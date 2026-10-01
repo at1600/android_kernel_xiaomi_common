@@ -150,8 +150,7 @@ static void waltgov_calc_avg_cap(struct waltgov_policy *wg_policy, u64 curr_ws,
 		wg_policy->last_cyc_update_time = curr_ws;
 	} else {
 		waltgov_track_cycles(wg_policy, prev_freq, curr_ws);
-		avg_freq = wg_policy->curr_cycles;
-		avg_freq /= sched_ravg_window / (NSEC_PER_SEC / KHZ);
+		avg_freq = wg_policy->curr_cycles * (NSEC_PER_SEC / KHZ) / sched_ravg_window;
 	}
 	wg_policy->avg_cap = freq_to_util(wg_policy, avg_freq);
 	wg_policy->curr_cycles = 0;
@@ -489,8 +488,8 @@ out:
 	return clamp(util, min_util, max_util);
 }
 
-#define NL_RATIO 75
-#define DEFAULT_HISPEED_LOAD 90
+#define NL_RATIO 80
+#define DEFAULT_HISPEED_LOAD 95
 #define DEFAULT_SILVER_RTG_BOOST_FREQ 1000000
 #define DEFAULT_GOLD_RTG_BOOST_FREQ 768000
 #define DEFAULT_PRIME_RTG_BOOST_FREQ 0
