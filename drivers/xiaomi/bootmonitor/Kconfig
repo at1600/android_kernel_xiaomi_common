@@ -5,6 +5,6 @@
 
 config MI_BOOT_MONITOR
 	tristate "boot monitor"
-	default n
+	default y
 	help
 	This adds support for mi boot monitor.
