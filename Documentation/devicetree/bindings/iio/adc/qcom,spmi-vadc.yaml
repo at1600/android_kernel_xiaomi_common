@@ -25,30 +25,12 @@ properties:
       - enum:
           - qcom,spmi-vadc
           - qcom,spmi-adc5
-          - qcom,spmi-adc5-gen3
-          - qcom,spmi-adc5-gen4
-          - qcom,spmi-adc5-lite
           - qcom,spmi-adc-rev2
           - qcom,spmi-adc7
-          - qcom,spmi-adc7-sw-calib
 
   reg:
-    minItems: 1
-    maxItems: 2
-    description: |
-      - For compatible property "qcom,spmi-vadc", "qcom,spmi-adc5", "qcom,spmi-adc-rev2",
-        "qcom,spmi-adc7", "qcom,spmi-adc5-lite", reg is the VADC base address.
-      - For compatible property "qcom,spmi-adc7-sw-calib", two registers are required.
-        First register is the VADC peripheral base address and the second is the
-        ADC common peripheral base addess.
-      - For compatible property "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4", each reg
-        corresponds to the SDAM peripheral base address that is being used.
-
-  qcom,debug-base:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: |
-      Debug ADC peripheral base address in the SPMI PMIC register map. Defined for
-      compatible "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4".
+    description: VADC base address in the SPMI PMIC register map
+    maxItems: 1
 
   '#address-cells':
     const: 1
@@ -59,26 +41,10 @@ properties:
   '#io-channel-cells':
     const: 1
 
-  '#thermal-sensor-cells':
-    const: 1
-    description: |
-      For compatible property "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4", property is
-      required for ADC_TM device.
-
   interrupts:
-    minItems: 1
-    maxItems: 2
-    description: |
+    maxItems: 1
+    description:
       End of conversion interrupt.
-      - For compatible property "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4", interrupts
-        are defined for each SDAM being used.
-
-  interrupt-names:
-    minItems: 1
-    maxItems: 2
-    description: |
-      For compatible property "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4", names should
-      be defined as "adc-sdam<N>" where <N> represents the SDAM index.
 
 required:
   - compatible
@@ -93,15 +59,11 @@ patternProperties:
     additionalProperties: false
     description: |
       Represents the external channels which are connected to the ADC.
-      - For compatible property "qcom,spmi-vadc" following channels, also known as
-        reference point channels, are used for result calibration and their channel
-        configuration nodes should be defined:
-        VADC_REF_625MV and/or VADC_SPARE1(based on PMIC version) VADC_REF_1250MV,
-        VADC_GND_REF and VADC_VDD_VADC.
-      - For compatible property "qcom,spmi-adc7-sw-calib" following channels, also known as
-        reference point channels, are used for result calibration and their channel
-        configuration nodes should be defined:
-        ADC7_REF_GND, ADC7_1P25VREF and ADC7_VREF_VADC.
+      For compatible property "qcom,spmi-vadc" following channels, also known as
+      reference point channels, are used for result calibration and their channel
+      configuration nodes should be defined:
+      VADC_REF_625MV and/or VADC_SPARE1(based on PMIC version) VADC_REF_1250MV,
+      VADC_GND_REF and VADC_VDD_VADC.
 
     properties:
       reg:
@@ -113,7 +75,6 @@ patternProperties:
           in the PMIC-specific files in include/dt-bindings/iio/.
 
       label:
-        $ref: /schemas/types.yaml#/definitions/string
         description: |
             ADC input of the platform as seen in the schematics.
             For thermistor inputs connected to generic AMUX or GPIO inputs
@@ -143,12 +104,6 @@ patternProperties:
           - items:
               - const: 10
               - const: 81
-          - items:
-              - enum: [ 32, 14, 28 ]
-              - const: 100
-          - items:
-              - const: 1000
-              - enum: [ 305185, 610370 ]
 
       qcom,ratiometric:
         description: |
@@ -158,20 +113,10 @@ patternProperties:
               channel calibration. If property is not found, channel will be
               calibrated with 0.625V and 1.25V reference channels, also
               known as absolute calibration.
-            - For all other compatible properties, if this property is specified
-              VADC will use the VDD reference (1.875V) and GND for channel calibration.
-              If property is not found, channel will be calibrated with 0V and 1.25V
-              reference channels, also known as absolute calibration.
-        type: boolean
-
-      qcom,no-cal:
-        description: |
-            - For compatible property "qcom,spmi-adc7-sw-calib", if this property
-              is specified for a channel, VADC will not use any reference channels
-              for that channel's calibration. It is needed for the three calibration
-              channels alone, mutually exclusive with ratiometric calibration and
-              not meant for any other compatible property. If this property is not
-              found, then the channel will be calibrated with 0.625V and 1.25V
+            - For compatible property "qcom,spmi-adc5", "qcom,spmi-adc7" and
+              "qcom,spmi-adc-rev2", if this property is specified VADC will use
+              the VDD reference (1.875V) and GND for channel calibration. If
+              property is not found, channel will be calibrated with 0V and 1.25V
               reference channels, also known as absolute calibration.
         type: boolean
 
@@ -190,41 +135,6 @@ patternProperties:
             from the ADC that is an average of multiple samples. The value
             selected is 2^(value).
 
-      qcom,scale-fn-type:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        description: |
-            The index of the VADC scale function used to convert raw ADC code to
-            physical scaled units for the channel. Defined for compatibles
-            "qcom,spmi-adc5", "qcom,spmi-adc7", "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4".
-            See include/dt-bindings/iio/qcom,spmi-vadc.h for values.
-
-      qcom,adc-tm-type:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        description: |
-            Type of ADC_TM usage defined for a given channel. Defined for compatible
-            "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4".
-              0 - not used for ADC_TM
-              1 - connected to thermistor; supports temperature threshold violation detection
-                  and temperature reading
-              2 - connected to thermistor; supports temperature reading
-              3 - not connected to thermistor; supports non-thermal threshold violation detection
-        enum: [ 0, 1, 2, 3]
-        default: 0
-
-      qcom,rscale-type:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        description: |
-            Type of reverse scaling function used for the ADC_TM channels. Defined for
-            compatible "qcom,spmi-adc5-gen3" and "qcom,spmi-adc5-gen4" and valid only
-            for the case of non-thermal ADC_TM client.
-        const: 0
-
-      qcom,adc5-gen4:
-        description: |
-            Flag indicating that the channel is an ADC5 GEN4 channel. Defined for compatible
-            "qcom,spmi-adc5-gen3".
-        type: boolean
-
     required:
       - reg
 
@@ -236,12 +146,6 @@ allOf:
             const: qcom,spmi-vadc
 
     then:
-      properties:
-        reg:
-          maxItems: 1
-        interrupts:
-          maxItems: 1
-        qcom,debug-base: false
       patternProperties:
         "^channel@[0-9a-f]+$":
           properties:
@@ -258,11 +162,6 @@ allOf:
               enum: [ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 ]
               default: 1
 
-            qcom,no-cal: false
-            qcom,adc-tm-type: false
-            qcom,rscale-type: false
-            qcom,adc5-gen4: false
-
   - if:
       properties:
         compatible:
@@ -270,12 +169,6 @@ allOf:
             const: qcom,spmi-adc-rev2
 
     then:
-      properties:
-        reg:
-          maxItems: 1
-        interrupts:
-          maxItems: 1
-        qcom,debug-base: false
       patternProperties:
         "^channel@[0-9a-f]+$":
           properties:
@@ -292,11 +185,6 @@ allOf:
               enum: [ 1, 2, 4, 8, 16 ]
               default: 1
 
-            qcom,no-cal: false
-            qcom,adc-tm-type: false
-            qcom,rscale-type: false
-            qcom,adc5-gen4: false
-
   - if:
       properties:
         compatible:
@@ -304,12 +192,6 @@ allOf:
             const: qcom,spmi-adc5
 
     then:
-      properties:
-        reg:
-          maxItems: 1
-        interrupts:
-          maxItems: 1
-        qcom,debug-base: false
       patternProperties:
         "^channel@[0-9a-f]+$":
           properties:
@@ -326,120 +208,6 @@ allOf:
               enum: [ 1, 2, 4, 8, 16 ]
               default: 1
 
-            qcom,no-cal: false
-            qcom,adc-tm-type: false
-            qcom,rscale-type: false
-            qcom,adc5-gen4: false
-
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: qcom,spmi-adc5-gen3
-
-    then:
-      properties:
-        reg:
-          minItems: 2
-        interrupts:
-          minItems: 2
-        interrupt-names:
-          items:
-            - const: adc-sdam0
-            - const: adc-sdam1
-      required:
-        - interrupts
-        - interrupt-names
-      patternProperties:
-        "^channel@[0-9a-f]+$":
-          properties:
-            qcom,decimation:
-              enum: [ 85, 340, 1360 ]
-              default: 1360
-
-            qcom,hw-settle-time:
-              enum: [ 15, 100, 200, 300, 400, 500, 600, 700, 1000, 2000, 4000,
-                      8000, 16000, 32000, 64000, 128000 ]
-              default: 15
-
-            qcom,avg-samples:
-              enum: [ 1, 2, 4, 8, 16 ]
-              default: 1
-
-            qcom,no-cal: false
-
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: qcom,spmi-adc5-gen4
-
-    then:
-      properties:
-        reg:
-          minItems: 2
-        interrupts:
-          minItems: 2
-        interrupt-names:
-          items:
-            - const: adc-sdam0
-            - const: adc-sdam1
-      required:
-        - interrupts
-        - interrupt-names
-      patternProperties:
-        "^channel@[0-9a-f]+$":
-          properties:
-            qcom,decimation:
-              enum: [ 85, 340, 1360 ]
-              default: 340
-
-            qcom,hw-settle-time:
-              enum: [ 15, 100, 200, 300, 400, 500, 600, 700, 1000, 2000, 4000,
-                      8000, 16000, 32000, 64000, 128000 ]
-              default: 15
-
-            qcom,avg-samples:
-              enum: [ 1, 2, 4, 8, 16 ]
-              default: 1
-
-            qcom,no-cal: false
-            qcom,adc5-gen4: false
-
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: qcom,spmi-adc5-lite
-
-    then:
-      properties:
-        reg:
-          maxItems: 1
-        interrupts:
-          maxItems: 1
-        qcom,debug-base: false
-      patternProperties:
-        "^channel@[0-9a-f]+$":
-          properties:
-            qcom,decimation:
-              enum: [ 250, 420, 840 ]
-              default: 840
-
-            qcom,hw-settle-time:
-              enum: [ 15, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1, 2,
-                      4, 6, 8, 10]
-              default: 15
-
-            qcom,avg-samples:
-              enum: [ 1, 2, 4, 8, 16 ]
-              default: 1
-
-            qcom,no-cal: false
-            qcom,adc-tm-type: false
-            qcom,rscale-type: false
-            qcom,adc5-gen4: false
-
   - if:
       properties:
         compatible:
@@ -447,12 +215,6 @@ allOf:
             const: qcom,spmi-adc7
 
     then:
-      properties:
-        reg:
-          maxItems: 1
-        interrupts:
-          maxItems: 1
-        qcom,debug-base: false
       patternProperties:
         "^channel@[0-9a-f]+$":
           properties:
@@ -468,59 +230,16 @@ allOf:
             qcom,avg-samples:
               enum: [ 1, 2, 4, 8, 16 ]
               default: 1
-
-            qcom,no-cal: false
-            qcom,adc-tm-type: false
-            qcom,rscale-type: false
-            qcom,adc5-gen4: false
-
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: qcom,spmi-adc7-sw-calib
-
-    then:
-      properties:
-        reg:
-          minItems: 2
-        interrupts:
-          maxItems: 1
-        qcom,debug-base: false
-      patternProperties:
-        "^channel@[0-9a-f]+$":
-          properties:
-            qcom,decimation:
-              enum: [ 85, 340, 1360 ]
-              default: 1360
-
-            qcom,hw-settle-time:
-              enum: [ 15, 100, 200, 300, 400, 500, 600, 700, 1000, 2000, 4000,
-                      8000, 16000, 32000, 64000, 128000 ]
-              default: 15
-
-            qcom,avg-samples:
-              enum: [ 1, 2, 4, 8, 16 ]
-              default: 1
-
-            qcom,adc-tm-type: false
-            qcom,rscale-type: false
-            qcom,adc5-gen4: false
-
-          not:
-            required:
-              - qcom,no-cal
-              - qcom,ratiometric
 
 additionalProperties: false
 
 examples:
   - |
-    spmi {
+    pmic {
         #address-cells = <1>;
         #size-cells = <0>;
-        /* VADC node */
-        pmic_vadc: adc@3100 {
+
+        adc@3100 {
             compatible = "qcom,spmi-vadc";
             reg = <0x3100>;
             interrupts = <0x0 0x31 0x0 0x1>;
@@ -561,9 +280,10 @@ examples:
     #include <dt-bindings/iio/qcom,spmi-adc7-pm8350.h>
     #include <dt-bindings/interrupt-controller/irq.h>
 
-    spmi {
+    pmic {
         #address-cells = <1>;
         #size-cells = <0>;
+
         adc@3100 {
             reg = <0x3100>;
             compatible = "qcom,spmi-adc7";
@@ -584,42 +304,6 @@ examples:
                 qcom,ratiometric;
                 qcom,hw-settle-time = <200>;
                 label = "conn_therm";
-            };
-        };
-    };
-
-  - |
-    #include <dt-bindings/iio/qcom,spmi-adc5-gen3-pmk8550.h>
-    #include <dt-bindings/interrupt-controller/irq.h>
-
-    spmi {
-        #address-cells = <1>;
-        #size-cells = <0>;
-        vadc@9000 {
-            compatible = "qcom,spmi-adc5-gen3";
-            reg = <0x9000>, <0x9100>;
-            qcom,debug-base = <0x7600>;
-            #address-cells = <1>;
-            #size-cells = <0>;
-            #io-channel-cells = <1>;
-            #thermal-sensor-cells = <1>;
-            interrupt-names = "adc-sdam0", "adc-sdam1";
-            interrupts = <0x0 0x90 0x1 IRQ_TYPE_EDGE_RISING>,
-                         <0x0 0x91 0x1 IRQ_TYPE_EDGE_RISING>;
-
-            channel@0 {
-                reg = <PMK8550_ADC5_GEN3_OFFSET_REF>;
-                label = "pmk8550_offset_ref";
-                qcom,pre-scaling = <1 1>;
-            };
-
-            channel@4 {
-                reg = <PMK8550_ADC5_GEN3_AMUX_THM1_XO_THERM_100K_PU>;
-                label = "pmk8550_xo_therm";
-                qcom,ratiometric;
-                qcom,hw-settle-time = <200>;
-                qcom,pre-scaling = <1 1>;
-                qcom,adc-tm-type = <1>;
             };
         };
     };

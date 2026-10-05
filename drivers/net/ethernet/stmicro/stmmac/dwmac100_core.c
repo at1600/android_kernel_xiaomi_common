@@ -34,8 +34,7 @@ static void dwmac100_core_init(struct mac_device_info *hw,
 #endif
 }
 
-static void dwmac100_dump_mac_regs(struct stmmac_priv *priv, struct mac_device_info *hw,
-				   u32 *reg_space)
+static void dwmac100_dump_mac_regs(struct mac_device_info *hw, u32 *reg_space)
 {
 	void __iomem *ioaddr = hw->pcsr;
 

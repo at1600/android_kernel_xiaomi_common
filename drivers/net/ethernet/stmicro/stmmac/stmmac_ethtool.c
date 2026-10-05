@@ -131,7 +131,6 @@ static const struct stmmac_stats stmmac_gstrings_stats[] = {
 	STMMAC_STAT(irq_pcs_ane_n),
 	STMMAC_STAT(irq_pcs_link_n),
 	STMMAC_STAT(irq_rgmii_n),
-	STMMAC_STAT(pcs_err_count),
 	/* DEBUG */
 	STMMAC_STAT(mtl_tx_status_fifo_full),
 	STMMAC_STAT(mtl_tx_fifo_not_empty),
@@ -443,10 +442,9 @@ static void stmmac_ethtool_setmsglevel(struct net_device *dev, u32 level)
 static int stmmac_ethtool_get_regs_len(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
-	const struct dwxgmac_addrs *dwxgmac_addrs = priv->plat->dwxgmac_addrs;
 
 	if (priv->plat->has_xgmac)
-		return XGMAC_REGSIZE(dwxgmac_addrs) * 4;
+		return XGMAC_REGSIZE * 4;
 	else if (priv->plat->has_gmac4)
 		return GMAC4_REG_SPACE_SIZE;
 	return REG_SPACE_SIZE;
@@ -639,9 +637,6 @@ static void stmmac_get_ethtool_stats(struct net_device *dev,
 				data[j++] = count;
 		}
 	}
-
-	if (priv->plat->safety_pcs_stats)
-		priv->plat->safety_pcs_stats(priv, &priv->xstats.pcs_err_count);
 
 	/* Update the DMA HW counters for dwmac10/100 */
 	ret = stmmac_dma_diagnostic_fr(priv, &priv->xstats, priv->ioaddr);

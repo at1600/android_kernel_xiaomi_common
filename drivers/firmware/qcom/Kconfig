@@ -10,27 +10,36 @@ config QCOM_SCM
 	select QCOM_TZMEM
 	tristate
 
-config QTEE_SHM_BRIDGE
-	bool "QTI TEE shared memory bridge"
-	depends on QCOM_SCM
-	default y if QCOM_SCM
-	help
-	  QTEE shared memory bridge driver provides kernel APIs to share
-	  memory between trustzone & other VMs through shared memory bridge.
-	  It allows kernel clients to create bridge, delete bridge, and do
-	  memory sub-allocation and free from the default kernel bridge
-	  created by bridge driver.
+config QCOM_TZMEM
+	tristate
+	select GENERIC_ALLOCATOR
 
-config QCOM_SCM_DOWNLOAD_MODE_DEFAULT
-	bool "Qualcomm download mode enabled by default"
-	depends on QCOM_SCM
+choice
+	prompt "TrustZone interface memory allocator mode"
+	depends on QCOM_TZMEM
+	default QCOM_TZMEM_MODE_GENERIC
 	help
-	  A device with "download mode" enabled will upon an unexpected
-	  warm-restart enter a special debug mode that allows the user to
-	  "download" memory content over USB for offline postmortem analysis.
-	  The feature can be enabled/disabled on the kernel command line.
+	  Selects the mode of the memory allocator providing memory buffers of
+	  suitable format for sharing with the TrustZone. If in doubt, select
+	  'Generic'.
 
-	  Say Y here to enable "download mode" by default.
+config QCOM_TZMEM_MODE_GENERIC
+	bool "Generic"
+	help
+	  Use the generic allocator mode. The memory is page-aligned, non-cachable
+	  and physically contiguous.
+
+config QCOM_TZMEM_MODE_SHMBRIDGE
+	bool "SHM Bridge"
+	help
+	  Use Qualcomm Shared Memory Bridge. The memory has the same alignment as
+	  in the 'Generic' allocator but is also explicitly marked as an SHM Bridge
+	  buffer.
+
+	  With this selected, all buffers passed to the TrustZone must be allocated
+	  using the TZMem allocator or else the TrustZone will refuse to use them.
+
+endchoice
 
 config QCOM_QSEECOM
 	bool "Qualcomm QSEECOM interface driver"
@@ -64,7 +73,5 @@ config QCOM_QSEECOM_UEFISECAPP
 
 	  Select Y here to provide access to EFI variables on the aforementioned
 	  platforms.
-
-source "$(KCONFIG_EXT_PREFIX)drivers/firmware/qcom/si_core/Kconfig"
 
 endmenu

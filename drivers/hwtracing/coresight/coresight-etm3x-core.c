@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Description: CoreSight Program Flow Trace driver
  */
@@ -34,7 +33,6 @@
 #include "coresight-etm.h"
 #include "coresight-etm-perf.h"
 #include "coresight-trace-id.h"
-#include "coresight-common.h"
 
 /*
  * Not really modular but using module_param is the easiest way to
@@ -483,10 +481,11 @@ void etm_release_trace_id(struct etm_drvdata *drvdata)
 }
 
 static int etm_enable_perf(struct coresight_device *csdev,
-			   struct perf_event *event)
+			   struct perf_event *event,
+			   struct coresight_trace_id_map *id_map)
 {
 	struct etm_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
-	int trace_id, ret = 0;
+	int trace_id;
 
 	if (WARN_ON_ONCE(drvdata->cpu != smp_processor_id()))
 		return -EINVAL;
@@ -502,7 +501,7 @@ static int etm_enable_perf(struct coresight_device *csdev,
 	 * with perf locks - we know the ID cannot change until perf shuts down
 	 * the session
 	 */
-	trace_id = coresight_trace_id_read_cpu_id(drvdata->cpu);
+	trace_id = coresight_trace_id_read_cpu_id_map(drvdata->cpu, id_map);
 	if (!IS_VALID_CS_TRACE_ID(trace_id)) {
 		dev_err(&drvdata->csdev->dev, "Failed to set trace ID for %s on CPU%d\n",
 			dev_name(&drvdata->csdev->dev), drvdata->cpu);
@@ -510,15 +509,8 @@ static int etm_enable_perf(struct coresight_device *csdev,
 	}
 	drvdata->traceid = (u8)trace_id;
 
-	coresight_csr_set_etr_atid(csdev, drvdata->traceid, true, etm_event_get_path(event));
-
 	/* And enable it */
-	ret = etm_enable_hw(drvdata);
-	if (ret)
-		coresight_csr_set_etr_atid(csdev, drvdata->traceid, false,
-				etm_event_get_path(event));
-
-	return ret;
+	return etm_enable_hw(drvdata);
 }
 
 static int etm_enable_sysfs(struct coresight_device *csdev)
@@ -533,8 +525,6 @@ static int etm_enable_sysfs(struct coresight_device *csdev)
 	ret = etm_read_alloc_trace_id(drvdata);
 	if (ret < 0)
 		goto unlock_enable_sysfs;
-
-	coresight_csr_set_etr_atid(csdev, drvdata->traceid, true, NULL);
 
 	/*
 	 * Configure the ETM only if the CPU is online.  If it isn't online
@@ -552,10 +542,8 @@ static int etm_enable_sysfs(struct coresight_device *csdev)
 		ret = -ENODEV;
 	}
 
-	if (ret) {
-		coresight_csr_set_etr_atid(csdev, drvdata->traceid, false, NULL);
+	if (ret)
 		etm_release_trace_id(drvdata);
-	}
 
 unlock_enable_sysfs:
 	spin_unlock(&drvdata->spinlock);
@@ -566,7 +554,7 @@ unlock_enable_sysfs:
 }
 
 static int etm_enable(struct coresight_device *csdev, struct perf_event *event,
-		      enum cs_mode mode)
+		      enum cs_mode mode, struct coresight_trace_id_map *id_map)
 {
 	int ret;
 	struct etm_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
@@ -581,7 +569,7 @@ static int etm_enable(struct coresight_device *csdev, struct perf_event *event,
 		ret = etm_enable_sysfs(csdev);
 		break;
 	case CS_MODE_PERF:
-		ret = etm_enable_perf(csdev, event);
+		ret = etm_enable_perf(csdev, event, id_map);
 		break;
 	default:
 		ret = -EINVAL;
@@ -666,8 +654,6 @@ static void etm_disable_sysfs(struct coresight_device *csdev)
 	 */
 	smp_call_function_single(drvdata->cpu, etm_disable_hw, drvdata, 1);
 
-	coresight_csr_set_etr_atid(csdev, drvdata->traceid, false, NULL);
-
 	spin_unlock(&drvdata->spinlock);
 	cpus_read_unlock();
 
@@ -701,14 +687,12 @@ static void etm_disable(struct coresight_device *csdev,
 		break;
 	case CS_MODE_PERF:
 		etm_disable_perf(csdev);
-		coresight_csr_set_etr_atid(csdev, drvdata->traceid, false,
-			etm_event_get_path(event));
 		break;
 	default:
 		WARN_ON_ONCE(mode);
 		return;
 	}
-	coresight_csr_set_etr_atid(csdev, drvdata->traceid, false);
+
 	if (mode)
 		coresight_set_mode(csdev, CS_MODE_DISABLED);
 }
@@ -935,7 +919,7 @@ static int etm_probe(struct amba_device *adev, const struct amba_id *id)
 
 	etmdrvdata[drvdata->cpu] = drvdata;
 
-	pm_runtime_put_sync(&adev->dev);
+	pm_runtime_put(&adev->dev);
 	dev_info(&drvdata->csdev->dev,
 		 "%s initialized\n", (char *)coresight_get_uci_data(id));
 	if (boot_enable) {

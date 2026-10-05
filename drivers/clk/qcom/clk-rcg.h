@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2013, 2016-2018, 2020 The Linux Foundation. All rights reserved. */
-/* Copyright (c) 2022, 2025 Qualcomm Innovation Center, Inc. All rights reserved. */
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Copyright (c) 2013, 2018, The Linux Foundation. All rights reserved. */
 
 #ifndef __QCOM_CLK_RCG_H__
 #define __QCOM_CLK_RCG_H__
@@ -16,8 +15,6 @@ struct freq_tbl {
 	u8 pre_div;
 	u16 m;
 	u16 n;
-	unsigned long src_freq;
-#define FIXED_FREQ_SRC   0
 };
 
 #define C(s, h, m, n) { (s), (2 * (h) - 1), (m), (n) }
@@ -157,16 +154,12 @@ extern const struct clk_ops clk_dyn_rcg_ops;
  * @hid_width: number of bits in half integer divider
  * @safe_src_index: safe src index value
  * @parent_map: map from software's parent index to hardware's src_sel field
- * @current_freq: last cached frequency when using branches with shared RCGs
- * @enable_safe_config: When set, the RCG is parked at CXO when it's disabled
  * @freq_tbl: frequency table
  * @freq_multi_tbl: frequency table for clocks reachable with multiple RCGs conf
  * @clkr: regmap clock handle
  * @cfg_off: defines the cfg register offset from the CMD_RCGR + CFG_REG
  * @parked_cfg: cached value of the CFG register for parked RCGs
- * @flags: additional flag parameters for the RCG
  * @hw_clk_ctrl: whether to enable hardware clock control
- * @is_enabled: true if clk framework has enabled the clock
  */
 struct clk_rcg2 {
 	u32			cmd_rcgr;
@@ -174,9 +167,6 @@ struct clk_rcg2 {
 	u8			hid_width;
 	u8			safe_src_index;
 	const struct parent_map	*parent_map;
-	unsigned long		configured_freq;
-	unsigned long		current_freq;
-	bool			enable_safe_config;
 	union {
 		const struct freq_tbl		*freq_tbl;
 		const struct freq_multi_tbl	*freq_multi_tbl;
@@ -184,13 +174,7 @@ struct clk_rcg2 {
 	struct clk_regmap	clkr;
 	u8			cfg_off;
 	u32			parked_cfg;
-	u8			flags;
-#define FORCE_ENABLE_RCG	BIT(0)
-#define HW_CLK_CTRL_MODE	BIT(1)
-#define DFS_SUPPORT		BIT(2)
-	bool			freq_populated;
 	bool			hw_clk_ctrl;
-	bool			is_enabled;
 };
 
 #define to_clk_rcg2(_hw) container_of(to_clk_regmap(_hw), struct clk_rcg2, clkr)
@@ -214,10 +198,9 @@ extern const struct clk_ops clk_byte2_ops;
 extern const struct clk_ops clk_pixel_ops;
 extern const struct clk_ops clk_gfx3d_ops;
 extern const struct clk_ops clk_rcg2_shared_ops;
+extern const struct clk_ops clk_rcg2_shared_floor_ops;
 extern const struct clk_ops clk_rcg2_shared_no_init_park_ops;
 extern const struct clk_ops clk_dp_ops;
-extern const struct clk_ops clk_rcg2_crmc_ops;
-extern const struct clk_ops clk_rcg2_crmb_ops;
 
 struct clk_rcg_dfs_data {
 	struct clk_rcg2 *rcg;

@@ -11,8 +11,8 @@
 #include <linux/regmap.h>
 #include <linux/soc/qcom/llcc-qcom.h>
 
-#include "drivers/edac/edac_mc.h"
-#include "drivers/edac/edac_device.h"
+#include "edac_mc.h"
+#include "edac_device.h"
 
 #define EDAC_LLCC                       "qcom_llcc"
 
@@ -220,9 +220,8 @@ dump_syn_reg_values(struct llcc_drv_data *drv, u32 bank, int err_type)
 		if (ret)
 			goto clear;
 
-		if (err_type != LLCC_DRAM_CE && err_type != LLCC_TRAM_CE)
-			edac_printk(KERN_CRIT, EDAC_LLCC, "%s: ECC_SYN%d: 0x%8x\n",
-			reg_data.name, i, synd_val);
+		edac_printk(KERN_CRIT, EDAC_LLCC, "%s: ECC_SYN%d: 0x%8x\n",
+			    reg_data.name, i, synd_val);
 	}
 
 	ret = regmap_read(drv->regmaps[bank], regs.count_status_reg,
@@ -343,9 +342,11 @@ static int qcom_llcc_edac_probe(struct platform_device *pdev)
 	int ecc_irq;
 	int rc;
 
-	rc = qcom_llcc_core_setup(llcc_driv_data, llcc_driv_data->bcast_regmap);
-	if (rc)
-		return rc;
+	if (!llcc_driv_data->ecc_irq_configured) {
+		rc = qcom_llcc_core_setup(llcc_driv_data, llcc_driv_data->bcast_regmap);
+		if (rc)
+			return rc;
+	}
 
 	/* Allocate edac control info */
 	edev_ctl = edac_device_alloc_ctl_info(0, "qcom-llcc", 1, "bank",

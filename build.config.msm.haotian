@@ -1,3 +1,0 @@
-################################################################################
-## Inheriting configs from ACK
-. ${ROOT_DIR}/soc-repo/build.config.msm.sun
