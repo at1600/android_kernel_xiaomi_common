@@ -163,14 +163,6 @@
 
 #define SII902X_AUDIO_PORT_INDEX		3
 
-/*
- * The maximum resolution supported by the HDMI bridge is 1080p@60Hz
- * and 1920x1200 requiring a pixel clock of 165MHz and the minimum
- * resolution supported is 480p@60Hz requiring a pixel clock of 25MHz
- */
-#define SII902X_MIN_PIXEL_CLOCK_KHZ		25000
-#define SII902X_MAX_PIXEL_CLOCK_KHZ		165000
-
 struct sii902x {
 	struct i2c_client *i2c;
 	struct regmap *regmap;
@@ -286,44 +278,56 @@ static const struct drm_connector_funcs sii902x_connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
-static const struct drm_edid *sii902x_edid_read(struct sii902x *sii902x,
-						struct drm_connector *connector)
+static struct edid *sii902x_get_edid(struct sii902x *sii902x,
+				     struct drm_connector *connector)
 {
-	const struct drm_edid *drm_edid;
+	struct edid *edid;
 
 	mutex_lock(&sii902x->mutex);
 
-	drm_edid = drm_edid_read_ddc(connector, sii902x->i2cmux->adapter[0]);
+	edid = drm_get_edid(connector, sii902x->i2cmux->adapter[0]);
+	if (edid) {
+		if (drm_detect_hdmi_monitor(edid))
+			sii902x->sink_is_hdmi = true;
+		else
+			sii902x->sink_is_hdmi = false;
+	}
 
 	mutex_unlock(&sii902x->mutex);
 
-	return drm_edid;
+	return edid;
 }
 
 static int sii902x_get_modes(struct drm_connector *connector)
 {
 	struct sii902x *sii902x = connector_to_sii902x(connector);
-	const struct drm_edid *drm_edid;
+	struct edid *edid;
 	int num = 0;
 
-	drm_edid = sii902x_edid_read(sii902x, connector);
-	drm_edid_connector_update(connector, drm_edid);
-	if (drm_edid) {
-		num = drm_edid_connector_add_modes(connector);
-		drm_edid_free(drm_edid);
+	edid = sii902x_get_edid(sii902x, connector);
+	drm_connector_update_edid_property(connector, edid);
+	if (edid) {
+		num = drm_add_edid_modes(connector, edid);
+		kfree(edid);
 	}
-
-	sii902x->sink_is_hdmi = connector->display_info.is_hdmi;
 
 	return num;
 }
 
+static enum drm_mode_status sii902x_mode_valid(struct drm_connector *connector,
+					       struct drm_display_mode *mode)
+{
+	/* TODO: check mode */
+
+	return MODE_OK;
+}
+
 static const struct drm_connector_helper_funcs sii902x_connector_helper_funcs = {
 	.get_modes = sii902x_get_modes,
+	.mode_valid = sii902x_mode_valid,
 };
 
-static void sii902x_bridge_atomic_disable(struct drm_bridge *bridge,
-					  struct drm_bridge_state *old_bridge_state)
+static void sii902x_bridge_disable(struct drm_bridge *bridge)
 {
 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
 
@@ -336,8 +340,7 @@ static void sii902x_bridge_atomic_disable(struct drm_bridge *bridge,
 	mutex_unlock(&sii902x->mutex);
 }
 
-static void sii902x_bridge_atomic_enable(struct drm_bridge *bridge,
-					 struct drm_bridge_state *old_bridge_state)
+static void sii902x_bridge_enable(struct drm_bridge *bridge)
 {
 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
 
@@ -462,12 +465,12 @@ static enum drm_connector_status sii902x_bridge_detect(struct drm_bridge *bridge
 	return sii902x_detect(sii902x);
 }
 
-static const struct drm_edid *sii902x_bridge_edid_read(struct drm_bridge *bridge,
-						       struct drm_connector *connector)
+static struct edid *sii902x_bridge_get_edid(struct drm_bridge *bridge,
+					    struct drm_connector *connector)
 {
 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
 
-	return sii902x_edid_read(sii902x, connector);
+	return sii902x_get_edid(sii902x, connector);
 }
 
 static u32 *sii902x_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
@@ -496,10 +499,6 @@ static int sii902x_bridge_atomic_check(struct drm_bridge *bridge,
 				       struct drm_crtc_state *crtc_state,
 				       struct drm_connector_state *conn_state)
 {
-	if (crtc_state->mode.clock < SII902X_MIN_PIXEL_CLOCK_KHZ ||
-	    crtc_state->mode.clock > SII902X_MAX_PIXEL_CLOCK_KHZ)
-		return -EINVAL;
-
 	/*
 	 * There might be flags negotiation supported in future but
 	 * set the bus flags in atomic_check statically for now.
@@ -509,33 +508,18 @@ static int sii902x_bridge_atomic_check(struct drm_bridge *bridge,
 	return 0;
 }
 
-static enum drm_mode_status
-sii902x_bridge_mode_valid(struct drm_bridge *bridge,
-			  const struct drm_display_info *info,
-			  const struct drm_display_mode *mode)
-{
-	if (mode->clock < SII902X_MIN_PIXEL_CLOCK_KHZ)
-		return MODE_CLOCK_LOW;
-
-	if (mode->clock > SII902X_MAX_PIXEL_CLOCK_KHZ)
-		return MODE_CLOCK_HIGH;
-
-	return MODE_OK;
-}
-
 static const struct drm_bridge_funcs sii902x_bridge_funcs = {
 	.attach = sii902x_bridge_attach,
 	.mode_set = sii902x_bridge_mode_set,
-	.atomic_disable = sii902x_bridge_atomic_disable,
-	.atomic_enable = sii902x_bridge_atomic_enable,
+	.disable = sii902x_bridge_disable,
+	.enable = sii902x_bridge_enable,
 	.detect = sii902x_bridge_detect,
-	.edid_read = sii902x_bridge_edid_read,
+	.get_edid = sii902x_bridge_get_edid,
 	.atomic_reset = drm_atomic_helper_bridge_reset,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
 	.atomic_get_input_bus_fmts = sii902x_bridge_atomic_get_input_bus_fmts,
 	.atomic_check = sii902x_bridge_atomic_check,
-	.mode_valid = sii902x_bridge_mode_valid,
 };
 
 static int sii902x_mute(struct sii902x *sii902x, bool mute)
@@ -1112,7 +1096,7 @@ static int sii902x_init(struct sii902x *sii902x)
 	}
 
 	sii902x->i2cmux->priv = sii902x;
-	ret = i2c_mux_add_adapter(sii902x->i2cmux, 0, 0);
+	ret = i2c_mux_add_adapter(sii902x->i2cmux, 0, 0, 0);
 	if (ret)
 		goto err_unreg_audio;
 

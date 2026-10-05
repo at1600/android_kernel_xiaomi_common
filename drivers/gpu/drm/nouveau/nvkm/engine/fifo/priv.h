@@ -13,8 +13,6 @@ struct nvkm_runq;
 struct nvkm_vctx;
 
 struct nvkm_fifo_func {
-	void (*dtor)(struct nvkm_fifo *);
-
 	int (*chid_nr)(struct nvkm_fifo *);
 	int (*chid_ctor)(struct nvkm_fifo *, int nr);
 	int (*runq_nr)(struct nvkm_fifo *);
@@ -40,7 +38,6 @@ struct nvkm_fifo_func {
 	void (*start)(struct nvkm_fifo *, unsigned long *);
 
 	int (*nonstall_ctor)(struct nvkm_fifo *);
-	void (*nonstall_dtor)(struct nvkm_fifo *);
 	const struct nvkm_event_func *nonstall;
 
 	const struct nvkm_runl_func *runl;
@@ -61,8 +58,6 @@ struct nvkm_fifo_func {
 	} chan;
 };
 
-int r535_fifo_new(const struct nvkm_fifo_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
-		  struct nvkm_fifo **);
 int nvkm_fifo_new_(const struct nvkm_fifo_func *, struct nvkm_device *, enum nvkm_subdev_type, int,
 		   struct nvkm_fifo **);
 
@@ -199,7 +194,6 @@ extern const struct nvkm_fifo_func_mmu_fault tu102_fifo_mmu_fault;
 
 int ga100_fifo_runl_ctor(struct nvkm_fifo *);
 int ga100_fifo_nonstall_ctor(struct nvkm_fifo *);
-void ga100_fifo_nonstall_dtor(struct nvkm_fifo *);
 extern const struct nvkm_event_func ga100_fifo_nonstall;
 extern const struct nvkm_runl_func ga100_runl;
 extern const struct nvkm_runq_func ga100_runq;

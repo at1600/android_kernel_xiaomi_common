@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #define pr_fmt(fmt) "%s: " fmt, __func__
 #include <linux/types.h>
@@ -1393,8 +1393,6 @@ static int lt9611uxc_connector_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *mode, *m;
 	unsigned int count = 0;
 	long ret = 0;
-	const struct drm_edid *drm_edid = NULL;
-	const struct edid *edid_raw = NULL;
 
 	mutex_lock(&pdata->lock);
 	if (pdata->pending_edid || pdata->edid_complete) {
@@ -1417,15 +1415,8 @@ static int lt9611uxc_connector_get_modes(struct drm_connector *connector)
 read_edid:
 	if (!pdata->edid) {
 		lt9611uxc_read_edid(pdata);
-		drm_edid = drm_edid_read_custom(connector,
+		pdata->edid = drm_do_get_edid(connector,
 				lt9611uxc_get_edid_block, pdata);
-		edid_raw = drm_edid_raw(drm_edid);
-		drm_edid_free(drm_edid);
-
-		if (edid_raw) {
-			pdata->edid = kmemdup(edid_raw, sizeof(struct edid), GFP_KERNEL);
-			kfree(edid_raw);
-		}
 	}
 
 skip_read_edid:

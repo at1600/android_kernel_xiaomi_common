@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "cpufreq_hw_debug: %s: " fmt, __func__
@@ -13,7 +13,6 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
-#include <linux/platform_device.h>
 
 enum debug_hw_regs_data {
 	REG_PERF_STATE,
@@ -203,10 +202,11 @@ static int qcom_cpufreq_hw_debug_probe(struct platform_device *pdev)
 	return enable_cpufreq_hw_debug(pdev);
 }
 
-static void qcom_cpufreq_hw_debug_remove(struct platform_device *pdev)
+static int qcom_cpufreq_hw_debug_remove(struct platform_device *pdev)
 {
 	sysfs_remove_file(kernel_kobj, &cpufreq_hwregs_attr.attr);
 	kobject_put(cpufreqhw_kobj);
+	return 0;
 }
 
 static const struct of_device_id qcom_cpufreq_hw_debug_match[] = {

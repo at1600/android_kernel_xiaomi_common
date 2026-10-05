@@ -35,7 +35,6 @@
 
 #include <linux/sync_file.h>
 #include <linux/hashtable.h>
-#include <linux/vmalloc.h>
 
 /*
  * Helper macro to get dx_ctx_node if available otherwise print an error
@@ -622,10 +621,10 @@ static int vmw_resources_reserve(struct vmw_sw_context *sw_context)
  * @sw_context: Pointer to the software context.
  * @res_type: Resource type.
  * @dirty: Whether to change dirty status.
- * @converter: User-space visible type specific information.
+ * @converter: User-space visisble type specific information.
  * @id_loc: Pointer to the location in the command buffer currently being parsed
  * from where the user-space resource id handle is located.
- * @p_res: Pointer to pointer to resource validation node. Populated on
+ * @p_res: Pointer to pointer to resource validalidation node. Populated on
  * exit.
  */
 static int
@@ -1515,7 +1514,6 @@ static int vmw_cmd_dma(struct vmw_private *dev_priv,
 		       SVGA3dCmdHeader *header)
 {
 	struct vmw_bo *vmw_bo = NULL;
-	struct vmw_resource *res;
 	struct vmw_surface *srf = NULL;
 	VMW_DECLARE_CMD_VAR(*cmd, SVGA3dCmdSurfaceDMA);
 	int ret;
@@ -1551,24 +1549,18 @@ static int vmw_cmd_dma(struct vmw_private *dev_priv,
 
 	dirty = (cmd->body.transfer == SVGA3D_WRITE_HOST_VRAM) ?
 		VMW_RES_DIRTY_SET : 0;
-	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface, dirty,
-				user_surface_converter, &cmd->body.host.sid,
-				NULL);
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				dirty, user_surface_converter,
+				&cmd->body.host.sid, NULL);
 	if (unlikely(ret != 0)) {
 		if (unlikely(ret != -ERESTARTSYS))
 			VMW_DEBUG_USER("could not find surface for DMA.\n");
 		return ret;
 	}
 
-	res = sw_context->res_cache[vmw_res_surface].res;
-	if (!res) {
-		VMW_DEBUG_USER("Invalid DMA surface.\n");
-		return -EINVAL;
-	}
+	srf = vmw_res_to_srf(sw_context->res_cache[vmw_res_surface].res);
 
-	srf = vmw_res_to_srf(res);
-	vmw_kms_cursor_snoop(srf, sw_context->fp->tfile, &vmw_bo->tbo,
-			     header);
+	vmw_kms_cursor_snoop(srf, sw_context->fp->tfile, &vmw_bo->tbo, header);
 
 	return 0;
 }
@@ -3619,8 +3611,6 @@ static const struct vmw_cmd_entry vmw_cmd_entries[SVGA_3D_CMD_MAX] = {
 		    &vmw_cmd_dx_bind_streamoutput, true, false, true),
 	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_RASTERIZER_STATE_V2,
 		    &vmw_cmd_dx_so_define, true, false, true),
-	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_SURFACE_V4,
-		    &vmw_cmd_invalid, false, false, true),
 };
 
 bool vmw_cmd_describe(const void *buf, u32 *size, char const **cmd)
@@ -3686,11 +3676,6 @@ static int vmw_cmd_check(struct vmw_private *dev_priv,
 
 
 	cmd_id = header->id;
-	if (header->size > SVGA_CMD_MAX_DATASIZE) {
-		VMW_DEBUG_USER("SVGA3D command: %d is too big.\n",
-			       cmd_id + SVGA_3D_CMD_BASE);
-		return -E2BIG;
-	}
 	*size = header->size + sizeof(SVGA3dCmdHeader);
 
 	cmd_id -= SVGA_3D_CMD_BASE;
@@ -4098,23 +4083,6 @@ static int vmw_execbuf_tie_context(struct vmw_private *dev_priv,
 	return 0;
 }
 
-/*
- * DMA fence callback to remove a seqno_waiter
- */
-struct seqno_waiter_rm_context {
-	struct dma_fence_cb base;
-	struct vmw_private *dev_priv;
-};
-
-static void seqno_waiter_rm_cb(struct dma_fence *f, struct dma_fence_cb *cb)
-{
-	struct seqno_waiter_rm_context *ctx =
-		container_of(cb, struct seqno_waiter_rm_context, base);
-
-	vmw_seqno_waiter_remove(ctx->dev_priv);
-	kfree(ctx);
-}
-
 int vmw_execbuf_process(struct drm_file *file_priv,
 			struct vmw_private *dev_priv,
 			void __user *user_commands, void *kernel_commands,
@@ -4295,15 +4263,6 @@ int vmw_execbuf_process(struct drm_file *file_priv,
 		} else {
 			/* Link the fence with the FD created earlier */
 			fd_install(out_fence_fd, sync_file->file);
-			struct seqno_waiter_rm_context *ctx =
-				kmalloc(sizeof(*ctx), GFP_KERNEL);
-			ctx->dev_priv = dev_priv;
-			vmw_seqno_waiter_add(dev_priv);
-			if (dma_fence_add_callback(&fence->base, &ctx->base,
-						   seqno_waiter_rm_cb) < 0) {
-				vmw_seqno_waiter_remove(dev_priv);
-				kfree(ctx);
-			}
 		}
 	}
 

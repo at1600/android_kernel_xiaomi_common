@@ -20,99 +20,6 @@
 #include <drm/drm_print.h>
 #include <drm/drm_rect.h>
 
-#include "drm_format_internal.h"
-
-/**
- * drm_format_conv_state_init - Initialize format-conversion state
- * @state: The state to initialize
- *
- * Clears all fields in struct drm_format_conv_state. The state will
- * be empty with no preallocated resources.
- */
-void drm_format_conv_state_init(struct drm_format_conv_state *state)
-{
-	state->tmp.mem = NULL;
-	state->tmp.size = 0;
-	state->tmp.preallocated = false;
-}
-EXPORT_SYMBOL(drm_format_conv_state_init);
-
-/**
- * drm_format_conv_state_copy - Copy format-conversion state
- * @state: Destination state
- * @old_state: Source state
- *
- * Copies format-conversion state from @old_state to @state; except for
- * temporary storage.
- */
-void drm_format_conv_state_copy(struct drm_format_conv_state *state,
-				const struct drm_format_conv_state *old_state)
-{
-	/*
-	 * So far, there's only temporary storage here, which we don't
-	 * duplicate. Just clear the fields.
-	 */
-	state->tmp.mem = NULL;
-	state->tmp.size = 0;
-	state->tmp.preallocated = false;
-}
-EXPORT_SYMBOL(drm_format_conv_state_copy);
-
-/**
- * drm_format_conv_state_reserve - Allocates storage for format conversion
- * @state: The format-conversion state
- * @new_size: The minimum allocation size
- * @flags: Flags for kmalloc()
- *
- * Allocates at least @new_size bytes and returns a pointer to the memory
- * range. After calling this function, previously returned memory blocks
- * are invalid. It's best to collect all memory requirements of a format
- * conversion and call this function once to allocate the range.
- *
- * Returns:
- * A pointer to the allocated memory range, or NULL otherwise.
- */
-void *drm_format_conv_state_reserve(struct drm_format_conv_state *state,
-				    size_t new_size, gfp_t flags)
-{
-	void *mem;
-
-	if (new_size <= state->tmp.size)
-		goto out;
-	else if (state->tmp.preallocated)
-		return NULL;
-
-	mem = krealloc(state->tmp.mem, new_size, flags);
-	if (!mem)
-		return NULL;
-
-	state->tmp.mem = mem;
-	state->tmp.size = new_size;
-
-out:
-	return state->tmp.mem;
-}
-EXPORT_SYMBOL(drm_format_conv_state_reserve);
-
-/**
- * drm_format_conv_state_release - Releases an format-conversion storage
- * @state: The format-conversion state
- *
- * Releases the memory range references by the format-conversion state.
- * After this call, all pointers to the memory are invalid. Prefer
- * drm_format_conv_state_init() for cleaning up and unloading a driver.
- */
-void drm_format_conv_state_release(struct drm_format_conv_state *state)
-{
-	if (state->tmp.preallocated)
-		return;
-
-	kfree(state->tmp.mem);
-	state->tmp.mem = NULL;
-	state->tmp.size = 0;
-}
-EXPORT_SYMBOL(drm_format_conv_state_release);
-
 static unsigned int clip_offset(const struct drm_rect *clip, unsigned int pitch, unsigned int cpp)
 {
 	return clip->y1 * pitch + clip->x1 * cpp;
@@ -138,7 +45,6 @@ EXPORT_SYMBOL(drm_fb_clip_offset);
 static int __drm_fb_xfrm(void *dst, unsigned long dst_pitch, unsigned long dst_pixsize,
 			 const void *vaddr, const struct drm_framebuffer *fb,
 			 const struct drm_rect *clip, bool vaddr_cached_hint,
-			 struct drm_format_conv_state *state,
 			 void (*xfrm_line)(void *dbuf, const void *sbuf, unsigned int npixels))
 {
 	unsigned long linepixels = drm_rect_width(clip);
@@ -154,7 +60,7 @@ static int __drm_fb_xfrm(void *dst, unsigned long dst_pitch, unsigned long dst_p
 	 * one line at a time.
 	 */
 	if (!vaddr_cached_hint) {
-		stmp = drm_format_conv_state_reserve(state, sbuf_len, GFP_KERNEL);
+		stmp = kmalloc(sbuf_len, GFP_KERNEL);
 		if (!stmp)
 			return -ENOMEM;
 	}
@@ -173,6 +79,8 @@ static int __drm_fb_xfrm(void *dst, unsigned long dst_pitch, unsigned long dst_p
 		dst += dst_pitch;
 	}
 
+	kfree(stmp);
+
 	return 0;
 }
 
@@ -180,7 +88,6 @@ static int __drm_fb_xfrm(void *dst, unsigned long dst_pitch, unsigned long dst_p
 static int __drm_fb_xfrm_toio(void __iomem *dst, unsigned long dst_pitch, unsigned long dst_pixsize,
 			      const void *vaddr, const struct drm_framebuffer *fb,
 			      const struct drm_rect *clip, bool vaddr_cached_hint,
-			      struct drm_format_conv_state *state,
 			      void (*xfrm_line)(void *dbuf, const void *sbuf, unsigned int npixels))
 {
 	unsigned long linepixels = drm_rect_width(clip);
@@ -194,9 +101,9 @@ static int __drm_fb_xfrm_toio(void __iomem *dst, unsigned long dst_pitch, unsign
 	void *dbuf;
 
 	if (vaddr_cached_hint) {
-		dbuf = drm_format_conv_state_reserve(state, dbuf_len, GFP_KERNEL);
+		dbuf = kmalloc(dbuf_len, GFP_KERNEL);
 	} else {
-		dbuf = drm_format_conv_state_reserve(state, stmp_off + sbuf_len, GFP_KERNEL);
+		dbuf = kmalloc(stmp_off + sbuf_len, GFP_KERNEL);
 		stmp = dbuf + stmp_off;
 	}
 	if (!dbuf)
@@ -217,6 +124,8 @@ static int __drm_fb_xfrm_toio(void __iomem *dst, unsigned long dst_pitch, unsign
 		dst += dst_pitch;
 	}
 
+	kfree(dbuf);
+
 	return 0;
 }
 
@@ -225,7 +134,6 @@ static int drm_fb_xfrm(struct iosys_map *dst,
 		       const unsigned int *dst_pitch, const u8 *dst_pixsize,
 		       const struct iosys_map *src, const struct drm_framebuffer *fb,
 		       const struct drm_rect *clip, bool vaddr_cached_hint,
-		       struct drm_format_conv_state *state,
 		       void (*xfrm_line)(void *dbuf, const void *sbuf, unsigned int npixels))
 {
 	static const unsigned int default_dst_pitch[DRM_FORMAT_MAX_PLANES] = {
@@ -238,24 +146,10 @@ static int drm_fb_xfrm(struct iosys_map *dst,
 	/* TODO: handle src in I/O memory here */
 	if (dst[0].is_iomem)
 		return __drm_fb_xfrm_toio(dst[0].vaddr_iomem, dst_pitch[0], dst_pixsize[0],
-					  src[0].vaddr, fb, clip, vaddr_cached_hint, state,
-					  xfrm_line);
+					  src[0].vaddr, fb, clip, vaddr_cached_hint, xfrm_line);
 	else
 		return __drm_fb_xfrm(dst[0].vaddr, dst_pitch[0], dst_pixsize[0],
-				     src[0].vaddr, fb, clip, vaddr_cached_hint, state,
-				     xfrm_line);
-}
-
-static __always_inline void drm_fb_xfrm_line_32to32(void *dbuf, const void *sbuf,
-						    unsigned int pixels,
-						    u32 (*xfrm_pixel)(u32))
-{
-	__le32 *dbuf32 = dbuf;
-	const __le32 *sbuf32 = sbuf;
-	const __le32 *send32 = sbuf32 + pixels;
-
-	while (sbuf32 < send32)
-		*dbuf32++ = cpu_to_le32(xfrm_pixel(le32_to_cpup(sbuf32++)));
+				     src[0].vaddr, fb, clip, vaddr_cached_hint, xfrm_line);
 }
 
 /**
@@ -341,7 +235,6 @@ static void drm_fb_swab32_line(void *dbuf, const void *sbuf, unsigned int pixels
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
  * @cached: Source buffer is mapped cached (eg. not write-combined)
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and swaps per-pixel
  * bytes during the process. Destination and framebuffer formats must match. The
@@ -356,8 +249,7 @@ static void drm_fb_swab32_line(void *dbuf, const void *sbuf, unsigned int pixels
  */
 void drm_fb_swab(struct iosys_map *dst, const unsigned int *dst_pitch,
 		 const struct iosys_map *src, const struct drm_framebuffer *fb,
-		 const struct drm_rect *clip, bool cached,
-		 struct drm_format_conv_state *state)
+		 const struct drm_rect *clip, bool cached)
 {
 	const struct drm_format_info *format = fb->format;
 	u8 cpp = DIV_ROUND_UP(drm_format_info_bpp(format, 0), 8);
@@ -376,7 +268,7 @@ void drm_fb_swab(struct iosys_map *dst, const unsigned int *dst_pitch,
 		return;
 	}
 
-	drm_fb_xfrm(dst, dst_pitch, &cpp, src, fb, clip, cached, state, swab_line);
+	drm_fb_xfrm(dst, dst_pitch, &cpp, src, fb, clip, cached, swab_line);
 }
 EXPORT_SYMBOL(drm_fb_swab);
 
@@ -403,7 +295,6 @@ static void drm_fb_xrgb8888_to_rgb332_line(void *dbuf, const void *sbuf, unsigne
  * @src: Array of XRGB8888 source buffers
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts the
  * color format during the process. Destination and framebuffer formats must match. The
@@ -418,13 +309,13 @@ static void drm_fb_xrgb8888_to_rgb332_line(void *dbuf, const void *sbuf, unsigne
  */
 void drm_fb_xrgb8888_to_rgb332(struct iosys_map *dst, const unsigned int *dst_pitch,
 			       const struct iosys_map *src, const struct drm_framebuffer *fb,
-			       const struct drm_rect *clip, struct drm_format_conv_state *state)
+			       const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		1,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_rgb332_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_rgb332);
@@ -473,7 +364,6 @@ static void drm_fb_xrgb8888_to_rgb565_swab_line(void *dbuf, const void *sbuf,
  * @src: Array of XRGB8888 source buffer
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  * @swab: Swap bytes
  *
  * This function copies parts of a framebuffer to display memory and converts the
@@ -489,8 +379,7 @@ static void drm_fb_xrgb8888_to_rgb565_swab_line(void *dbuf, const void *sbuf,
  */
 void drm_fb_xrgb8888_to_rgb565(struct iosys_map *dst, const unsigned int *dst_pitch,
 			       const struct iosys_map *src, const struct drm_framebuffer *fb,
-			       const struct drm_rect *clip, struct drm_format_conv_state *state,
-			       bool swab)
+			       const struct drm_rect *clip, bool swab)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		2,
@@ -503,7 +392,7 @@ void drm_fb_xrgb8888_to_rgb565(struct iosys_map *dst, const unsigned int *dst_pi
 	else
 		xfrm_line = drm_fb_xrgb8888_to_rgb565_line;
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state, xfrm_line);
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, xfrm_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_rgb565);
 
@@ -532,7 +421,6 @@ static void drm_fb_xrgb8888_to_xrgb1555_line(void *dbuf, const void *sbuf, unsig
  * @src: Array of XRGB8888 source buffer
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts
  * the color format during the process. The parameters @dst, @dst_pitch and
@@ -548,13 +436,13 @@ static void drm_fb_xrgb8888_to_xrgb1555_line(void *dbuf, const void *sbuf, unsig
  */
 void drm_fb_xrgb8888_to_xrgb1555(struct iosys_map *dst, const unsigned int *dst_pitch,
 				 const struct iosys_map *src, const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip, struct drm_format_conv_state *state)
+				 const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		2,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_xrgb1555_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_xrgb1555);
@@ -585,7 +473,6 @@ static void drm_fb_xrgb8888_to_argb1555_line(void *dbuf, const void *sbuf, unsig
  * @src: Array of XRGB8888 source buffer
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts
  * the color format during the process. The parameters @dst, @dst_pitch and
@@ -601,13 +488,13 @@ static void drm_fb_xrgb8888_to_argb1555_line(void *dbuf, const void *sbuf, unsig
  */
 void drm_fb_xrgb8888_to_argb1555(struct iosys_map *dst, const unsigned int *dst_pitch,
 				 const struct iosys_map *src, const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip, struct drm_format_conv_state *state)
+				 const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		2,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_argb1555_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_argb1555);
@@ -638,7 +525,6 @@ static void drm_fb_xrgb8888_to_rgba5551_line(void *dbuf, const void *sbuf, unsig
  * @src: Array of XRGB8888 source buffer
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts
  * the color format during the process. The parameters @dst, @dst_pitch and
@@ -654,13 +540,13 @@ static void drm_fb_xrgb8888_to_rgba5551_line(void *dbuf, const void *sbuf, unsig
  */
 void drm_fb_xrgb8888_to_rgba5551(struct iosys_map *dst, const unsigned int *dst_pitch,
 				 const struct iosys_map *src, const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip, struct drm_format_conv_state *state)
+				 const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		2,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_rgba5551_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_rgba5551);
@@ -689,7 +575,6 @@ static void drm_fb_xrgb8888_to_rgb888_line(void *dbuf, const void *sbuf, unsigne
  * @src: Array of XRGB8888 source buffers
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts the
  * color format during the process. Destination and framebuffer formats must match. The
@@ -705,71 +590,29 @@ static void drm_fb_xrgb8888_to_rgb888_line(void *dbuf, const void *sbuf, unsigne
  */
 void drm_fb_xrgb8888_to_rgb888(struct iosys_map *dst, const unsigned int *dst_pitch,
 			       const struct iosys_map *src, const struct drm_framebuffer *fb,
-			       const struct drm_rect *clip, struct drm_format_conv_state *state)
+			       const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		3,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_rgb888_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_rgb888);
 
-static void drm_fb_xrgb8888_to_bgr888_line(void *dbuf, const void *sbuf, unsigned int pixels)
+static void drm_fb_xrgb8888_to_argb8888_line(void *dbuf, const void *sbuf, unsigned int pixels)
 {
-	u8 *dbuf8 = dbuf;
+	__le32 *dbuf32 = dbuf;
 	const __le32 *sbuf32 = sbuf;
 	unsigned int x;
 	u32 pix;
 
 	for (x = 0; x < pixels; x++) {
 		pix = le32_to_cpu(sbuf32[x]);
-		/* write red-green-blue to output in little endianness */
-		*dbuf8++ = (pix & 0x00ff0000) >> 16;
-		*dbuf8++ = (pix & 0x0000ff00) >> 8;
-		*dbuf8++ = (pix & 0x000000ff) >> 0;
+		pix |= GENMASK(31, 24); /* fill alpha bits */
+		dbuf32[x] = cpu_to_le32(pix);
 	}
-}
-
-/**
- * drm_fb_xrgb8888_to_bgr888 - Convert XRGB8888 to BGR888 clip buffer
- * @dst: Array of BGR888 destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffers
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
- *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. Destination and framebuffer formats must match. The
- * parameters @dst, @dst_pitch and @src refer to arrays. Each array must have at
- * least as many entries as there are planes in @fb's format. Each entry stores the
- * value for the format's respective color plane at the same index.
- *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
- *
- * Drivers can use this function for BGR888 devices that don't natively
- * support XRGB8888.
- */
-void drm_fb_xrgb8888_to_bgr888(struct iosys_map *dst, const unsigned int *dst_pitch,
-			       const struct iosys_map *src, const struct drm_framebuffer *fb,
-			       const struct drm_rect *clip, struct drm_format_conv_state *state)
-{
-	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
-		3,
-	};
-
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
-		    drm_fb_xrgb8888_to_bgr888_line);
-}
-EXPORT_SYMBOL(drm_fb_xrgb8888_to_bgr888);
-
-static void drm_fb_xrgb8888_to_argb8888_line(void *dbuf, const void *sbuf, unsigned int pixels)
-{
-	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_argb8888);
 }
 
 /**
@@ -780,7 +623,6 @@ static void drm_fb_xrgb8888_to_argb8888_line(void *dbuf, const void *sbuf, unsig
  * @src: Array of XRGB8888 source buffer
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts the
  * color format during the process. The parameters @dst, @dst_pitch and @src refer
@@ -796,146 +638,93 @@ static void drm_fb_xrgb8888_to_argb8888_line(void *dbuf, const void *sbuf, unsig
  */
 void drm_fb_xrgb8888_to_argb8888(struct iosys_map *dst, const unsigned int *dst_pitch,
 				 const struct iosys_map *src, const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip, struct drm_format_conv_state *state)
+				 const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		4,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_argb8888_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_argb8888);
 
 static void drm_fb_xrgb8888_to_abgr8888_line(void *dbuf, const void *sbuf, unsigned int pixels)
 {
-	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_abgr8888);
+	__le32 *dbuf32 = dbuf;
+	const __le32 *sbuf32 = sbuf;
+	unsigned int x;
+	u32 pix;
+
+	for (x = 0; x < pixels; x++) {
+		pix = le32_to_cpu(sbuf32[x]);
+		pix = ((pix & 0x00ff0000) >> 16) <<  0 |
+		      ((pix & 0x0000ff00) >>  8) <<  8 |
+		      ((pix & 0x000000ff) >>  0) << 16 |
+		      GENMASK(31, 24); /* fill alpha bits */
+		*dbuf32++ = cpu_to_le32(pix);
+	}
 }
 
-/**
- * drm_fb_xrgb8888_to_abgr8888 - Convert XRGB8888 to ABGR8888 clip buffer
- * @dst: Array of ABGR8888 destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffer
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
- *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. The parameters @dst, @dst_pitch and @src refer
- * to arrays. Each array must have at least as many entries as there are planes in
- * @fb's format. Each entry stores the value for the format's respective color plane
- * at the same index.
- *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
- *
- * Drivers can use this function for ABGR8888 devices that don't support XRGB8888
- * natively. It sets an opaque alpha channel as part of the conversion.
- */
-void drm_fb_xrgb8888_to_abgr8888(struct iosys_map *dst, const unsigned int *dst_pitch,
-				 const struct iosys_map *src,
-				 const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip,
-				 struct drm_format_conv_state *state)
+static void drm_fb_xrgb8888_to_abgr8888(struct iosys_map *dst, const unsigned int *dst_pitch,
+					const struct iosys_map *src,
+					const struct drm_framebuffer *fb,
+					const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		4,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_abgr8888_line);
 }
-EXPORT_SYMBOL(drm_fb_xrgb8888_to_abgr8888);
 
 static void drm_fb_xrgb8888_to_xbgr8888_line(void *dbuf, const void *sbuf, unsigned int pixels)
 {
-	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_xbgr8888);
+	__le32 *dbuf32 = dbuf;
+	const __le32 *sbuf32 = sbuf;
+	unsigned int x;
+	u32 pix;
+
+	for (x = 0; x < pixels; x++) {
+		pix = le32_to_cpu(sbuf32[x]);
+		pix = ((pix & 0x00ff0000) >> 16) <<  0 |
+		      ((pix & 0x0000ff00) >>  8) <<  8 |
+		      ((pix & 0x000000ff) >>  0) << 16 |
+		      ((pix & 0xff000000) >> 24) << 24;
+		*dbuf32++ = cpu_to_le32(pix);
+	}
 }
 
-/**
- * drm_fb_xrgb8888_to_xbgr8888 - Convert XRGB8888 to XBGR8888 clip buffer
- * @dst: Array of XBGR8888 destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffer
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
- *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. The parameters @dst, @dst_pitch and @src refer
- * to arrays. Each array must have at least as many entries as there are planes in
- * @fb's format. Each entry stores the value for the format's respective color plane
- * at the same index.
- *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
- *
- * Drivers can use this function for XBGR8888 devices that don't support XRGB8888
- * natively.
- */
-void drm_fb_xrgb8888_to_xbgr8888(struct iosys_map *dst, const unsigned int *dst_pitch,
-				 const struct iosys_map *src,
-				 const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip,
-				 struct drm_format_conv_state *state)
+static void drm_fb_xrgb8888_to_xbgr8888(struct iosys_map *dst, const unsigned int *dst_pitch,
+					const struct iosys_map *src,
+					const struct drm_framebuffer *fb,
+					const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		4,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_xbgr8888_line);
 }
-EXPORT_SYMBOL(drm_fb_xrgb8888_to_xbgr8888);
-
-static void drm_fb_xrgb8888_to_bgrx8888_line(void *dbuf, const void *sbuf, unsigned int pixels)
-{
-	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_bgrx8888);
-}
-
-/**
- * drm_fb_xrgb8888_to_bgrx8888 - Convert XRGB8888 to BGRX8888 clip buffer
- * @dst: Array of BGRX8888 destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffer
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
- *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. The parameters @dst, @dst_pitch and @src refer
- * to arrays. Each array must have at least as many entries as there are planes in
- * @fb's format. Each entry stores the value for the format's respective color plane
- * at the same index.
- *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
- *
- * Drivers can use this function for BGRX8888 devices that don't support XRGB8888
- * natively.
- */
-void drm_fb_xrgb8888_to_bgrx8888(struct iosys_map *dst, const unsigned int *dst_pitch,
-				 const struct iosys_map *src,
-				 const struct drm_framebuffer *fb,
-				 const struct drm_rect *clip,
-				 struct drm_format_conv_state *state)
-{
-	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
-		4,
-	};
-
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
-		    drm_fb_xrgb8888_to_bgrx8888_line);
-}
-EXPORT_SYMBOL(drm_fb_xrgb8888_to_bgrx8888);
 
 static void drm_fb_xrgb8888_to_xrgb2101010_line(void *dbuf, const void *sbuf, unsigned int pixels)
 {
-	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_xrgb2101010);
+	__le32 *dbuf32 = dbuf;
+	const __le32 *sbuf32 = sbuf;
+	unsigned int x;
+	u32 val32;
+	u32 pix;
+
+	for (x = 0; x < pixels; x++) {
+		pix = le32_to_cpu(sbuf32[x]);
+		val32 = ((pix & 0x000000FF) << 2) |
+			((pix & 0x0000FF00) << 4) |
+			((pix & 0x00FF0000) << 6);
+		pix = val32 | ((val32 >> 8) & 0x00300C03);
+		*dbuf32++ = cpu_to_le32(pix);
+	}
 }
 
 /**
@@ -946,7 +735,6 @@ static void drm_fb_xrgb8888_to_xrgb2101010_line(void *dbuf, const void *sbuf, un
  * @src: Array of XRGB8888 source buffers
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts the
  * color format during the process. Destination and framebuffer formats must match. The
@@ -962,21 +750,34 @@ static void drm_fb_xrgb8888_to_xrgb2101010_line(void *dbuf, const void *sbuf, un
  */
 void drm_fb_xrgb8888_to_xrgb2101010(struct iosys_map *dst, const unsigned int *dst_pitch,
 				    const struct iosys_map *src, const struct drm_framebuffer *fb,
-				    const struct drm_rect *clip,
-				    struct drm_format_conv_state *state)
+				    const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		4,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_xrgb2101010_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_xrgb2101010);
 
 static void drm_fb_xrgb8888_to_argb2101010_line(void *dbuf, const void *sbuf, unsigned int pixels)
 {
-	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_argb2101010);
+	__le32 *dbuf32 = dbuf;
+	const __le32 *sbuf32 = sbuf;
+	unsigned int x;
+	u32 val32;
+	u32 pix;
+
+	for (x = 0; x < pixels; x++) {
+		pix = le32_to_cpu(sbuf32[x]);
+		val32 = ((pix & 0x000000ff) << 2) |
+			((pix & 0x0000ff00) << 4) |
+			((pix & 0x00ff0000) << 6);
+		pix = GENMASK(31, 30) | /* set alpha bits */
+		      val32 | ((val32 >> 8) & 0x00300c03);
+		*dbuf32++ = cpu_to_le32(pix);
+	}
 }
 
 /**
@@ -987,7 +788,6 @@ static void drm_fb_xrgb8888_to_argb2101010_line(void *dbuf, const void *sbuf, un
  * @src: Array of XRGB8888 source buffers
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts
  * the color format during the process. The parameters @dst, @dst_pitch and
@@ -1003,14 +803,13 @@ static void drm_fb_xrgb8888_to_argb2101010_line(void *dbuf, const void *sbuf, un
  */
 void drm_fb_xrgb8888_to_argb2101010(struct iosys_map *dst, const unsigned int *dst_pitch,
 				    const struct iosys_map *src, const struct drm_framebuffer *fb,
-				    const struct drm_rect *clip,
-				    struct drm_format_conv_state *state)
+				    const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		4,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_argb2101010_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_argb2101010);
@@ -1040,7 +839,6 @@ static void drm_fb_xrgb8888_to_gray8_line(void *dbuf, const void *sbuf, unsigned
  * @src: Array of XRGB8888 source buffers
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts the
  * color format during the process. Destination and framebuffer formats must match. The
@@ -1060,13 +858,13 @@ static void drm_fb_xrgb8888_to_gray8_line(void *dbuf, const void *sbuf, unsigned
  */
 void drm_fb_xrgb8888_to_gray8(struct iosys_map *dst, const unsigned int *dst_pitch,
 			      const struct iosys_map *src, const struct drm_framebuffer *fb,
-			      const struct drm_rect *clip, struct drm_format_conv_state *state)
+			      const struct drm_rect *clip)
 {
 	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
 		1,
 	};
 
-	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false,
 		    drm_fb_xrgb8888_to_gray8_line);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_gray8);
@@ -1080,7 +878,6 @@ EXPORT_SYMBOL(drm_fb_xrgb8888_to_gray8);
  * @src:	The framebuffer memory to copy from
  * @fb:		The framebuffer to copy from
  * @clip:	Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory. If the
  * formats of the display and the framebuffer mismatch, the blit function
@@ -1099,7 +896,7 @@ EXPORT_SYMBOL(drm_fb_xrgb8888_to_gray8);
  */
 int drm_fb_blit(struct iosys_map *dst, const unsigned int *dst_pitch, uint32_t dst_format,
 		const struct iosys_map *src, const struct drm_framebuffer *fb,
-		const struct drm_rect *clip, struct drm_format_conv_state *state)
+		const struct drm_rect *clip)
 {
 	uint32_t fb_format = fb->format->format;
 
@@ -1107,47 +904,44 @@ int drm_fb_blit(struct iosys_map *dst, const unsigned int *dst_pitch, uint32_t d
 		drm_fb_memcpy(dst, dst_pitch, src, fb, clip);
 		return 0;
 	} else if (fb_format == (dst_format | DRM_FORMAT_BIG_ENDIAN)) {
-		drm_fb_swab(dst, dst_pitch, src, fb, clip, false, state);
+		drm_fb_swab(dst, dst_pitch, src, fb, clip, false);
 		return 0;
 	} else if (fb_format == (dst_format & ~DRM_FORMAT_BIG_ENDIAN)) {
-		drm_fb_swab(dst, dst_pitch, src, fb, clip, false, state);
+		drm_fb_swab(dst, dst_pitch, src, fb, clip, false);
 		return 0;
 	} else if (fb_format == DRM_FORMAT_XRGB8888) {
 		if (dst_format == DRM_FORMAT_RGB565) {
-			drm_fb_xrgb8888_to_rgb565(dst, dst_pitch, src, fb, clip, state, false);
+			drm_fb_xrgb8888_to_rgb565(dst, dst_pitch, src, fb, clip, false);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_XRGB1555) {
-			drm_fb_xrgb8888_to_xrgb1555(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_xrgb1555(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_ARGB1555) {
-			drm_fb_xrgb8888_to_argb1555(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_argb1555(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_RGBA5551) {
-			drm_fb_xrgb8888_to_rgba5551(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_rgba5551(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_RGB888) {
-			drm_fb_xrgb8888_to_rgb888(dst, dst_pitch, src, fb, clip, state);
-			return 0;
-		} else if (dst_format == DRM_FORMAT_BGR888) {
-			drm_fb_xrgb8888_to_bgr888(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_rgb888(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_ARGB8888) {
-			drm_fb_xrgb8888_to_argb8888(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_argb8888(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_XBGR8888) {
-			drm_fb_xrgb8888_to_xbgr8888(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_xbgr8888(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_ABGR8888) {
-			drm_fb_xrgb8888_to_abgr8888(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_abgr8888(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_XRGB2101010) {
-			drm_fb_xrgb8888_to_xrgb2101010(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_xrgb2101010(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_ARGB2101010) {
-			drm_fb_xrgb8888_to_argb2101010(dst, dst_pitch, src, fb, clip, state);
+			drm_fb_xrgb8888_to_argb2101010(dst, dst_pitch, src, fb, clip);
 			return 0;
 		} else if (dst_format == DRM_FORMAT_BGRX8888) {
-			drm_fb_swab(dst, dst_pitch, src, fb, clip, false, state);
+			drm_fb_swab(dst, dst_pitch, src, fb, clip, false);
 			return 0;
 		}
 	}
@@ -1184,7 +978,6 @@ static void drm_fb_gray8_to_mono_line(void *dbuf, const void *sbuf, unsigned int
  * @src: Array of XRGB8888 source buffers
  * @fb: DRM framebuffer
  * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
  *
  * This function copies parts of a framebuffer to display memory and converts the
  * color format during the process. Destination and framebuffer formats must match. The
@@ -1209,7 +1002,7 @@ static void drm_fb_gray8_to_mono_line(void *dbuf, const void *sbuf, unsigned int
  */
 void drm_fb_xrgb8888_to_mono(struct iosys_map *dst, const unsigned int *dst_pitch,
 			     const struct iosys_map *src, const struct drm_framebuffer *fb,
-			     const struct drm_rect *clip, struct drm_format_conv_state *state)
+			     const struct drm_rect *clip)
 {
 	static const unsigned int default_dst_pitch[DRM_FORMAT_MAX_PLANES] = {
 		0, 0, 0, 0
@@ -1249,7 +1042,7 @@ void drm_fb_xrgb8888_to_mono(struct iosys_map *dst, const unsigned int *dst_pitc
 	 * Allocate a buffer to be used for both copying from the cma
 	 * memory and to store the intermediate grayscale line pixels.
 	 */
-	src32 = drm_format_conv_state_reserve(state, len_src32 + linepixels, GFP_KERNEL);
+	src32 = kmalloc(len_src32 + linepixels, GFP_KERNEL);
 	if (!src32)
 		return;
 
@@ -1263,6 +1056,8 @@ void drm_fb_xrgb8888_to_mono(struct iosys_map *dst, const unsigned int *dst_pitc
 		vaddr += fb->pitches[0];
 		mono += dst_pitch_0;
 	}
+
+	kfree(src32);
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_mono);
 

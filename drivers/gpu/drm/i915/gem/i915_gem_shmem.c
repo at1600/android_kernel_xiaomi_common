@@ -209,6 +209,8 @@ static int shmem_get_pages(struct drm_i915_gem_object *obj)
 	struct address_space *mapping = obj->base.filp->f_mapping;
 	unsigned int max_segment = i915_sg_segment_size(i915->drm.dev);
 	struct sg_table *st;
+	struct sgt_iter sgt_iter;
+	struct page *page;
 	int ret;
 
 	/*
@@ -237,7 +239,9 @@ rebuild_st:
 		 * for PAGE_SIZE chunks instead may be helpful.
 		 */
 		if (max_segment > PAGE_SIZE) {
-			shmem_sg_free_table(st, mapping, false, false);
+			for_each_sgt_page(page, sgt_iter, st)
+				put_page(page);
+			sg_free_table(st);
 			kfree(st);
 
 			max_segment = PAGE_SIZE;
@@ -420,8 +424,7 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
 	struct address_space *mapping = obj->base.filp->f_mapping;
 	const struct address_space_operations *aops = mapping->a_ops;
 	char __user *user_data = u64_to_user_ptr(arg->data_ptr);
-	u64 remain;
-	loff_t pos;
+	u64 remain, offset;
 	unsigned int pg;
 
 	/* Caller already validated user args */
@@ -454,12 +457,12 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
 	 */
 
 	remain = arg->size;
-	pos = arg->offset;
-	pg = offset_in_page(pos);
+	offset = arg->offset;
+	pg = offset_in_page(offset);
 
 	do {
 		unsigned int len, unwritten;
-		struct folio *folio;
+		struct page *page;
 		void *data, *vaddr;
 		int err;
 		char __maybe_unused c;
@@ -477,19 +480,19 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
 		if (err)
 			return err;
 
-		err = aops->write_begin(obj->base.filp, mapping, pos, len,
-					&folio, &data);
+		err = aops->write_begin(obj->base.filp, mapping, offset, len,
+					&page, &data);
 		if (err < 0)
 			return err;
 
-		vaddr = kmap_local_folio(folio, offset_in_folio(folio, pos));
-		pagefault_disable();
-		unwritten = __copy_from_user_inatomic(vaddr, user_data, len);
-		pagefault_enable();
-		kunmap_local(vaddr);
+		vaddr = kmap_atomic(page);
+		unwritten = __copy_from_user_inatomic(vaddr + pg,
+						      user_data,
+						      len);
+		kunmap_atomic(vaddr);
 
-		err = aops->write_end(obj->base.filp, mapping, pos, len,
-				      len - unwritten, folio, data);
+		err = aops->write_end(obj->base.filp, mapping, offset, len,
+				      len - unwritten, page, data);
 		if (err < 0)
 			return err;
 
@@ -499,7 +502,7 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
 
 		remain -= len;
 		user_data += len;
-		pos += len;
+		offset += len;
 		pg = 0;
 	} while (remain);
 
@@ -649,17 +652,17 @@ i915_gem_object_create_shmem(struct drm_i915_private *i915,
 
 /* Allocate a new GEM object and fill it with the supplied data */
 struct drm_i915_gem_object *
-i915_gem_object_create_shmem_from_data(struct drm_i915_private *i915,
+i915_gem_object_create_shmem_from_data(struct drm_i915_private *dev_priv,
 				       const void *data, resource_size_t size)
 {
 	struct drm_i915_gem_object *obj;
 	struct file *file;
 	const struct address_space_operations *aops;
-	loff_t pos;
+	resource_size_t offset;
 	int err;
 
-	GEM_WARN_ON(IS_DGFX(i915));
-	obj = i915_gem_object_create_shmem(i915, round_up(size, PAGE_SIZE));
+	GEM_WARN_ON(IS_DGFX(dev_priv));
+	obj = i915_gem_object_create_shmem(dev_priv, round_up(size, PAGE_SIZE));
 	if (IS_ERR(obj))
 		return obj;
 
@@ -667,27 +670,29 @@ i915_gem_object_create_shmem_from_data(struct drm_i915_private *i915,
 
 	file = obj->base.filp;
 	aops = file->f_mapping->a_ops;
-	pos = 0;
+	offset = 0;
 	do {
 		unsigned int len = min_t(typeof(size), size, PAGE_SIZE);
-		struct folio *folio;
-		void *fsdata;
+		struct page *page;
+		void *pgdata, *vaddr;
 
-		err = aops->write_begin(file, file->f_mapping, pos, len,
-					&folio, &fsdata);
+		err = aops->write_begin(file, file->f_mapping, offset, len,
+					&page, &pgdata);
 		if (err < 0)
 			goto fail;
 
-		memcpy_to_folio(folio, offset_in_folio(folio, pos), data, len);
+		vaddr = kmap(page);
+		memcpy(vaddr, data, len);
+		kunmap(page);
 
-		err = aops->write_end(file, file->f_mapping, pos, len, len,
-				      folio, fsdata);
+		err = aops->write_end(file, file->f_mapping, offset, len, len,
+				      page, pgdata);
 		if (err < 0)
 			goto fail;
 
 		size -= len;
 		data += len;
-		pos += len;
+		offset += len;
 	} while (size);
 
 	return obj;
