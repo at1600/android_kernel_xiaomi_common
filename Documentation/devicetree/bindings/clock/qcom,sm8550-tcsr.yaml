@@ -16,6 +16,7 @@ description: |
   See also:
   - include/dt-bindings/clock/qcom,sm8550-tcsr.h
   - include/dt-bindings/clock/qcom,sm8650-tcsr.h
+  - include/dt-bindings/clock/qcom,x1e80100-tcsr.h
 
 properties:
   compatible:

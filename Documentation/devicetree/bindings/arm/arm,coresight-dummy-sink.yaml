@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/arm/arm,coresight-dummy-sink.yaml#
@@ -15,14 +15,14 @@ description: |
   sink.
 
   The Coresight dummy sink component is for the specific coresight sink devices
-  kernel don't have permission to access or configure, e.g., CoreSight EUD on
-  Qualcomm platforms. It is a mini-USB hub implemented to support the USB-based
-  debug and trace capabilities. For this device, a dummy driver is needed to
-  register it as Coresight sink device in kernel side, so that path can be
-  created in the driver. Then the trace flow would be transferred to EUD via
-  coresight link of AP processor. It provides Coresight API for operations on
-  dummy source devices, such as enabling and disabling them. It also provides
-  the Coresight dummy source paths for debugging.
+  kernel don't have permission to access or configure, e.g., CoreSight EUD, it
+  is a mini-USB hub implemented to support the USB-based debug and trace
+  capabilities. For this device, a dummy driver is needed to register it as
+  Coresight sink device in kernel side, so that path can be created in the
+  driver. Then the trace flow would be transferred to EUD via coresight link of
+  AP processor. It provides Coresight API for operations on dummy source devices,
+  such as enabling and disabling them. It also provides the Coresight dummy source
+  paths for debugging.
 
   The primary use case of the coresight dummy sink is to build path in kernel
   side for dummy sink component.
@@ -30,7 +30,7 @@ description: |
 maintainers:
   - Mike Leach <mike.leach@linaro.org>
   - Suzuki K Poulose <suzuki.poulose@arm.com>
-  - James Clark <james.clark@linaro.org>
+  - James Clark <james.clark@arm.com>
   - Mao Jinlong <quic_jinlmao@quicinc.com>
   - Hao Zhang <quic_hazha@quicinc.com>
 
