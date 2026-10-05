@@ -2,6 +2,6 @@
 
 config PRINTK_ENHANCE
 	tristate "printk_enhance support"
-	default n
+	default y
 	help
 		printk enhance will add more additional information to the beginning of the log, improving troubleshooting efficiency.
