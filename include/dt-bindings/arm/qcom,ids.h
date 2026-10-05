@@ -234,13 +234,13 @@
 #define QCOM_ID_SA8540P			461
 #define QCOM_ID_QCM4290			469
 #define QCOM_ID_QCS4290			470
-#define QCOM_ID_SM7325			475
 #define QCOM_ID_SM8450_2		480
 #define QCOM_ID_SM8450_3		482
+#define QCOM_ID_MONACO			486
 #define QCOM_ID_SC7280			487
 #define QCOM_ID_SC7180P			495
 #define QCOM_ID_QCM6490			497
-#define QCOM_ID_SM7325P			499
+#define QCOM_ID_QCS6490			498
 #define QCOM_ID_IPQ5000			503
 #define QCOM_ID_IPQ0509			504
 #define QCOM_ID_IPQ0518			505
@@ -270,14 +270,24 @@
 #define QCOM_ID_QRU1062			590
 #define QCOM_ID_IPQ5332			592
 #define QCOM_ID_IPQ5322			593
+#define QCOM_ID_PINEAPPLE		557
+#define QCOM_ID_PINEAPPLEP		577
 #define QCOM_ID_IPQ5312			594
 #define QCOM_ID_IPQ5302			595
 #define QCOM_ID_QCS8550			603
 #define QCOM_ID_QCM8550			604
+#define QCOM_ID_SUN				618
+#define QCOM_ID_SUNP			639
 #define QCOM_ID_IPQ5300			624
+#define QCOM_ID_X1P42100		635
 #define QCOM_ID_IPQ5321			650
-#define QCOM_ID_QCS8300			674
-#define QCOM_ID_QCS8275			675
+#define QCOM_ID_CANOE			660
+#define QCOM_ID_CANOEP			661
+#define QCOM_ID_VIENNA			669
+#define QCOM_ID_VIENNAP			670
+#define QCOM_ID_ALOR			685
+#define QCOM_ID_ALOR_INTERPOSER		704
+#define QCOM_ID_CHORA			724
 
 /*
  * The board type and revision information, used by Qualcomm bootloaders and

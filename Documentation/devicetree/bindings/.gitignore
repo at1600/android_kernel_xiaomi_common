@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-*.example.dts
+*.example.dts*
+*.example.dtb*
 /processed-schema*.yaml
 /processed-schema*.json
-
-#
-# We don't want to ignore the following even if they are dot-files
-#
-!.yamllint

@@ -63,7 +63,8 @@ properties:
   pinctrl-1:
     description: configuration for the sleep state
 
-  operating-points-v2: true
+  operating-points-v2:
+    $ref: /schemas/types.yaml#/definitions/phandle
 
   power-domains:
     items:

@@ -406,6 +406,22 @@ static int stmmac_of_get_mac_mode(struct device_node *np)
 }
 
 /**
+ * stmmac_remove_config_dt - undo the effects of stmmac_probe_config_dt()
+ * @pdev: platform_device structure
+ * @plat: driver data platform structure
+ *
+ * Release resources claimed by stmmac_probe_config_dt().
+ */
+static void stmmac_remove_config_dt(struct platform_device *pdev,
+				    struct plat_stmmacenet_data *plat)
+{
+	clk_disable_unprepare(plat->stmmac_clk);
+	clk_disable_unprepare(plat->pclk);
+	of_node_put(plat->phy_node);
+	of_node_put(plat->mdio_node);
+}
+
+/**
  * stmmac_probe_config_dt - parse device-tree driver parameters
  * @pdev: platform_device structure
  * @mac: MAC address to use
@@ -419,7 +435,6 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 	struct device_node *np = pdev->dev.of_node;
 	struct plat_stmmacenet_data *plat;
 	struct stmmac_dma_cfg *dma_cfg;
-	static int bus_id = -ENODEV;
 	int phy_mode;
 	void *ret;
 	int rc;
@@ -455,14 +470,8 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 	of_property_read_u32(np, "max-speed", &plat->max_speed);
 
 	plat->bus_id = of_alias_get_id(np, "ethernet");
-	if (plat->bus_id < 0) {
-		if (bus_id < 0)
-			bus_id = of_alias_get_highest_id("ethernet");
-		/* No ethernet alias found, init at -1 so first bus_id is 0 */
-		if (bus_id < 0)
-			bus_id = -1;
-		plat->bus_id = ++bus_id;
-	}
+	if (plat->bus_id < 0)
+		plat->bus_id = 0;
 
 	/* Default to phy auto-detection */
 	plat->phy_addr = -1;
@@ -481,10 +490,8 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 		dev_warn(&pdev->dev, "snps,phy-addr property is deprecated\n");
 
 	rc = stmmac_mdio_setup(plat, np, &pdev->dev);
-	if (rc) {
-		ret = ERR_PTR(rc);
-		goto error_put_phy;
-	}
+	if (rc)
+		return ERR_PTR(rc);
 
 	of_property_read_u32(np, "tx-fifo-depth", &plat->tx_fifo_size);
 
@@ -573,8 +580,8 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 	dma_cfg = devm_kzalloc(&pdev->dev, sizeof(*dma_cfg),
 			       GFP_KERNEL);
 	if (!dma_cfg) {
-		ret = ERR_PTR(-ENOMEM);
-		goto error_put_mdio;
+		stmmac_remove_config_dt(pdev, plat);
+		return ERR_PTR(-ENOMEM);
 	}
 	plat->dma_cfg = dma_cfg;
 
@@ -602,8 +609,8 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 
 	rc = stmmac_mtl_setup(pdev, plat);
 	if (rc) {
-		ret = ERR_PTR(rc);
-		goto error_put_mdio;
+		stmmac_remove_config_dt(pdev, plat);
+		return ERR_PTR(rc);
 	}
 
 	/* clock setup */
@@ -655,10 +662,6 @@ error_hw_init:
 	clk_disable_unprepare(plat->pclk);
 error_pclk_get:
 	clk_disable_unprepare(plat->stmmac_clk);
-error_put_mdio:
-	of_node_put(plat->mdio_node);
-error_put_phy:
-	of_node_put(plat->phy_node);
 
 	return ret;
 }
@@ -667,17 +670,16 @@ static void devm_stmmac_remove_config_dt(void *data)
 {
 	struct plat_stmmacenet_data *plat = data;
 
-	clk_disable_unprepare(plat->stmmac_clk);
-	clk_disable_unprepare(plat->pclk);
-	of_node_put(plat->mdio_node);
-	of_node_put(plat->phy_node);
+	/* Platform data argument is unused */
+	stmmac_remove_config_dt(NULL, plat);
 }
 
 /**
  * devm_stmmac_probe_config_dt
  * @pdev: platform_device structure
  * @mac: MAC address to use
- * Description: Devres variant of stmmac_probe_config_dt().
+ * Description: Devres variant of stmmac_probe_config_dt(). Does not require
+ * the user to call stmmac_remove_config_dt() at driver detach.
  */
 struct plat_stmmacenet_data *
 devm_stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)

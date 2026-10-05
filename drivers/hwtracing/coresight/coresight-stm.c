@@ -2,6 +2,8 @@
 /*
  * Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
  *
+ * Copyright (c) 2023-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ *
  * Description: CoreSight System Trace Macrocell driver
  *
  * Initial implementation by Pratik Patel
@@ -30,9 +32,12 @@
 #include <linux/pm_runtime.h>
 #include <linux/stm.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 
 #include "coresight-priv.h"
 #include "coresight-trace-id.h"
+#include "coresight-common.h"
+#include "../stm/stm.h"
 
 #define STMDMASTARTR			0xc04
 #define STMDMASTOPR			0xc08
@@ -146,6 +151,7 @@ struct stm_drvdata {
 	u32			stmheer;
 	u32			stmheter;
 	u32			stmhebsr;
+	bool			static_atid;
 };
 
 static void stm_hwevent_enable_hw(struct stm_drvdata *drvdata)
@@ -194,9 +200,9 @@ static void stm_enable_hw(struct stm_drvdata *drvdata)
 }
 
 static int stm_enable(struct coresight_device *csdev, struct perf_event *event,
-		      enum cs_mode mode,
-		      __maybe_unused struct coresight_trace_id_map *trace_id)
+		      enum cs_mode mode)
 {
+	int ret;
 	struct stm_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
 
 	if (mode != CS_MODE_SYSFS)
@@ -206,8 +212,22 @@ static int stm_enable(struct coresight_device *csdev, struct perf_event *event,
 		/* Someone is already using the tracer */
 		return -EBUSY;
 	}
+	if (drvdata->static_atid) {
+		ret = coresight_trace_id_reserve_id(drvdata->traceid);
+		if (ret) {
+			coresight_set_mode(csdev, CS_MODE_DISABLED);
+			dev_err(&csdev->dev, "reserve ATID: %d fail\n", drvdata->traceid);
+			return ret;
+		}
+	}
+	coresight_csr_set_etr_atid(csdev, drvdata->traceid, true, NULL);
 
-	pm_runtime_get_sync(csdev->dev.parent);
+	ret = pm_runtime_resume_and_get(csdev->dev.parent);
+	if (ret < 0) {
+		coresight_csr_set_etr_atid(csdev, drvdata->traceid, false, NULL);
+		coresight_set_mode(csdev, CS_MODE_DISABLED);
+		return ret;
+	}
 
 	spin_lock(&drvdata->spinlock);
 	stm_enable_hw(drvdata);
@@ -274,8 +294,11 @@ static void stm_disable(struct coresight_device *csdev,
 		/* Wait until the engine has completely stopped */
 		coresight_timeout(csa, STMTCSR, STMTCSR_BUSY_BIT, 0);
 
-		pm_runtime_put(csdev->dev.parent);
+		pm_runtime_put_sync(csdev->dev.parent);
 
+		coresight_csr_set_etr_atid(csdev, drvdata->traceid, false, NULL);
+		if (drvdata->static_atid)
+			coresight_trace_id_free_reserved_id(drvdata->traceid);
 		coresight_set_mode(csdev, CS_MODE_DISABLED);
 		dev_dbg(&csdev->dev, "STM tracing disabled\n");
 	}
@@ -880,6 +903,7 @@ static int __stm_probe(struct device *dev, struct resource *res)
 		dev_info(dev,
 			 "%s : stm_register_device failed, probing deferred\n",
 			 desc.name);
+		pm_runtime_put(dev);
 		return -EPROBE_DEFER;
 	}
 
@@ -902,12 +926,17 @@ static int __stm_probe(struct device *dev, struct resource *res)
 		goto stm_unregister;
 	}
 
-	trace_id = coresight_trace_id_get_system_id();
-	if (trace_id < 0) {
-		ret = trace_id;
-		goto cs_unregister;
+	if (!of_property_read_u32(dev->of_node, "atid", &trace_id))
+		drvdata->static_atid = true;
+	else {
+		trace_id = coresight_trace_id_get_system_id();
+		if (trace_id < 0) {
+			ret = trace_id;
+			goto cs_unregister;
+		}
 	}
 	drvdata->traceid = (u8)trace_id;
+
 
 	dev_info(&drvdata->csdev->dev, "%s initialized\n",
 		 stm_csdev_name(drvdata->csdev));
@@ -936,7 +965,8 @@ static void __stm_remove(struct device *dev)
 {
 	struct stm_drvdata *drvdata = dev_get_drvdata(dev);
 
-	coresight_trace_id_put_system_id(drvdata->traceid);
+	if (!drvdata->static_atid)
+		coresight_trace_id_put_system_id(drvdata->traceid);
 	coresight_unregister(drvdata->csdev);
 
 	stm_unregister_device(&drvdata->stm);
@@ -973,8 +1003,93 @@ static int stm_runtime_resume(struct device *dev)
 }
 #endif
 
+#ifdef CONFIG_DEEPSLEEP
+static int stm_suspend(struct device *dev)
+{
+	struct stm_drvdata *drvdata = dev_get_drvdata(dev);
+	struct stm_device	*stm_dev;
+	struct list_head	*head, *p;
+
+	if (pm_suspend_via_firmware()) {
+		coresight_disable_sysfs(drvdata->csdev);
+
+		stm_dev = drvdata->stm.stm;
+		if (stm_dev) {
+			head = &stm_dev->link_list;
+			list_for_each(p, head)
+				pm_runtime_put_autosuspend(&stm_dev->dev);
+		}
+	}
+
+	return 0;
+}
+
+static int stm_resume(struct device *dev)
+{
+	struct stm_drvdata *drvdata = dev_get_drvdata(dev);
+	struct stm_device	*stm_dev;
+	struct list_head	*head, *p;
+
+	if (pm_suspend_via_firmware()) {
+		stm_dev = drvdata->stm.stm;
+		if (stm_dev) {
+			head = &stm_dev->link_list;
+			list_for_each(p, head)
+				pm_runtime_get(&stm_dev->dev);
+		}
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_HIBERNATION
+static int stm_freeze(struct device *dev)
+{
+	struct stm_drvdata *drvdata = dev_get_drvdata(dev);
+	struct stm_device	*stm_dev;
+	struct list_head	*head, *p;
+
+	coresight_disable_sysfs(drvdata->csdev);
+
+	stm_dev = drvdata->stm.stm;
+	if (stm_dev) {
+		head = &stm_dev->link_list;
+		list_for_each(p, head)
+			pm_runtime_put_autosuspend(&stm_dev->dev);
+	}
+
+	return 0;
+}
+
+static int stm_restore(struct device *dev)
+{
+	struct stm_drvdata *drvdata = dev_get_drvdata(dev);
+	struct stm_device	*stm_dev;
+	struct list_head	*head, *p;
+
+	stm_dev = drvdata->stm.stm;
+	if (stm_dev) {
+		head = &stm_dev->link_list;
+		list_for_each(p, head)
+			pm_runtime_get(&stm_dev->dev);
+	}
+
+	return 0;
+}
+
+#endif
+
 static const struct dev_pm_ops stm_dev_pm_ops = {
 	SET_RUNTIME_PM_OPS(stm_runtime_suspend, stm_runtime_resume, NULL)
+#ifdef CONFIG_DEEPSLEEP
+	.suspend = stm_suspend,
+	.resume  = stm_resume,
+#endif
+#ifdef CONFIG_HIBERNATION
+	.freeze  = stm_freeze,
+	.restore = stm_restore,
+#endif
 };
 
 static const struct amba_id stm_ids[] = {
@@ -1047,7 +1162,7 @@ static struct platform_driver stm_platform_driver = {
 
 static int __init stm_init(void)
 {
-	return coresight_init_driver("stm", &stm_driver, &stm_platform_driver, THIS_MODULE);
+	return coresight_init_driver("stm", &stm_driver, &stm_platform_driver);
 }
 
 static void __exit stm_exit(void)

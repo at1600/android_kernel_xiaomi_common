@@ -41,7 +41,9 @@
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_XAUI	4
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_SGMII	6
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_RXAUI	7
+#define MDIO_PHYXS_VEND_IF_STATUS_TYPE_OFF	9
 #define MDIO_PHYXS_VEND_IF_STATUS_TYPE_OCSGMII	10
+#define MDIO_PHYXS_VEND_IF_STATUS_TYPE_USX_5G	12
 
 #define MDIO_AN_VEND_PROV			0xc400
 #define MDIO_AN_VEND_PROV_1000BASET_FULL	BIT(15)
@@ -342,9 +344,19 @@ static int aqr107_read_status(struct phy_device *phydev)
 	if (!phydev->link || phydev->autoneg == AUTONEG_DISABLE)
 		return 0;
 
-	val = phy_read_mmd(phydev, MDIO_MMD_PHYXS, MDIO_PHYXS_VEND_IF_STATUS);
-	if (val < 0)
-		return val;
+	/**
+	 * The status register is not immediately correct on line side link up.
+	 * Poll periodically until it reflects the correct ON state.
+	 * Only return fail for read error, timeout defaults to OFF state.
+	 */
+	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_PHYXS,
+					MDIO_PHYXS_VEND_IF_STATUS, val,
+					(FIELD_GET(MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK, val) !=
+					MDIO_PHYXS_VEND_IF_STATUS_TYPE_OFF),
+					AQR107_OP_IN_PROG_SLEEP,
+					AQR107_OP_IN_PROG_TIMEOUT, false);
+	if (ret && ret != -ETIMEDOUT)
+		return ret;
 
 	switch (FIELD_GET(MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK, val)) {
 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_KR:
@@ -371,6 +383,10 @@ static int aqr107_read_status(struct phy_device *phydev)
 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_OCSGMII:
 		phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
 		break;
+	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_USX_5G:
+		phydev->interface = PHY_INTERFACE_MODE_5GBASER;
+		break;
+	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_OFF:
 	default:
 		phydev->interface = PHY_INTERFACE_MODE_NA;
 		break;
@@ -435,9 +451,6 @@ static int aqr107_set_tunable(struct phy_device *phydev,
 	}
 }
 
-#define AQR_FW_WAIT_SLEEP_US	20000
-#define AQR_FW_WAIT_TIMEOUT_US	2000000
-
 /* If we configure settings whilst firmware is still initializing the chip,
  * then these settings may be overwritten. Therefore make sure chip
  * initialization has completed. Use presence of the firmware ID as
@@ -447,16 +460,19 @@ static int aqr107_set_tunable(struct phy_device *phydev,
  */
 int aqr_wait_reset_complete(struct phy_device *phydev)
 {
-	int ret, val;
+	int val, ret;
 
-	ret = read_poll_timeout(phy_read_mmd, val, val != 0,
-				AQR_FW_WAIT_SLEEP_US, AQR_FW_WAIT_TIMEOUT_US,
-				false, phydev, MDIO_MMD_VEND1,
-				VEND1_GLOBAL_FW_ID);
-	if (val < 0) {
-		phydev_err(phydev, "Failed to read VEND1_GLOBAL_FW_ID: %pe\n",
-			   ERR_PTR(val));
-		return val;
+	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1,
+					VEND1_GLOBAL_FW_ID, val, val != 0,
+					20000, 2000000, false);
+
+	if (!ret) {
+		if (phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1,
+					      VEND1_GLOBAL_RSVD_STAT1, val,
+					      FIELD_GET(VEND1_GLOBAL_RSVD_STAT1_PROV_ID,
+							val) != 0,
+					      20000, 2000000, false))
+			phydev_dbg(phydev, "Provision ID is 0\n");
 	}
 
 	return ret;
@@ -489,7 +505,7 @@ static int aqr107_config_init(struct phy_device *phydev)
 {
 	struct aqr107_priv *priv = phydev->priv;
 	u32 led_active_low;
-	int ret;
+	int ret, index = 0;
 
 	/* Check that the PHY interface type is compatible */
 	if (phydev->interface != PHY_INTERFACE_MODE_SGMII &&
@@ -500,7 +516,8 @@ static int aqr107_config_init(struct phy_device *phydev)
 	    phydev->interface != PHY_INTERFACE_MODE_10GKR &&
 	    phydev->interface != PHY_INTERFACE_MODE_10GBASER &&
 	    phydev->interface != PHY_INTERFACE_MODE_XAUI &&
-	    phydev->interface != PHY_INTERFACE_MODE_RXAUI)
+	    phydev->interface != PHY_INTERFACE_MODE_RXAUI &&
+	    phydev->interface != PHY_INTERFACE_MODE_5GBASER)
 		return -ENODEV;
 
 	WARN(phydev->interface == PHY_INTERFACE_MODE_XGMII,
@@ -516,9 +533,10 @@ static int aqr107_config_init(struct phy_device *phydev)
 
 	/* Restore LED polarity state after reset */
 	for_each_set_bit(led_active_low, &priv->leds_active_low, AQR_MAX_LEDS) {
-		ret = aqr_phy_led_active_low_set(phydev, led_active_low, true);
+		ret = aqr_phy_led_active_low_set(phydev, index, led_active_low);
 		if (ret)
 			return ret;
+		index++;
 	}
 
 	return 0;
@@ -536,6 +554,12 @@ static int aqcs109_config_init(struct phy_device *phydev)
 	ret = aqr_wait_reset_complete(phydev);
 	if (!ret)
 		aqr107_chip_info(phydev);
+
+	/* AQCS109 belongs to a chip family partially supporting 10G and 5G.
+	 * PMA speed ability bits are the same for all members of the family,
+	 * AQCS109 however supports speeds up to 2.5G only.
+	 */
+	phy_set_max_speed(phydev, SPEED_2500);
 
 	return aqr107_set_downshift(phydev, MDIO_AN_VEND_PROV_DOWNSHIFT_DFLT);
 }
@@ -614,7 +638,8 @@ static int aqr107_get_rate_matching(struct phy_device *phydev,
 {
 	if (iface == PHY_INTERFACE_MODE_10GBASER ||
 	    iface == PHY_INTERFACE_MODE_2500BASEX ||
-	    iface == PHY_INTERFACE_MODE_NA)
+	    iface == PHY_INTERFACE_MODE_NA ||
+	    iface == PHY_INTERFACE_MODE_5GBASER)
 		return RATE_MATCH_PAUSE;
 	return RATE_MATCH_NONE;
 }
@@ -725,27 +750,17 @@ static int aqr113c_fill_interface_modes(struct phy_device *phydev)
 	return aqr107_fill_interface_modes(phydev);
 }
 
-static int aqr115c_get_features(struct phy_device *phydev)
+static int aqr113c_get_features(struct phy_device *phydev)
 {
 	unsigned long *supported = phydev->supported;
 
-	/* PHY supports speeds up to 2.5G with autoneg. PMA capabilities
+	/* PHY supports speeds up to 10G with autoneg. PMA capabilities
 	 * are not useful.
 	 */
 	linkmode_or(supported, supported, phy_gbit_features);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, supported);
-
-	return 0;
-}
-
-static int aqr111_get_features(struct phy_device *phydev)
-{
-	/* PHY supports speeds up to 5G with autoneg. PMA capabilities
-	 * are not useful.
-	 */
-	aqr115c_get_features(phydev);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_5000baseT_Full_BIT,
-			 phydev->supported);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_5000baseT_Full_BIT, supported);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT, supported);
 
 	return 0;
 }
@@ -786,6 +801,15 @@ static int aqr107_probe(struct phy_device *phydev)
 	return aqr_hwmon_probe(phydev);
 }
 
+static int aqr111_config_init(struct phy_device *phydev)
+{
+	/* AQR111 reports supporting speed up to 10G,
+	 * however only speeds up to 5G are supported.
+	 */
+	phy_set_max_speed(phydev, SPEED_5000);
+
+	return aqr107_config_init(phydev);
+}
 
 static struct phy_driver aqr_driver[] = {
 {
@@ -863,7 +887,6 @@ static struct phy_driver aqr_driver[] = {
 	.get_sset_count	= aqr107_get_sset_count,
 	.get_strings	= aqr107_get_strings,
 	.get_stats	= aqr107_get_stats,
-	.get_features   = aqr115c_get_features,
 	.link_change_notify = aqr107_link_change_notify,
 	.led_brightness_set = aqr_phy_led_brightness_set,
 	.led_hw_is_supported = aqr_phy_led_hw_is_supported,
@@ -876,7 +899,7 @@ static struct phy_driver aqr_driver[] = {
 	.name		= "Aquantia AQR111",
 	.probe		= aqr107_probe,
 	.get_rate_matching = aqr107_get_rate_matching,
-	.config_init	= aqr107_config_init,
+	.config_init	= aqr111_config_init,
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.handle_interrupt = aqr_handle_interrupt,
@@ -888,7 +911,6 @@ static struct phy_driver aqr_driver[] = {
 	.get_sset_count	= aqr107_get_sset_count,
 	.get_strings	= aqr107_get_strings,
 	.get_stats	= aqr107_get_stats,
-	.get_features   = aqr111_get_features,
 	.link_change_notify = aqr107_link_change_notify,
 	.led_brightness_set = aqr_phy_led_brightness_set,
 	.led_hw_is_supported = aqr_phy_led_hw_is_supported,
@@ -901,7 +923,7 @@ static struct phy_driver aqr_driver[] = {
 	.name		= "Aquantia AQR111B0",
 	.probe		= aqr107_probe,
 	.get_rate_matching = aqr107_get_rate_matching,
-	.config_init	= aqr107_config_init,
+	.config_init	= aqr111_config_init,
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.handle_interrupt = aqr_handle_interrupt,
@@ -913,7 +935,6 @@ static struct phy_driver aqr_driver[] = {
 	.get_sset_count	= aqr107_get_sset_count,
 	.get_strings	= aqr107_get_strings,
 	.get_stats	= aqr107_get_stats,
-	.get_features   = aqr111_get_features,
 	.link_change_notify = aqr107_link_change_notify,
 	.led_brightness_set = aqr_phy_led_brightness_set,
 	.led_hw_is_supported = aqr_phy_led_hw_is_supported,
@@ -1011,6 +1032,7 @@ static struct phy_driver aqr_driver[] = {
 	.get_sset_count = aqr107_get_sset_count,
 	.get_strings    = aqr107_get_strings,
 	.get_stats      = aqr107_get_stats,
+	.get_features   = aqr113c_get_features,
 	.link_change_notify = aqr107_link_change_notify,
 	.led_brightness_set = aqr_phy_led_brightness_set,
 	.led_hw_is_supported = aqr_phy_led_hw_is_supported,
@@ -1023,7 +1045,7 @@ static struct phy_driver aqr_driver[] = {
 	.name           = "Aquantia AQR114C",
 	.probe          = aqr107_probe,
 	.get_rate_matching = aqr107_get_rate_matching,
-	.config_init    = aqr107_config_init,
+	.config_init    = aqr111_config_init,
 	.config_aneg    = aqr_config_aneg,
 	.config_intr    = aqr_config_intr,
 	.handle_interrupt = aqr_handle_interrupt,
@@ -1035,7 +1057,6 @@ static struct phy_driver aqr_driver[] = {
 	.get_sset_count = aqr107_get_sset_count,
 	.get_strings    = aqr107_get_strings,
 	.get_stats      = aqr107_get_stats,
-	.get_features   = aqr111_get_features,
 	.link_change_notify = aqr107_link_change_notify,
 	.led_brightness_set = aqr_phy_led_brightness_set,
 	.led_hw_is_supported = aqr_phy_led_hw_is_supported,
@@ -1060,7 +1081,6 @@ static struct phy_driver aqr_driver[] = {
 	.get_sset_count = aqr107_get_sset_count,
 	.get_strings    = aqr107_get_strings,
 	.get_stats      = aqr107_get_stats,
-	.get_features   = aqr115c_get_features,
 	.link_change_notify = aqr107_link_change_notify,
 	.led_brightness_set = aqr_phy_led_brightness_set,
 	.led_hw_is_supported = aqr_phy_led_hw_is_supported,

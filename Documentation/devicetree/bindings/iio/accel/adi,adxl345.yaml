@@ -32,8 +32,6 @@ properties:
 
   spi-cpol: true
 
-  spi-3wire: true
-
   interrupts:
     maxItems: 1
 
@@ -51,7 +49,7 @@ examples:
   - |
     #include <dt-bindings/gpio/gpio.h>
     #include <dt-bindings/interrupt-controller/irq.h>
-    i2c {
+    i2c0 {
         #address-cells = <1>;
         #size-cells = <0>;
 
@@ -66,7 +64,7 @@ examples:
   - |
     #include <dt-bindings/gpio/gpio.h>
     #include <dt-bindings/interrupt-controller/irq.h>
-    spi {
+    spi0 {
         #address-cells = <1>;
         #size-cells = <0>;
 

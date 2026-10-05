@@ -87,6 +87,11 @@ properties:
     description:
       The offset of the TCS blocks.
 
+  qcom,tcs-distance:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The distance between each TCS for a DRV.
+
   reg:
     minItems: 1
     maxItems: 4
@@ -112,9 +117,8 @@ properties:
     $ref: /schemas/power/qcom,rpmpd.yaml#
 
 patternProperties:
-  '^regulators(-[0-9])?$':
+  '-regulators$':
     $ref: /schemas/regulator/qcom,rpmh-regulator.yaml#
-    unevaluatedProperties: false
 
 required:
   - compatible
@@ -124,7 +128,6 @@ required:
   - qcom,tcs-offset
   - reg
   - reg-names
-  - power-domains
 
 additionalProperties: false
 
@@ -151,6 +154,7 @@ examples:
                      <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH>;
         label = "apps_rsc";
         qcom,tcs-offset = <0xd00>;
+        qcom,tcs-distance= <0x150>;
         qcom,drv-id = <2>;
         qcom,tcs-config = <ACTIVE_TCS  2>,
                           <SLEEP_TCS   3>,
@@ -175,12 +179,12 @@ examples:
         interrupts = <GIC_SPI 129 IRQ_TYPE_LEVEL_HIGH>;
         label = "disp_rsc";
         qcom,tcs-offset = <0x1c00>;
+        qcom,tcs-distance= <0x150>;
         qcom,drv-id = <0>;
         qcom,tcs-config = <ACTIVE_TCS  0>,
                           <SLEEP_TCS   1>,
                           <WAKE_TCS    1>,
                           <CONTROL_TCS 0>;
-        power-domains = <&CLUSTER_PD>;
     };
 
   - |

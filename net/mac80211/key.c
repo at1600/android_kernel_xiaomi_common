@@ -17,8 +17,8 @@
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
 #include <linux/export.h>
-#include <net/mac80211.h>
 #include <linux/unaligned.h>
+#include <net/mac80211.h>
 #include "ieee80211_i.h"
 #include "driver-ops.h"
 #include "debugfs_key.h"
@@ -508,16 +508,10 @@ static int ieee80211_key_replace(struct ieee80211_sub_if_data *sdata,
 				ret = ieee80211_key_enable_hw_accel(new);
 		}
 	} else {
-		if (!new->local->wowlan) {
+		if (!new->local->wowlan)
 			ret = ieee80211_key_enable_hw_accel(new);
-		} else if (link_id < 0 || !sdata->vif.active_links ||
-			 BIT(link_id) & sdata->vif.active_links) {
+		else
 			new->flags |= KEY_FLAG_UPLOADED_TO_HARDWARE;
-			if (!(new->conf.flags & (IEEE80211_KEY_FLAG_GENERATE_MMIC |
-						 IEEE80211_KEY_FLAG_PUT_MIC_SPACE |
-						 IEEE80211_KEY_FLAG_RESERVE_TAILROOM)))
-				decrease_tailroom_need_count(sdata, 1);
-		}
 	}
 
 	if (ret)
@@ -993,26 +987,6 @@ void ieee80211_reenable_keys(struct ieee80211_sub_if_data *sdata)
 	}
 }
 
-static void
-ieee80211_key_iter(struct ieee80211_hw *hw,
-		   struct ieee80211_vif *vif,
-		   struct ieee80211_key *key,
-		   void (*iter)(struct ieee80211_hw *hw,
-				struct ieee80211_vif *vif,
-				struct ieee80211_sta *sta,
-				struct ieee80211_key_conf *key,
-				void *data),
-		   void *iter_data)
-{
-	/* skip keys of station in removal process */
-	if (key->sta && key->sta->removed)
-		return;
-	if (!(key->flags & KEY_FLAG_UPLOADED_TO_HARDWARE))
-		return;
-	iter(hw, vif, key->sta ? &key->sta->sta : NULL,
-	     &key->conf, iter_data);
-}
-
 void ieee80211_iter_keys(struct ieee80211_hw *hw,
 			 struct ieee80211_vif *vif,
 			 void (*iter)(struct ieee80211_hw *hw,
@@ -1031,13 +1005,16 @@ void ieee80211_iter_keys(struct ieee80211_hw *hw,
 	if (vif) {
 		sdata = vif_to_sdata(vif);
 		list_for_each_entry_safe(key, tmp, &sdata->key_list, list)
-			ieee80211_key_iter(hw, vif, key, iter, iter_data);
+			iter(hw, &sdata->vif,
+			     key->sta ? &key->sta->sta : NULL,
+			     &key->conf, iter_data);
 	} else {
 		list_for_each_entry(sdata, &local->interfaces, list)
 			list_for_each_entry_safe(key, tmp,
 						 &sdata->key_list, list)
-				ieee80211_key_iter(hw, &sdata->vif, key,
-						   iter, iter_data);
+				iter(hw, &sdata->vif,
+				     key->sta ? &key->sta->sta : NULL,
+				     &key->conf, iter_data);
 	}
 }
 EXPORT_SYMBOL(ieee80211_iter_keys);
@@ -1054,8 +1031,17 @@ _ieee80211_iter_keys_rcu(struct ieee80211_hw *hw,
 {
 	struct ieee80211_key *key;
 
-	list_for_each_entry_rcu(key, &sdata->key_list, list)
-		ieee80211_key_iter(hw, &sdata->vif, key, iter, iter_data);
+	list_for_each_entry_rcu(key, &sdata->key_list, list) {
+		/* skip keys of station in removal process */
+		if (key->sta && key->sta->removed)
+			continue;
+		if (!(key->flags & KEY_FLAG_UPLOADED_TO_HARDWARE))
+			continue;
+
+		iter(hw, &sdata->vif,
+		     key->sta ? &key->sta->sta : NULL,
+		     &key->conf, iter_data);
+	}
 }
 
 void ieee80211_iter_keys_rcu(struct ieee80211_hw *hw,

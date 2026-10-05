@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef __QCOM_TSENS_H__
@@ -20,12 +21,24 @@
 #define THRESHOLD_MAX_ADC_CODE	0x3ff
 #define THRESHOLD_MIN_ADC_CODE	0x0
 
+#define TSENS_FEAT_OFFSET	20
+#define TSENS_CHIP_ID0		0x197
+#define TSENS_CHIP_ID1		0x198
+#define TSENS_CHIP_ID2		0x20e
+#define TSENS_CHIP_ID3		0x20f
+#define TSENS_FEAT_ID2		0x2
+#define TSENS_FEAT_ID3		0x3
+#define TSENS_FEAT_ID4		0x4
+#define TSENS_ELEVATE_DELTA	10000
+#define TSENS_ELEVATE_CPU_DELTA	5000
+
 #define MAX_SENSORS 16
 
 #include <linux/interrupt.h>
 #include <linux/thermal.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <linux/ipc_logging.h>
 
 struct tsens_priv;
 
@@ -44,9 +57,43 @@ enum tsens_irq_type {
 };
 
 /**
+ * struct tsens_irq_data - IRQ status and temperature violations
+ * @up_viol:        upper threshold violated
+ * @up_thresh:      upper threshold temperature value
+ * @up_irq_mask:    mask register for upper threshold irqs
+ * @up_irq_clear:   clear register for uppper threshold irqs
+ * @low_viol:       lower threshold violated
+ * @low_thresh:     lower threshold temperature value
+ * @low_irq_mask:   mask register for lower threshold irqs
+ * @low_irq_clear:  clear register for lower threshold irqs
+ * @crit_viol:      critical threshold violated
+ * @crit_thresh:    critical threshold temperature value
+ * @crit_irq_mask:  mask register for critical threshold irqs
+ * @crit_irq_clear: clear register for critical threshold irqs
+ *
+ * Structure containing data about temperature threshold settings and
+ * irq status if they were violated.
+ */
+struct tsens_irq_data {
+	u32 up_viol;
+	int up_thresh;
+	u32 up_irq_mask;
+	u32 up_irq_clear;
+	u32 low_viol;
+	int low_thresh;
+	u32 low_irq_mask;
+	u32 low_irq_clear;
+	u32 crit_viol;
+	u32 crit_thresh;
+	u32 crit_irq_mask;
+	u32 crit_irq_clear;
+};
+
+/**
  * struct tsens_sensor - data for each sensor connected to the tsens device
  * @priv: tsens device instance that this sensor is connected to
  * @tzd: pointer to the thermal zone that this sensor is in
+ * @irq_d: Latest sensor irq and violation status for this sensor
  * @offset: offset of temperature adjustment curve
  * @hw_id: HW ID can be used in case of platform-specific IDs
  * @slope: slope of temperature adjustment curve
@@ -55,6 +102,7 @@ enum tsens_irq_type {
 struct tsens_sensor {
 	struct tsens_priv		*priv;
 	struct thermal_zone_device	*tzd;
+	struct tsens_irq_data		irq_d;
 	int				offset;
 	unsigned int			hw_id;
 	int				slope;
@@ -152,6 +200,23 @@ struct tsens_ops {
 	[_name##_##14] = REG_FIELD(_offset, 30, 30),	\
 	[_name##_##15] = REG_FIELD(_offset, 31, 31)
 
+#define IPC_LOGPAGES 10
+#define TSENS_DBG(dev, msg, args...) do {		\
+		if ((dev) && (dev)->ipc_log) {		\
+			ipc_log_string((dev)->ipc_log,	\
+			"" msg " [%s]\n",		\
+			args, current->comm);	        \
+		}					\
+	} while (0)
+
+#define TSENS_DBG_1(priv, msg, args...) do {		\
+		if ((priv) && (priv)->ipc_log1) {		\
+			ipc_log_string((priv)->ipc_log1,	\
+			"" msg " [%s]\n",		\
+			args, current->comm);		\
+		}					\
+	} while (0)
+
 /*
  * reg_field IDs to use as an index into an array
  * If you change the order of the entries, check the devm_regmap_field_alloc()
@@ -191,22 +256,6 @@ enum regfield_ids {
 	LAST_TEMP_13,
 	LAST_TEMP_14,
 	LAST_TEMP_15,
-	VALID_0,		/* VALID reading or not */
-	VALID_1,
-	VALID_2,
-	VALID_3,
-	VALID_4,
-	VALID_5,
-	VALID_6,
-	VALID_7,
-	VALID_8,
-	VALID_9,
-	VALID_10,
-	VALID_11,
-	VALID_12,
-	VALID_13,
-	VALID_14,
-	VALID_15,
 	LOWER_STATUS_0,	/* LOWER threshold violated */
 	LOWER_STATUS_1,
 	LOWER_STATUS_2,
@@ -492,6 +541,15 @@ enum regfield_ids {
 	MAX_STATUS_14,
 	MAX_STATUS_15,
 
+	/* TEMP PERSIST MAX_MIN data */
+	TEMP_PERSIST_CTRL,
+	TEMP_PERSIST_MAX_TEMP,
+	TEMP_PERSIST_MAX_SENSOR_ID,
+	TEMP_PERSIST_MAX_VALID,
+	TEMP_PERSIST_MIN_TEMP,
+	TEMP_PERSIST_MIN_SENSOR_ID,
+	TEMP_PERSIST_MIN_VALID,
+
 	/* Keep last */
 	MAX_REGFIELDS
 };
@@ -506,8 +564,12 @@ enum regfield_ids {
  *              with SROT only being available to secure boot firmware?
  * @has_watchdog: does this IP support watchdog functionality?
  * @max_sensors: maximum sensors supported by this version of the IP
+ * @persist_max_min: does this IP support persist max-min data?
  * @trip_min_temp: minimum trip temperature supported by this version of the IP
  * @trip_max_temp: maximum trip temperature supported by this version of the IP
+ * @valid_bit: validate if read temperature is valid or not?
+ * @last_temp_mask: mask register for last temperature
+ * @last_temp_resolution: last temperarure sign bit resolution
  */
 struct tsens_features {
 	unsigned int ver_major;
@@ -517,8 +579,12 @@ struct tsens_features {
 	unsigned int srot_split:1;
 	unsigned int has_watchdog:1;
 	unsigned int max_sensors;
+	unsigned int persist_max_min:1;
 	int trip_min_temp;
 	int trip_max_temp;
+	int valid_bit;
+	int last_temp_mask;
+	u32 last_temp_resolution;
 };
 
 /**
@@ -551,6 +617,7 @@ struct tsens_context {
  * struct tsens_priv - private data for each instance of the tsens IP
  * @dev: pointer to struct device
  * @num_sensors: number of sensors enabled on this device
+ * @ul_irq_cnt: upper lower irq triggered count
  * @tm_map: pointer to TM register address space
  * @srot_map: pointer to SROT register address space
  * @tm_offset: deal with old device trees that don't address TM and SROT
@@ -564,14 +631,18 @@ struct tsens_context {
  * @ops: pointer to list of callbacks supported by this device
  * @debug_root: pointer to debugfs dentry for all tsens
  * @debug: pointer to debugfs dentry for tsens controller
+ * @ipc_log: pointer for first ipc log context id
+ * @ipc_log1: pointer for second ipc log context id
  * @sensor: list of sensors attached to this device
  */
 struct tsens_priv {
 	struct device			*dev;
 	u32				num_sensors;
+	u32				ul_irq_cnt;
 	struct regmap			*tm_map;
 	struct regmap			*srot_map;
 	u32				tm_offset;
+	bool				need_trip_update;
 
 	/* lock for upper/lower threshold interrupts */
 	spinlock_t			ul_lock;
@@ -584,6 +655,8 @@ struct tsens_priv {
 
 	struct dentry			*debug_root;
 	struct dentry			*debug;
+	void				*ipc_log;
+	void				*ipc_log1;
 
 	struct tsens_sensor		sensor[] __counted_by(num_sensors);
 };
@@ -647,7 +720,7 @@ extern struct tsens_plat_data data_8960;
 extern struct tsens_plat_data data_8226, data_8909, data_8916, data_8939, data_8974, data_9607;
 
 /* TSENS v1 targets */
-extern struct tsens_plat_data data_tsens_v1, data_8937, data_8976, data_8956;
+extern struct tsens_plat_data data_tsens_v1, data_8976, data_8956;
 
 /* TSENS v2 targets */
 extern struct tsens_plat_data data_8996, data_ipq8074, data_tsens_v2;
