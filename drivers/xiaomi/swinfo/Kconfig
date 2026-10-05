@@ -2,6 +2,6 @@
 
 config MI_SOFTWARE_INFO
 	tristate "export software information"
-	default n
+	default y
 	help
 		swinfo provide the function of exported software information (such as .config).
