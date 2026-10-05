@@ -198,3 +198,8 @@ obj-$(CONFIG_S390)		+= s390/
 
 #Re-Kernel Support
 obj-$(CONFIG_REKERNEL)		+= rekernel/
+
+#xiaomi
+obj-y				+= xiaomi/
+obj-$(CONFIG_MIHW)		+= mihw/
+obj-$(CONFIG_MI_RT_MONITOR)	+= sandbox/
