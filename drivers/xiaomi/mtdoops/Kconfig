@@ -5,6 +5,6 @@
 
 config MI_MTDOOPS
 	tristate "mtdoops record"
-	default y
+	default n
 	help
 	This adds support for mi mtdoops.
