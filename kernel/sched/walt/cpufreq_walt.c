@@ -1595,6 +1595,21 @@ static int waltgov_init(struct cpufreq_policy *policy)
 				   walt_gov.name);
 	if (ret)
 		goto fail;
+{
+		unsigned int adaptive_level_1 = 0;
+		unsigned int adaptive_low_freq = 700000;
+		unsigned int adaptive_high_freq = 1500000;
+		int ret_set;
+
+		ret_set = cpufreq_walt_set_adaptive_freq(policy->cpu, adaptive_level_1, adaptive_low_freq, adaptive_high_freq);
+		if (ret_set)
+			pr_err("waltgov_init: set adaptive fail ret=%d (adaptive_level_1=%u adaptive_low_freq=%u adaptive_high_freq=%u)\n",
+				ret_set, adaptive_level_1, adaptive_low_freq, adaptive_high_freq);
+		else
+			pr_info("waltgov_init: set adaptive ok: adaptive_level_1=%u adaptive_low_freq=%u adaptive_high_freq=%u\n",
+				adaptive_level_1, adaptive_low_freq, adaptive_high_freq);
+	}
+
 
 	return 0;
 
