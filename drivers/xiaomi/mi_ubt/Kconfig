@@ -2,7 +2,7 @@
 
 config MI_UBT
 	tristate "mi_ubt support"
-	default y
+	default n
 	help
 		mi_ubt provide dump_user_backtrace interface to show user stacktrace.
 

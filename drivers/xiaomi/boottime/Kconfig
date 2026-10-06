@@ -5,6 +5,6 @@
 
 config MI_BOOT_TIME
 	tristate "boot time record"
-	default y
+	default n
 	help
 	This adds support for mi boot time.

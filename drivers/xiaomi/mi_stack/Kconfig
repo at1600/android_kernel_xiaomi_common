@@ -2,6 +2,6 @@
 
 config MI_STACK
 	tristate "mi_stack support"
-	default y
+	default n
 	help
 		mi stack will show kernel stacktrace of the specified task.
