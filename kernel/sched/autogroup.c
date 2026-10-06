@@ -19,6 +19,7 @@ static struct ctl_table sched_autogroup_sysctls[] = {
 		.extra1         = SYSCTL_ZERO,
 		.extra2         = SYSCTL_ONE,
 	},
+	{}
 };
 
 static void __init sched_autogroup_sysctl_init(void)
@@ -150,7 +151,7 @@ void sched_autogroup_exit_task(struct task_struct *p)
 	 * see this thread after that: we can no longer use signal->autogroup.
 	 * See the PF_EXITING check in task_wants_autogroup().
 	 */
-	sched_move_task(p, true);
+	sched_move_task(p);
 }
 
 static void
@@ -182,7 +183,7 @@ autogroup_move_group(struct task_struct *p, struct autogroup *ag)
 	 * sched_autogroup_exit_task().
 	 */
 	for_each_thread(p, t)
-		sched_move_task(t, true);
+		sched_move_task(t);
 
 	unlock_task_sighand(p, &flags);
 	autogroup_kref_put(prev);
