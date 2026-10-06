@@ -249,4 +249,6 @@ source "drivers/rekernel/Kconfig"
 
 source "drivers/xiaomi/Kconfig"
 
+source "drivers/mihw/Kconfig"
+
 endmenu
