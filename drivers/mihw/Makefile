@@ -1,6 +1,6 @@
 # MIUI ADD: Performance_TurboSched
 # END Performance_TurboSched
-#obj-y                                  += perfmgr/
+obj-y                                  += perfmgr/
 # MIUI ADD: DCVS ARBI
 obj-y                                   += dcvs_arbi/
 # END DCVS ARBI
@@ -11,4 +11,3 @@ obj-y                                   += unionpower/
 # MIUI ADD: Power_PowerSaveModeV2
 obj-y                                   += powersave/
 # END Power_PowerSaveModeV2
-

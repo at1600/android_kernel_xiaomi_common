@@ -30,4 +30,3 @@ config MI_UNION_POWER
     default n
     help
       The case is used to monitor load
-
