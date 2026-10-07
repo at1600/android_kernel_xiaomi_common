@@ -12,4 +12,3 @@ obj-y                                   += unionpower/
 obj-y                                   += powersave/
 # END Power_PowerSaveModeV2
 
-obj-y                                   += input/
