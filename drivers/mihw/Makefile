@@ -11,3 +11,7 @@ obj-y                                   += unionpower/
 # MIUI ADD: Power_PowerSaveModeV2
 obj-y                                   += powersave/
 # END Power_PowerSaveModeV2
+
+obj-y                                   += mi_sched/
+obj-y                                   += game/
+obj-y					+= turbo_sched/

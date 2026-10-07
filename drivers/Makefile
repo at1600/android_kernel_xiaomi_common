@@ -196,5 +196,9 @@ obj-$(CONFIG_DPLL)		+= dpll/
 
 obj-$(CONFIG_S390)		+= s390/
 
+#xiaomi
+obj-y		                += mihw/
+obj-y		                += xiaomi/
+
 #Re-Kernel Support
 obj-$(CONFIG_REKERNEL)		+= rekernel/
