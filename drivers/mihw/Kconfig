@@ -1,11 +1,3 @@
-config CFS_BANDWIDTH_MI
-	tristate "cfs bandwidth by xiaomi"
-	default n
-
-config MI_PERFMGR
-	tristate "Frame Energy Aware Scheduling"
-	help
-	  More power saving while meeting performance
 
 config MI_SPEED_TOUCH
 	tristate "mi speed touch"
