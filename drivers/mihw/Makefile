@@ -12,6 +12,3 @@ obj-y                                   += unionpower/
 obj-y                                   += powersave/
 # END Power_PowerSaveModeV2
 
-obj-y                                   += mi_sched/
-obj-y                                   += game/
-obj-y					+= turbo_sched/
