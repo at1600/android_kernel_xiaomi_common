@@ -1,9 +1,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "boot_monitor.h"
-#include "boot_fail.h"
-
 #include "../boottime/boottime.h"
+#include "boot_fail.h"
 
 static unsigned long log_count_2;
 static struct log_t **bootprof_2;
@@ -12,13 +11,16 @@ static int count =0;
 static int ringnums = 0;
 static char prof_node[RPOC_ENTRY_LINE] = {0};
 static struct proc_dir_entry *bootmonitor_entry;
-struct bootmonitor_data_context boot_cxt;
+struct bootmonitor_context boot_cxt;
 int bm_event_counts;
-int first_boot = 0;
 char *bm_write_buffer = NULL;
 
-char bm_boot_mode[16] = {0};
-module_param_string(bootmode, bm_boot_mode, 16, 0644);
+char bm_boot_mode[10] = {0};
+module_param_string(bootmode, bm_boot_mode, 10, 0644);
+
+//#define MAX_CMDLINE_PARAM_LEN 256
+char build_fingerprint[MAX_CMDLINE_PARAM_LEN] = {0};
+module_param_string(fingerprint, build_fingerprint, MAX_CMDLINE_PARAM_LEN,0644);
 
 static int blackbox = 0;
 module_param(blackbox, int, 0600);
@@ -26,27 +28,28 @@ MODULE_PARM_DESC(blackbox,
 		"blackbox (default 0)");
 
 struct type_map bm_boot_events[] = {
-	{9,  15,  "late-fs"},
-	{10, 20,  "zygote-start"},
-	{8,  16,  "zygote_preload_end"},
-	{5,  10,  "start_android"},
-	{20, 36,  "pms_start"},
+	{5,  8,   "early-init"},
+	{3,  8,   "late-init"},
+	{5,  8,   "late-fs"},
+	{6,  12,  "zygote-start"},
+	{8,  24,  "zygote_preload_end"},
+	{3,  12,  "start_android"},
+	{6,  12,  "pms_start"},
 	{18, 24,  "pms_ready"},
 	{30, 40,  "ams_ready"},
 	{8,  24,  "boot_completed"},
 };
 
-static void exit_boot_monitor(struct bootmonitor_data_context *cxt) {
+static void exit_boot_monitor(struct bootmonitor_context *cxt) {
 	MTN_PRINT_START();
-	/*add bdev_file == NULL ,because bdev_file no init*/
-	if (IS_ERR(bdev_file) || bdev_file == NULL) {
-		MTN_PRINT_INFO("%s-%d:bdev_file no init\n", __func__, __LINE__);
+	/*add bdev == NULL ,because bdev no init*/
+	if (IS_ERR(bdev) || bdev == NULL) {
+		MTN_PRINT_INFO("%s-%d:bdev no init\n", __func__, __LINE__);
 	} else {
-		sync_blockdev(file_bdev(bdev_file));
+		sync_blockdev(bdev);
 		mutex_destroy(&write_bm_mutex);
-        /*free_device*/
-		invalidate_mapping_pages(bdev_file->f_mapping, 0, -1);
-		bdev_fput(bdev_file);
+		invalidate_mapping_pages(bdev->bd_inode->i_mapping, 0, -1);
+		blkdev_put(bdev, NULL);
 		MTN_PRINT_INFO("%s-%d:invalidate_mapping_pages end\n", __func__, __LINE__);
 	}
 	if (bm_write_buffer) {
@@ -56,6 +59,7 @@ static void exit_boot_monitor(struct bootmonitor_data_context *cxt) {
 		vfree(cxt->oops_buf);
 	}
 	/*release netlink*/
+	//bm_netlink_exit();
 	platform_driver_unregister(&boot_monitor_driver);
 	monitor_main = NULL;
 	MTN_PRINT_END();
@@ -65,7 +69,6 @@ static void exit_boot_monitor(struct bootmonitor_data_context *cxt) {
 static bool find_event(int nums) {
 	struct log_t *p;
 	char *occurrence = NULL;
-	char *firstboot = NULL;
 	int i;
 	spin_lock(&bootprof_lock);
 	log_count_2 = get_log_count();
@@ -75,12 +78,6 @@ static bool find_event(int nums) {
 		p = &bootprof_2[i / LOGS_PER_BUF][i % LOGS_PER_BUF];
 		if (!p->comm_event)
 			continue;
-		/*first boot*/
-		firstboot = strstr(p->comm_event + TASK_COMM_LEN, FIRST_BOOT);
-		if (firstboot) {
-			MTN_PRINT_INFO("%s-%d:first boot\n", __func__, __LINE__);
-			first_boot = 1;
-		}
 		/*p->comm_event + TASK_COMM_LEN = event*/
         occurrence = strstr(p->comm_event + TASK_COMM_LEN, bm_boot_events[nums].name);
         if (!occurrence) {
@@ -97,7 +94,7 @@ static bool find_event(int nums) {
 	return false;
 }
 
-static int write_log_to_dev(struct bootmonitor_data_context *cxt, char * buffer, int event) {
+static int write_log_to_dev(struct bootmonitor_context *cxt, char * buffer, int event) {
 	int err;
 
 	err = -1;
@@ -106,19 +103,19 @@ static int write_log_to_dev(struct bootmonitor_data_context *cxt, char * buffer,
 		return err;
 	}
 	/*erase blackbox-bootfail-log-partition*/
-	err = _partition_bm_write(PARTITION_KMSG_OFFSET + HEADER_SIZE_4K, PARTITION_KMSG_SIZE - HEADER_SIZE_4K, buffer);
+	err = partition_bm_write(PARTITION_KMSG_OFFSET + HEADER_SIZE_4K, PARTITION_KMSG_SIZE - HEADER_SIZE_4K, buffer);
 	if (err != 0) {
-		MTN_PRINT_ERR("%s-%d:_partition_bm_write error\n", __func__, __LINE__);
+		MTN_PRINT_ERR("%s-%d:partition_bm_write error\n", __func__, __LINE__);
 		return err;
 	}
-	err = _partition_bm_write(PARTITION_PMSG_OFFSET, PARTITION_PMSG_SIZE, cxt->oops_buf);
+	err = partition_bm_write(PARTITION_PMSG_OFFSET, PARTITION_PMSG_SIZE, cxt->oops_buf);
 	if (err != 0) {
-		MTN_PRINT_ERR("%s-%d:_partition_bm_write error\n", __func__, __LINE__);
+		MTN_PRINT_ERR("%s-%d:partition_bm_write error\n", __func__, __LINE__);
 		return err;
 	}
 	/*get kernel log and logcat*/
-	bootmonitor_get_kmsg(buffer);
-	bootmonitor_get_pmsg(cxt);
+	monitor_get_kmsg(buffer);
+	monitor_get_pmsg(cxt);
 	/*init and update header*/
 	err = write_blackbox_header(cxt, buffer, event);
 	if (err != 0) {
@@ -126,14 +123,14 @@ static int write_log_to_dev(struct bootmonitor_data_context *cxt, char * buffer,
 		return err;
 	}
 	/*record log in blackbox-bootfail-partition*/
-	err = _partition_bm_write(PARTITION_KMSG_OFFSET + HEADER_SIZE_4K, PARTITION_KMSG_SIZE - HEADER_SIZE_4K, buffer);
+	err = partition_bm_write(PARTITION_KMSG_OFFSET + HEADER_SIZE_4K, PARTITION_KMSG_SIZE - HEADER_SIZE_4K, buffer);
 	if (err != 0) {
-		MTN_PRINT_ERR("%s-%d:_partition_bm_write error\n", __func__, __LINE__);
+		MTN_PRINT_ERR("%s-%d:partition_bm_write error\n", __func__, __LINE__);
 		return err;
 	}
-	err = _partition_bm_write(PARTITION_PMSG_OFFSET, PARTITION_PMSG_SIZE, cxt->oops_buf);
+	err = partition_bm_write(PARTITION_PMSG_OFFSET, PARTITION_PMSG_SIZE, cxt->oops_buf);
 	if (err != 0) {
-		MTN_PRINT_ERR("%s-%d:_partition_bm_write error\n", __func__, __LINE__);
+		MTN_PRINT_ERR("%s-%d:partition_bm_write error\n", __func__, __LINE__);
 		return err;
 	}
 	return err;
@@ -147,7 +144,7 @@ static int monitor_main_thread_body(void *data) {
 	int boottime;
 	char bootwarn[RPOC_ENTRY_LINE] = "warning:";
 	char booterror[RPOC_ENTRY_LINE] = "error:";
-	struct bootmonitor_data_context *cxt;
+	struct bootmonitor_context *cxt;
 
 	cxt = &boot_cxt;
 	boottime = DEFAULT_TIMEOUT - 1;
@@ -173,11 +170,6 @@ static int monitor_main_thread_body(void *data) {
 					/*set counts to error time*/
 					counts = bm_boot_events[bm_event_counts].errortimes + 1;
 					MTN_PRINT_INFO("counts = bm_boot_events[%d].errortimes = %d\n", bm_event_counts, bm_boot_events[bm_event_counts].errortimes);
-					/*if first boot, ams ready time to long*/
-					if (first_boot == 1 && bm_event_counts == AMS_READY) {
-						counts = AMS_READY_TIME;
-						MTN_PRINT_INFO("first_boot:counts = %d\n", counts);
-					}
 					schedule_timeout(msecs_to_jiffies(1000));
 					boottime ++;
 					continue;
@@ -194,7 +186,7 @@ static int monitor_main_thread_body(void *data) {
 				strncat(booterror, bm_boot_events[bm_event_counts].name, sizeof(bm_boot_events[bm_event_counts].name));
 				strncpy(prof_node, booterror, sizeof(booterror));
 				//bm_sendnlmsg(booterror);
-				if(!get_bootmonitor_devices()) {
+				if(!get_bm_devices()) {
 					err = write_log_to_dev(cxt, bm_write_buffer, bm_event_counts);
 				}
 				MTN_PRINT_INFO("error write end\n");
@@ -257,7 +249,7 @@ static const struct proc_ops boot_monitor_fops = {
 static int __init boot_monitor_init(void)
 {
 	int result;
-	struct bootmonitor_data_context *cxt;
+	struct bootmonitor_context *cxt;
 
 	cxt = &boot_cxt;
 	/*boottime init ready?*/
@@ -324,19 +316,17 @@ static int __init boot_monitor_init(void)
 
 static void __exit boot_monitor_exit(void)
 {
-	struct bootmonitor_data_context *cxt;
+	struct bootmonitor_context *cxt;
 
 	cxt = &boot_cxt;
-	/*add bdev_file == NULL ,because bdev_file no init*/
-	if (IS_ERR(bdev_file) || bdev_file == NULL) {
-		MTN_PRINT_ERR("%s-%d:bdev_file no\n", __func__, __LINE__);
+	/*add bdev == NULL ,because bdev no init*/
+	if (IS_ERR(bdev) || bdev == NULL) {
+		MTN_PRINT_ERR("%s-%d:bdev no\n", __func__, __LINE__);
 	} else {
-		sync_blockdev(file_bdev(bdev_file));
-		mutex_destroy(&write_bm_mutex);
-        //free_device
-		invalidate_mapping_pages(bdev_file->f_mapping, 0, -1);
-		bdev_fput(bdev_file);
-		MTN_PRINT_INFO("%s-%d:invalidate_mapping_pages end\n", __func__, __LINE__);
+		sync_blockdev(bdev);
+		invalidate_mapping_pages(bdev->bd_inode->i_mapping, 0, -1);
+		blkdev_put(bdev, NULL);
+		MTN_PRINT_ERR("invalidate_mapping_pages end\n");
 	}
 	mutex_destroy(&write_bm_mutex);
 	if (bm_write_buffer) {

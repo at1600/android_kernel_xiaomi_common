@@ -1,6 +1,3 @@
-# MIUI ADD: DCVS ARBI
-obj-y                                   += dcvs_arbi/
-# END DCVS ARBI
 # MIUI ADD: Power_UnionPowerCore
 obj-y                                   += unionpower/
 # END Power_UnionPowerCore

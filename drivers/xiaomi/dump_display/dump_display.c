@@ -2,9 +2,7 @@
 /*
  * Dump display support
  *
- * Copyright (c) 2022, xiaomi. All rights reserved.
- *
- * Author: yanghui10@xiaomi.com
+ * Copyright (C) 2024.
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -19,7 +17,6 @@
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <asm/stacktrace.h>
-#include <linux/of_reserved_mem.h>
 
 #define CRASH_RECORD_MAGIC 0x12345678
 #define TRACE_INFO_SIZE 2044
@@ -49,7 +46,7 @@ int trace_snprint(char *buf, size_t size, const unsigned long *entries,
 	return total;
 }
 
-static int set_backtrace_msg(struct notifier_block *self, unsigned long v, void *p)
+static int  set_backtrace_msg(struct notifier_block *self, unsigned long v, void *p)
 {
 	unsigned int nr_entries;
 	unsigned long entries[30] = {0};
@@ -78,19 +75,17 @@ static int dump_display_probe(struct platform_device *pdev)
 {
 	char *unknow_info = "UNKNOWN";
 	int  unknow_info_size  = sizeof(unknow_info);
-	struct reserved_mem *rmem = NULL;
-	phys_addr_t mem_address;
-	size_t mem_size;
+	struct resource *res;
+	u64 mem_address, mem_size;
 
 	pr_info("%s dump display probe\n", __func__);
-	rmem = of_reserved_mem_lookup(pdev->dev.of_node);
-	if (!rmem) {
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
 		pr_err("failed to get dump_display address\n");
 		return -EINVAL;
 	}
-	mem_address = rmem->base;
-	mem_size = rmem->size;
-	pr_err("dump_display address:0x%llx, size:0x%zx\n", mem_address, mem_size);
+	mem_address = res -> start;
+	mem_size = resource_size(res);
 
 	crash_info_region_base = ioremap(mem_address, mem_size);
 	if (!crash_info_region_base) {
@@ -128,13 +123,5 @@ static int __init crash_record_init(void)
 	return 0;
 }
 
-static void __exit crash_record_exit(void)
-{
-	pr_info("%s dump display exit\n", __func__);
-	iounmap(crash_info_region_base);
-	platform_driver_unregister(&dump_display_driver);
-}
-
 module_init(crash_record_init);
-module_exit(crash_record_exit);
 MODULE_LICENSE("GPL v2");

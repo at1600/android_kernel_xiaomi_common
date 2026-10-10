@@ -43,7 +43,7 @@ DEFINE_SPINLOCK(bootprof_lock);
 unsigned long boottime_ok;
 
 static bool enabled;
-static u64 timestamp_on, timestamp_off, start_time;
+static u64 timestamp_on, timestamp_off;
 static bool boot_finish;
 
 static struct list_head initcall_list;
@@ -316,12 +316,9 @@ tp_initcall_finish_cb(void *data, initcall_t fn, int ret)
 	/* start time of current module is 0.*/
 	if (start_ts == 0) {
 		#ifdef MODULE
-		if (start_time == 0) {
-			/* if bootprof is first loading module.*/
-			bootprof_log_boot("Kernel_init_done");
-		}
+		/* if bootprof is first loading module.*/
+		bootprof_log_boot("Kernel_init_done");
 		#endif
-		start_time += 1;
 		return;
 	}
 	duration = end_ts - start_ts;
@@ -481,7 +478,7 @@ static int mt_bootprof_show(struct seq_file *m, void *v)
 	seq_printf(m, "%s: %-10sms\n", "xbl time", xbl_time);
 	seq_printf(m, "%s: %-10sms\n", "abl time", abl_time);
 	seq_puts(m, "----------------------------------------\n");
-	
+
 	seq_printf(m, "%10lld.%06ld : ON (Threshold:%5lldms)\n",
 		   msec_high(timestamp_on), msec_low(timestamp_on),
 		   msec_high(BOOTPROF_THRESHOLD));
@@ -528,24 +525,18 @@ static int __init bootprof_init(void)
 		pr_err("[BOOTTIME] fail to allocate memory\n");
 		return 0;
 	}
-	pr_info("BOOTTIME:bootprof is %p\n", bootprof);
-	pr_info("BOOTTIME:log_count is %lu\n", log_count);
-
 	pr_info("BOOTTIME:pbl_time is %s\n", pbl_time);
 	pr_info("BOOTTIME:xbl_time is %s\n", xbl_time);
 	pr_info("BOOTTIME:abl_time is %s\n", abl_time);
-
 	pe = proc_create("bootprof", 0664, NULL, &mt_bootprof_fops);
 	if (!pe) {
 		pr_err("[BOOTTIME] fail to create file node\n");
 		return 0;
 	}
 	tp_init();
-	pr_info("bootprof_lock is %p\n", &bootprof_lock);
 	pr_info("[BOOTTIME] start mt_bootprof_switch\n");
 	mt_bootprof_switch(1);
 	boottime_ok = 1;
-	start_time = 0;
 
 	return 0;
 }

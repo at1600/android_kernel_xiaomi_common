@@ -24,7 +24,6 @@ struct __mi_stack {
 	struct proc_dir_entry *stack_proc_dir;
 	struct mutex lock;
 } mi_stack = {
-	.pid = -1,
 	.task = NULL,
 };
 
@@ -53,20 +52,15 @@ static int stack_show(struct seq_file *m, void *v)
 {
 	unsigned long *entries;
 	unsigned int i, nr_entries;
-	pid_t pid;
 	struct mutex *lock = &mi_stack.lock;
-	struct task_struct *task = NULL;
+	struct task_struct **p = &mi_stack.task;
 
 	mutex_lock(lock);
-	pid = mi_stack.pid;
-	task = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (task == NULL) {
+	if (!*p) {
 		mutex_unlock(lock);
-		pr_err("can not find pid %d\n", pid);
 		return -ESRCH;
 	}
 
-	get_task_struct(task);
 	entries = kmalloc_array(MAX_STACK_TRACE_DEPTH, sizeof(*entries),
 				GFP_KERNEL);
 	if (!entries) {
@@ -74,12 +68,10 @@ static int stack_show(struct seq_file *m, void *v)
 		return -ENOMEM;
 	}
 
-	nr_entries = stack_trace_save_tsk(task, entries,
+	nr_entries = stack_trace_save_tsk(*p, entries,
 						MAX_STACK_TRACE_DEPTH, 0);
 
-	seq_printf(m, "[%d, %s] Kernel calltrace: \n", task->pid, task->comm);
-	put_task_struct(task);
-
+	seq_printf(m, "[%d, %s] Kernel calltrace: \n", (*p)->pid, (*p)->comm);
 	mutex_unlock(lock);
 	for (i = 0; i < nr_entries; i++) {
 		seq_printf(m, "[<%d>] %pB\n", i, (void *)entries[i]);
@@ -101,9 +93,15 @@ static ssize_t pid_read(struct file *file, char __user *buf,
 {
 	int nbytes;
 	struct mutex *lock = &mi_stack.lock;
+	struct task_struct **p = &mi_stack.task;
 
 	mutex_lock(lock);
-	nbytes = sprintf(kbuf, "%d\n", mi_stack.pid);
+	if (!*p) {
+		mutex_unlock(lock);
+		return -ESRCH;
+	}
+
+	nbytes = sprintf(kbuf, "[%d, %s]\n", (*p)->pid, (*p)->comm);
 	mutex_unlock(lock);
 
 	return simple_read_from_buffer(buf, len, offset, kbuf, nbytes);
@@ -114,25 +112,24 @@ static ssize_t pid_write(struct file *file, const char __user *buf,
 			  size_t len, loff_t *ppos)
 {
 	ssize_t ret;
-	pid_t tmp_pid;
+	pid_t *pid = &mi_stack.pid;
+	struct task_struct **p = &mi_stack.task;
 	struct mutex *lock = &mi_stack.lock;
 
-	mutex_lock(lock);
 	ret = simple_write_to_buffer(kbuf, len, ppos, buf, len);
-	if (sscanf(kbuf, "%d", &tmp_pid) != 1) {
-		mutex_unlock(lock);
+	if (sscanf(kbuf, "%d", pid) != 1)
 		return -EINVAL;
-	}
 
-	if (tmp_pid < 0) {
+	mutex_lock(lock);
+	*p = pid_task(find_vpid(*pid), PIDTYPE_PID);
+	if (*p == NULL) {
 		mutex_unlock(lock);
-		pr_err("pid %d is invalid\n", tmp_pid);
-		return -EINVAL;
+		pr_err("can not find pid %d\n", *pid);
+		return -1;
 	}
-
-	mi_stack.pid = tmp_pid;
 	mutex_unlock(lock);
-	pr_info("User set pid:%d\n", tmp_pid);
+
+	pr_info("User set [pid:%d, comm: %s]\n", (*p)->pid, (*p)->comm);
 
 	return ret;
 }

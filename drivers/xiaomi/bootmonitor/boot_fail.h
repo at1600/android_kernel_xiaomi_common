@@ -76,7 +76,7 @@ typedef unsigned long                  uint64;
 
 #define ERROR_RECORD_LEN               128
 #define ERROR_STAGE                    16
-#define BOITFAIL_MAX                   8
+#define BOITFAIL_MAX                   30
 #define INIT_INDEX                     60
 #define CRASH_MAX                      90
 

@@ -1,6 +1,0 @@
-
-config MI_HYPSYS_NETLINK
-	tristate "hypsys communications"
-	default n
-	help
-	  This feature support hypsys communications

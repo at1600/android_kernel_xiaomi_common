@@ -36,26 +36,11 @@
 #include <linux/export.h>
 #include <net/sock.h>
 #include <net/netlink.h>
+#include <asm/uaccess.h>
 #include <linux/device.h>
 #include <linux/device.h>
 #include <linux/kdev_t.h>
 #include <linux/stat.h>
-#include <linux/console.h>
-#include <linux/vmalloc.h>
-#include <linux/workqueue.h>
-#include <linux/wait.h>
-#include <linux/interrupt.h>
-#include <linux/mtd/mtd.h>
-#include <linux/reboot.h>
-#include <linux/panic_notifier.h>
-#include <linux/io.h>
-#include <linux/mm.h>
-#include <linux/memblock.h>
-#include <linux/pstore_ram.h>
-#include <linux/rslib.h>
-#include <asm/page.h>
-#include <linux/nmi.h>
-#include <linux/sched/debug.h>
 
 #define DEFAULT_TIMEOUT	                  5
 #define DEFAULT_BOOT_TIME                 45
@@ -80,34 +65,29 @@
 #define NETLINK_TEST                      31
 #define MAX_MSGSIZE                       128
 
-#define AMS_READY                         8
-#define AMS_READY_TIME                    80
-
 #define RPOC_ENTRY_LINE                   64
 #define MAX_CMDLINE_PARAM_LEN             128
 
 #define BOOT_MODE_NORMAL                  "normal"
 #define BOOT_OK                           "boot-ok"
 #define BEFORE_VERSION                    "no record for fisrt bootfail init"
-#define FIRST_BOOT                    	  "mFirstBoot"
 
 extern unsigned long get_log_count(void);
 extern struct log_t **get_bootprof_pointer(void);
 extern void bm_netlink_exit(void);
 extern void bm_sendnlmsg(char *message);
-extern void bootmonitor_get_kmsg(char *buffer);
-extern int get_bootmonitor_devices(void);
-extern int __partition_bm_read(struct file *dev, loff_t from, size_t len, void *buf);
-extern int _partition_bm_write(loff_t to, size_t len, const void *buf);
+extern void monitor_get_kmsg(char *buffer);
+extern int get_bm_devices(void);
+extern int _partition_bm_read(struct block_device *dev, loff_t from, size_t len, void *buf);
+extern int partition_bm_write(loff_t to, size_t len, const void *buf);
 extern int bm_netlink_init(void);
 
 extern spinlock_t bootprof_lock;
 extern unsigned long boottime_ok;
 extern int bm_event_counts;
-extern int first_boot;
-extern char bm_boot_mode[16];
+extern char bm_boot_mode[10];
 extern char *bm_write_buffer;
-extern struct file *bdev_file;
+extern struct block_device *bdev;
 extern struct mutex write_bm_mutex;
 extern struct platform_driver boot_monitor_driver;
 
@@ -115,20 +95,20 @@ extern char build_fingerprint[MAX_CMDLINE_PARAM_LEN];
 extern int blackbox_version;
 extern int os_version;
 
-struct bootmonitor_platform_data {
+struct boot_platform_data {
 	unsigned long	mem_size;
 	phys_addr_t	    mem_address;
 	unsigned long	console_size;
 	unsigned long	pmsg_size;
 };
 
-struct bootmonitor_data_context {
-	struct bootmonitor_platform_data monitor_data;
+struct bootmonitor_context {
+	struct boot_platform_data monitor_data;
 	void *oops_buf;
 };
 
-extern int write_blackbox_header(struct bootmonitor_data_context *cxt, char *buffer, int event);
-extern void bootmonitor_get_pmsg(struct bootmonitor_data_context *cxt);
+extern int write_blackbox_header(struct bootmonitor_context *cxt, char *buffer, int event);
+extern void monitor_get_pmsg(struct bootmonitor_context *cxt);
 
 struct type_map {
 	int warntime;
@@ -136,10 +116,10 @@ struct type_map {
 	char name[40];
 };
 
-extern struct bootmonitor_data_context boot_cxt;
+extern struct bootmonitor_context boot_cxt;
 extern struct type_map bm_boot_events[];
 
-struct bootmonitor_pmsg_buffer_hdr {
+struct pmsg_buffer_hdr {
 	uint32_t    sig;
 	atomic_t    start;
 	atomic_t    size;

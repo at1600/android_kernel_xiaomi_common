@@ -6,4 +6,4 @@ config MI_UBT
 	help
 		mi_ubt provide dump_user_backtrace interface to show user stacktrace.
 
-source "$(KCONFIG_EXT_PREFIX)drivers/xiaomi/mi_ubt/test/Kconfig"
+source "drivers/xiaomi/mi_ubt/test/Kconfig"

@@ -16,6 +16,7 @@
 
 #include <linux/node.h>
 #include <linux/compiler.h>
+#include <linux/cpumask.h>
 #include <linux/cpuhotplug.h>
 #include <linux/cpuhplock.h>
 #include <linux/cpu_smt.h>
