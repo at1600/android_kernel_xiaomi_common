@@ -4,3 +4,5 @@ source "drivers/xiaomi/mi_ubt/Kconfig"
 source "drivers/xiaomi/printk_enhance/Kconfig"
 source "drivers/xiaomi/mi_trace/Kconfig"
 source "drivers/xiaomi/swinfo/Kconfig"
+source "drivers/xiaomi/lz4asm/Kconfig"
+
