@@ -4,5 +4,5 @@ obj-y				+= mi_ubt/
 obj-y				+= printk_enhance/
 obj-y				+= mi_trace/
 obj-y				+= swinfo/
-obj-y				+= lz4asm/
+
 
