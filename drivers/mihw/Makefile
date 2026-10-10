@@ -9,3 +9,7 @@ obj-y                                   += powersave/
 # MIUI ADD: Performance_TurboSched
 obj-$(CONFIG_MI_SPEED_TOUCH)            += input/
 # END Performance_TurboSched
+
+# MIUI ADD: DCVS ARBI
+obj-y                                   += dcvs_arbi/
+# END DCVS ARBI
