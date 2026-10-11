@@ -2,6 +2,7 @@
 config MI_SPEED_TOUCH
 	tristate "mi speed touch"
 	depends on MIHW
+        default y
 	help
 	  The case is used to monitor speed touch
 
@@ -12,27 +13,28 @@ config MI_DCVS_ARBI
           The case is used to manager multi voter clients of dcvs
 
 config MI_POWER_SAVE
-    tristate "power save mode 2.0"
-    default n
-    help
-      Power Save Mode 2.0
+        tristate "power save mode 2.0"
+        default n
+        help
+          Power Save Mode 2.0
 
 config MI_UNION_POWER
-    tristate "union power load monitor"
-    default n
-    help
-      The case is used to monitor load
+        tristate "union power load monitor"
+        default n
+        help
+          The case is used to monitor load
 
 config MI_SCHED
         tristate "schedule policy defined by xiaomi"
-	depends on MIHW && MI_SCHED_WALT
-        default n
+        depends on MIHW && MI_SCHED_WALT
+        default y
         help
           This option can show package runtime info in sup/big/little core.
 
 config MIGT
-	tristate "mi game turbo"
+        tristate "mi game turbo"
 	depends on MI_SCHED && SCHED_WALT && MIGT_WALT
+        default y
 	help
 	  Improve game peformance and power.
 
