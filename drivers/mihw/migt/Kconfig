@@ -1,16 +1,5 @@
 menu "Migt"
 
-config XIAOMI_Migt
-	bool "Enable Xiaomi MIUI modifications"
-	depends on BOARD_XIAOMI
-	help
-	  Enables compilation of Xiaomi MIUI specific vendor additions
-
-	  Say Y if you want to compile the Xiaomi MIUI specific kernel modifications.
-	  Say N if you want to discard the Xiaomi MIUI specific kernel modifications.
-
-if XIAOMI_Migt
-
 config PACKAGE_RUNTIME_INFO
 	bool "Show package runtime info on cluster"
 	help
@@ -57,8 +46,21 @@ config MIUI_ZRAM_MEMORY_TRACKING
 
 	  See Documentation/blockdev/zram.txt for more information.
 
+config MI_SCHED
+        tristate "schedule policy defined by xiaomi"
+        depends on MIHW && MI_SCHED_WALT
+        default y
+        help
+          This option can show package runtime info in sup/big/little core.
+
+config TURBO_SCHED
+	tristate "mi turbo sched"
+	depends on MIHW && MI_SCHED
+	help
+	  Tuning mi-scheduler policy
+
+
 source "drivers/mihw/migt/fragmention/Kconfig"
 
-endif
 
 endmenu

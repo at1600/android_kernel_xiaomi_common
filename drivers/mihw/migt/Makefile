@@ -5,3 +5,6 @@ obj-$(CONFIG_MI_FRAGMENTION)	+= fragmention/
 migt-$(CONFIG_MIGT)		+= migt_main.o
 migt-$(CONFIG_MIGT)		+= migt_ca.o
 migt-$(CONFIG_MIGT)		+= glk.o
+obj-$(CONFIG_MI_SCHED) +=		mi_schedule.o
+mi_schedule-$(CONFIG_MI_SCHED)		+= mi_sched.o
+obj-$(CONFIG_TURBO_SCHED)                += turbo_sched.o
