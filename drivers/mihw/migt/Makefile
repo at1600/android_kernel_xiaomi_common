@@ -1,0 +1,7 @@
+obj-$(CONFIG_MIGT)		+= migt.o
+obj-$(CONFIG_MILLET)		+= millet_core.o millet_pkg.o millet_hs.o
+obj-$(CONFIG_MIGT_ENERGY_MODEL)	+= cpu_energy_dt.o cpu_pcost.o gpu_pcost.o
+obj-$(CONFIG_MI_FRAGMENTION)	+= fragmention/
+migt-$(CONFIG_MIGT)		+= migt_main.o
+migt-$(CONFIG_MIGT)		+= migt_ca.o
+migt-$(CONFIG_MIGT)		+= glk.o

@@ -31,18 +31,14 @@ config MI_SCHED
         help
           This option can show package runtime info in sup/big/little core.
 
-config MIGT
-        tristate "mi game turbo"
-	depends on MI_SCHED && SCHED_WALT && MIGT_WALT
-        default y
-	help
-	  Improve game peformance and power.
 
 config TURBO_SCHED
 	tristate "mi turbo sched"
 	depends on MIHW && MI_SCHED
 	help
 	  Tuning mi-scheduler policy
+
+source "drivers/mihw/migt/Kconfig"
 
 
 

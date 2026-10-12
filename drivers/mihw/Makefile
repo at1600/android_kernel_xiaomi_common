@@ -14,5 +14,6 @@ obj-$(CONFIG_MI_SPEED_TOUCH)            += input/
 obj-y                                   += dcvs_arbi/
 # END DCVS ARBI
 obj-y                                   += mi_sched/
-obj-y                                   += game/
+obj-y                                   += migt/
 obj-y					+= turbo_sched/
+
