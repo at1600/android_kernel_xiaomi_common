@@ -26,6 +26,13 @@ config THERMAL_NETLINK
 	  trip point crossed, cooling device update or governor
 	  change. It is recommended to enable the feature.
 
+config MI_THERMAL_INTERFACE
+	tristate "xiaomi thermal control interface"
+	depends on THERMAL && QGKI
+	default n
+	help
+	  This is xiaomi thermal control interface.
+
 config THERMAL_STATISTICS
 	bool "Thermal state transition statistics"
 	help
@@ -498,13 +505,5 @@ config LOONGSON2_THERMAL
 	  temperature range to trigger the interrupt. When the input temperature
 	  is higher than the high temperature threshold or lower than the low
 	  temperature threshold, the interrupt will occur.
-
-config MI_THERMAL_INTERFACE
-	tristate "xiaomi thermal control interface"
-	depends on THERMAL && QGKI
-	default n
-	help
-	  This is xiaomi thermal control interface.
-
 
 endif
