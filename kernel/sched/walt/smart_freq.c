@@ -615,65 +615,63 @@ void smart_freq_init(const char *name)
 			if (cluster->id == 0) {
 				/* Legacy */
 				cluster->smart_freq_info->legacy_reason_config[0].freq_allowed =
-					2400000;
+					2000000;
 				cluster->smart_freq_info->legacy_reason_config[2].hyst_ns =
-					1000000000;
+					2000000000;
 				cluster->smart_freq_info->legacy_reason_config[3].hyst_ns =
-					1000000000;
+					2000000000;
 				cluster->smart_freq_info->legacy_reason_config[4].hyst_ns =
-					300000000;
+					1000000000;
 				cluster->smart_freq_info->smart_freq_participation_mask |=
 					BIT(BOOST_SMART_FREQ) |
 					BIT(SUSTAINED_HIGH_UTIL_SMART_FREQ) |
 					BIT(BIG_TASKCNT_SMART_FREQ) |
 					BIT(TRAILBLAZER_SMART_FREQ) |
 					BIT(SBT_SMART_FREQ) |
-					BIT(PIPELINE_60FPS_OR_LESSER_SMART_FREQ) |
 					BIT(PIPELINE_90FPS_SMART_FREQ) |
 					BIT(PIPELINE_120FPS_OR_GREATER_SMART_FREQ) |
 					BIT(THERMAL_ROTATION_SMART_FREQ);
 
 				/* IPC */
-				cluster->smart_freq_info->ipc_reason_config[0].ipc = 120;
-				cluster->smart_freq_info->ipc_reason_config[1].ipc = 180;
-				cluster->smart_freq_info->ipc_reason_config[2].ipc = 220;
-				cluster->smart_freq_info->ipc_reason_config[3].ipc = 260;
-				cluster->smart_freq_info->ipc_reason_config[4].ipc = 300;
+				cluster->smart_freq_info->ipc_reason_config[0].ipc = 140;
+				cluster->smart_freq_info->ipc_reason_config[1].ipc = 200;
+				cluster->smart_freq_info->ipc_reason_config[2].ipc = 250;
+				cluster->smart_freq_info->ipc_reason_config[3].ipc = 290;
+				cluster->smart_freq_info->ipc_reason_config[4].ipc = 340;
 				cluster->smart_freq_info->smart_freq_ipc_participation_mask =
 					BIT(IPC_A) | BIT(IPC_B) | BIT(IPC_C) | BIT(IPC_D) |
 					BIT(IPC_E);
-				cluster->smart_freq_info->min_cycles = 5806080;
+				cluster->smart_freq_info->min_cycles = 6967296;
 			} else if (cluster->id == 1) {
 				/* Legacy */
 				cluster->smart_freq_info->legacy_reason_config[0].freq_allowed =
-					3513600;
+					3000000;
 				cluster->smart_freq_info->legacy_reason_config[2].hyst_ns =
-					1000000000;
+					2000000000;
 				cluster->smart_freq_info->legacy_reason_config[3].hyst_ns =
-					1000000000;
+					2000000000;
 				cluster->smart_freq_info->legacy_reason_config[4].hyst_ns =
-					300000000;
+					1000000000;
 				cluster->smart_freq_info->smart_freq_participation_mask |=
 					BIT(BOOST_SMART_FREQ) |
 					BIT(SUSTAINED_HIGH_UTIL_SMART_FREQ) |
 					BIT(BIG_TASKCNT_SMART_FREQ) |
 					BIT(TRAILBLAZER_SMART_FREQ) |
 					BIT(SBT_SMART_FREQ) |
-					BIT(PIPELINE_60FPS_OR_LESSER_SMART_FREQ) |
 					BIT(PIPELINE_90FPS_SMART_FREQ) |
 					BIT(PIPELINE_120FPS_OR_GREATER_SMART_FREQ) |
 					BIT(THERMAL_ROTATION_SMART_FREQ);
 
 				/* IPC */
-				cluster->smart_freq_info->ipc_reason_config[0].ipc = 220;
-				cluster->smart_freq_info->ipc_reason_config[1].ipc = 260;
-				cluster->smart_freq_info->ipc_reason_config[2].ipc = 280;
-				cluster->smart_freq_info->ipc_reason_config[3].ipc = 320;
-				cluster->smart_freq_info->ipc_reason_config[4].ipc = 400;
+				cluster->smart_freq_info->ipc_reason_config[0].ipc = 250;
+				cluster->smart_freq_info->ipc_reason_config[1].ipc = 290;
+				cluster->smart_freq_info->ipc_reason_config[2].ipc = 310;
+				cluster->smart_freq_info->ipc_reason_config[3].ipc = 350;
+				cluster->smart_freq_info->ipc_reason_config[4].ipc = 440;
 				cluster->smart_freq_info->smart_freq_ipc_participation_mask =
 					BIT(IPC_A) | BIT(IPC_B) | BIT(IPC_C) | BIT(IPC_D) |
 					BIT(IPC_E);
-				cluster->smart_freq_info->min_cycles = 7004160;
+				cluster->smart_freq_info->min_cycles = 8404992;
 			}
 		}
 	} else if (!strcmp(name, "TUNA") || !strcmp(name, "TUNA7") || !strcmp(name, "TUNAP")) {
