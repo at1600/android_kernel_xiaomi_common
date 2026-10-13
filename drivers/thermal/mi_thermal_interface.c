@@ -16,11 +16,9 @@
 #include <net/netlink.h>
 #include <net/genetlink.h>
 #include <linux/power_supply.h>
-#include "thermal_core.h"
 
-/* ===================== 修复1：删除未定义的 mi_thermal_device，改用全局变量存业务数据 ===================== */
-static struct thermal_zone_device *mi_tzd;
-static int usb_online; /* 替代原来的 mi_thermal_dev.usb_online */
+static struct device *mi_thermal_dev;
+static int usb_online; /* 替代原结构体里的 usb_online 成员 */
 
 struct screen_monitor {
 	struct notifier_block thermal_notifier;
@@ -28,19 +26,6 @@ struct screen_monitor {
 };
 struct screen_monitor sm;
 
-/* ===================== 修复2：thermal zone 温度回调（必须实现） ===================== */
-static int mi_thermal_get_temp(struct thermal_zone_device *tzd, int *temp)
-{
-	/* 替换为实际温度读取逻辑，单位：毫摄氏度 */
-	*temp = 25000;
-	return 0;
-}
-
-static const struct thermal_zone_device_ops mi_thermal_zone_ops = {
-	.get_temp = mi_thermal_get_temp,
-};
-
-/* ===================== sysfs 属性节点 ===================== */
 static ssize_t thermal_screen_state_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -61,7 +46,6 @@ static struct attribute *mi_thermal_dev_attr_group[] = {
 	NULL,
 };
 
-/* ===================== 修复3：属性组直接用标准结构体，不再嵌套一层 ===================== */
 static const struct attribute_group mi_thermal_attr_group = {
 	.attrs = mi_thermal_dev_attr_group,
 };
@@ -108,8 +92,7 @@ static int screen_state_for_thermal_callback(struct notifier_block *nb,
 	pr_warn("%s: %s, sm.screen_state = %d\n", __func__, get_screen_state_name(blank),
 			sm.screen_state);
 
-	/* ===================== 修复4：通知对象改为 thermal zone 自带的 device ===================== */
-	sysfs_notify(&mi_tzd->dev.kobj, NULL, "screen_state");
+	sysfs_notify(&mi_thermal_dev->kobj, NULL, "screen_state");
 	return NOTIFY_OK;
 }
 
@@ -135,85 +118,68 @@ static int usb_online_callback(struct notifier_block *nb,
 			return err;
 		}
 		usb_online = ret.intval;
-		/* ===================== 修复5：通知对象改为 thermal zone 自带的 device ===================== */
-		sysfs_notify(&mi_tzd->dev.kobj, NULL, "usb_online");
+		sysfs_notify(&mi_thermal_dev->kobj, NULL, "usb_online");
 	}
 	return NOTIFY_OK;
 }
 
-/* ===================== 修复6：创建 sysfs 节点，挂载到 thermal zone 设备上 ===================== */
 static int create_thermal_message_node(void)
 {
 	int ret = 0;
+	struct class *thermal_class;
 
-	ret = sysfs_create_group(&mi_tzd->dev.kobj, &mi_thermal_attr_group);
+	thermal_class = class_find_by_name("thermal");
+	if (!thermal_class) {
+		pr_err("%s ERROR: thermal class not found\n", __func__);
+		return -ENODEV;
+	}
+
+	mi_thermal_dev = device_create(thermal_class, NULL, MKDEV(0, 0),
+					NULL, "thermal_message");
+	if (IS_ERR(mi_thermal_dev)) {
+		pr_err("%s ERROR: Cannot create thermal message device\n", __func__);
+		ret = PTR_ERR(mi_thermal_dev);
+		return ret;
+	}
+
+	ret = sysfs_create_group(&mi_thermal_dev->kobj, &mi_thermal_attr_group);
 	if (ret) {
 		pr_err("%s ERROR: Cannot create sysfs structure!:%d\n", __func__, ret);
+		device_destroy(thermal_class, MKDEV(0, 0));
 		ret = -ENODEV;
 		return ret;
 	}
+
 	return ret;
 }
 
 static void destroy_thermal_message_node(void)
 {
-	sysfs_remove_group(&mi_tzd->dev.kobj, &mi_thermal_attr_group);
+	struct class *thermal_class;
+
+	thermal_class = class_find_by_name("thermal");
+	if (thermal_class && mi_thermal_dev) {
+		sysfs_remove_group(&mi_thermal_dev->kobj, &mi_thermal_attr_group);
+		device_destroy(thermal_class, MKDEV(0, 0));
+		mi_thermal_dev = NULL;
+	}
 }
 
-/* ===================== 修复7：6.12 标准两步注册法：alloc + add ===================== */
 static int __init mi_thermal_interface_init(void)
 {
 	int ret;
 
-	/* 第一步：分配 thermal zone 设备 */
-	mi_tzd = thermal_zone_device_alloc(
-		"mi_thermal",	/* 设备名，对应 /sys/class/thermal/mi_thermal */
-		0,		/* trip 温差点数量 */
-		0,		/* 中断掩码 */
-		NULL,		/* 私有数据指针 */
-		&mi_thermal_zone_ops,
-		NULL,		/* 温控参数 */
-		0,		/* 被动降温延迟(ms) */
-		0		/* 轮询延迟(ms) */
-	);
-	if (IS_ERR(mi_tzd)) {
-		pr_err("mi_thermal: alloc thermal zone failed, err=%ld\n",
-		       PTR_ERR(mi_tzd));
-		return PTR_ERR(mi_tzd);
-	}
-
-	/* 第二步：添加到内核 thermal 子系统 */
-	ret = thermal_zone_device_add(mi_tzd);
-	if (ret) {
-		pr_err("mi_thermal: add thermal zone failed, err=%d\n", ret);
-		goto err_put_tzd;
-	}
-
-	/* 创建自定义 sysfs 消息节点 */
 	ret = create_thermal_message_node();
 	if (ret)
-		goto err_del_tzd;
+		return ret;
 
-	/* 你原来的其他初始化逻辑（通知注册等）保留在这里 */
 
 	return 0;
-
-err_del_tzd:
-	thermal_zone_device_del(mi_tzd);
-err_put_tzd:
-	thermal_zone_device_put(mi_tzd);
-	return ret;
 }
 
 static void __exit mi_thermal_interface_exit(void)
 {
-	/* 先销毁 sysfs 节点，再注销 thermal zone */
 	destroy_thermal_message_node();
-
-	if (mi_tzd) {
-		thermal_zone_device_del(mi_tzd);
-		thermal_zone_device_put(mi_tzd);
-	}
 }
 
 module_init(mi_thermal_interface_init);
