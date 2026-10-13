@@ -1,190 +1,163 @@
-#include <linux/cpu_cooling.h>
-#include <linux/cpufreq.h>
-#include <linux/device.h>
-#include <linux/err.h>
-#include <linux/idr.h>
-#include <linux/kdev_t.h>
 #include <linux/module.h>
-#include <linux/of.h>
-#include <linux/pm_qos.h>
-#include <linux/reboot.h>
+#include <linux/device.h>
+#include <linux/thermal.h>
+#include <linux/sysfs.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/suspend.h>
-#include <linux/thermal.h>
-#include <drm/mi_disp_notifier.h>
-#include <net/netlink.h>
-#include <net/genetlink.h>
 #include <linux/power_supply.h>
+#include <drm/mi_disp_notifier.h>
 
-static struct device *mi_thermal_dev;
-static int usb_online; /* 替代原结构体里的 usb_online 成员 */
-
-struct screen_monitor {
-	struct notifier_block thermal_notifier;
+struct thermal_msg_priv {
+	int usb_online;
 	int screen_state;
+	struct notifier_block screen_nb;
+	struct notifier_block usb_nb;
 };
-struct screen_monitor sm;
 
-static ssize_t thermal_screen_state_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+static struct thermal_zone_device *tzd;
+
+static int msg_get_temp(struct thermal_zone_device *tz, int *temp)
 {
-	return snprintf(buf, PAGE_SIZE, "%d\n", sm.screen_state);
+	*temp = 25000;
+	return 0;
 }
-static DEVICE_ATTR(screen_state, 0664, thermal_screen_state_show, NULL);
 
-static ssize_t thermal_usb_online_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+static const struct thermal_zone_device_ops msg_tz_ops = {
+	.get_temp = msg_get_temp,
+};
+
+static ssize_t screen_state_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%d\n", usb_online);
+	struct thermal_msg_priv *priv = thermal_zone_device_priv(tzd);
+	return sysfs_emit(buf, "%d\n", priv->screen_state);
 }
-static DEVICE_ATTR(usb_online, 0664, thermal_usb_online_show, NULL);
+static DEVICE_ATTR_RO(screen_state);
 
-static struct attribute *mi_thermal_dev_attr_group[] = {
+static ssize_t usb_online_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct thermal_msg_priv *priv = thermal_zone_device_priv(tzd);
+	return sysfs_emit(buf, "%d\n", priv->usb_online);
+}
+static DEVICE_ATTR_RO(usb_online);
+
+static struct attribute *msg_attrs[] = {
 	&dev_attr_screen_state.attr,
 	&dev_attr_usb_online.attr,
 	NULL,
 };
 
-static const struct attribute_group mi_thermal_attr_group = {
-	.attrs = mi_thermal_dev_attr_group,
+static const struct attribute_group msg_attr_group = {
+	.attrs = msg_attrs,
 };
 
-static const char *get_screen_state_name(int mode)
+static const char *screen_state_name(int state)
 {
-	switch (mode) {
-	case MI_DISP_DPMS_ON:
-		return "On";
-	case MI_DISP_DPMS_LP1:
-		return "Doze";
-	case MI_DISP_DPMS_LP2:
-		return "DozeSuspend";
-	case MI_DISP_DPMS_POWERDOWN:
-		return "Off";
-	default:
-		return "Unknown";
+	switch (state) {
+	case MI_DISP_DPMS_ON:		return "On";
+	case MI_DISP_DPMS_LP1:		return "Doze";
+	case MI_DISP_DPMS_LP2:		return "DozeSuspend";
+	case MI_DISP_DPMS_POWERDOWN:	return "Off";
+	default:			return "Unknown";
 	}
 }
 
-static int screen_state_for_thermal_callback(struct notifier_block *nb,
-		unsigned long val, void *data)
+static int screen_state_notify(struct notifier_block *nb,
+			       unsigned long val, void *data)
 {
-	struct mi_disp_notifier *evdata = data;
-	unsigned int blank;
+	struct thermal_msg_priv *priv = container_of(nb, struct thermal_msg_priv, screen_nb);
+	struct mi_disp_notifier *ev = data;
+	int state;
 
-	if (val != MI_DISP_DPMS_EVENT || !evdata || !evdata->data)
-		return 0;
+	if (val != MI_DISP_DPMS_EVENT || !ev || !ev->data)
+		return NOTIFY_OK;
 
-	blank = *(int *)(evdata->data);
-	switch (blank) {
-	case MI_DISP_DPMS_ON:
-		sm.screen_state = 1;
-		break;
-	case MI_DISP_DPMS_LP1:
-	case MI_DISP_DPMS_LP2:
-	case MI_DISP_DPMS_POWERDOWN:
-		sm.screen_state = 0;
-		break;
-	default:
-		break;
-	}
+	state = *(int *)ev->data;
+	priv->screen_state = (state == MI_DISP_DPMS_ON) ? 1 : 0;
 
-	pr_warn("%s: %s, sm.screen_state = %d\n", __func__, get_screen_state_name(blank),
-			sm.screen_state);
+	pr_debug("thermal_msg: screen %s, state=%d\n",
+		 screen_state_name(state), priv->screen_state);
 
-	sysfs_notify(&mi_thermal_dev->kobj, NULL, "screen_state");
+	sysfs_notify(&tzd->dev.kobj, NULL, "screen_state");
 	return NOTIFY_OK;
 }
 
-static int usb_online_callback(struct notifier_block *nb,
-		unsigned long val, void *data)
+static int usb_online_notify(struct notifier_block *nb,
+			     unsigned long val, void *data)
 {
-	static struct power_supply *usb_psy;
+	struct thermal_msg_priv *priv = container_of(nb, struct thermal_msg_priv, usb_nb);
 	struct power_supply *psy = data;
-	union power_supply_propval ret = {0,};
-	int err = 0;
+	union power_supply_propval prop;
 
 	if (strcmp(psy->desc->name, "usb"))
 		return NOTIFY_OK;
 
-	if (!usb_psy)
-		usb_psy = power_supply_get_by_name("usb");
-
-	if (usb_psy) {
-		err = power_supply_get_property(usb_psy,
-				POWER_SUPPLY_PROP_ONLINE, &ret);
-		if (err) {
-			pr_err("usb online read error:%d\n", err);
-			return err;
-		}
-		usb_online = ret.intval;
-		sysfs_notify(&mi_thermal_dev->kobj, NULL, "usb_online");
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &prop) == 0) {
+		priv->usb_online = prop.intval;
+		sysfs_notify(&tzd->dev.kobj, NULL, "usb_online");
 	}
+
 	return NOTIFY_OK;
 }
 
-static int create_thermal_message_node(void)
+static int __init thermal_msg_init(void)
 {
-	int ret = 0;
-	struct class *thermal_class;
+	struct thermal_msg_priv *priv;
+	int ret;
 
-	thermal_class = class_find_by_name("thermal");
-	if (!thermal_class) {
-		pr_err("%s ERROR: thermal class not found\n", __func__);
-		return -ENODEV;
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	tzd = thermal_zone_device_alloc("thermal_message", 0, 0,
+					priv, &msg_tz_ops, NULL, 0, 0);
+	if (IS_ERR(tzd)) {
+		ret = PTR_ERR(tzd);
+		goto err_free_priv;
 	}
 
-	mi_thermal_dev = device_create(thermal_class, NULL, MKDEV(0, 0),
-					NULL, "thermal_message");
-	if (IS_ERR(mi_thermal_dev)) {
-		pr_err("%s ERROR: Cannot create thermal message device\n", __func__);
-		ret = PTR_ERR(mi_thermal_dev);
-		return ret;
-	}
+	ret = thermal_zone_device_add(tzd);
+	if (ret)
+		goto err_put_tzd;
 
-	ret = sysfs_create_group(&mi_thermal_dev->kobj, &mi_thermal_attr_group);
-	if (ret) {
-		pr_err("%s ERROR: Cannot create sysfs structure!:%d\n", __func__, ret);
-		device_destroy(thermal_class, MKDEV(0, 0));
-		ret = -ENODEV;
-		return ret;
-	}
+	ret = sysfs_create_group(&tzd->dev.kobj, &msg_attr_group);
+	if (ret)
+		goto err_del_tzd;
 
+	priv->screen_nb.notifier_call = screen_state_notify;
+	mi_disp_register_client(&priv->screen_nb);
+
+	priv->usb_nb.notifier_call = usb_online_notify;
+	power_supply_reg_notifier(&priv->usb_nb);
+
+	return 0;
+
+err_del_tzd:
+	thermal_zone_device_del(tzd);
+err_put_tzd:
+	thermal_zone_device_put(tzd);
+err_free_priv:
+	kfree(priv);
 	return ret;
 }
 
-static void destroy_thermal_message_node(void)
+static void __exit thermal_msg_exit(void)
 {
-	struct class *thermal_class;
+	struct thermal_msg_priv *priv = thermal_zone_device_priv(tzd);
 
-	thermal_class = class_find_by_name("thermal");
-	if (thermal_class && mi_thermal_dev) {
-		sysfs_remove_group(&mi_thermal_dev->kobj, &mi_thermal_attr_group);
-		device_destroy(thermal_class, MKDEV(0, 0));
-		mi_thermal_dev = NULL;
-	}
+	power_supply_unreg_notifier(&priv->usb_nb);
+	mi_disp_unregister_client(&priv->screen_nb);
+
+	sysfs_remove_group(&tzd->dev.kobj, &msg_attr_group);
+	thermal_zone_device_del(tzd);
+	thermal_zone_device_put(tzd);
+	kfree(priv);
 }
 
-static int __init mi_thermal_interface_init(void)
-{
-	int ret;
+module_init(thermal_msg_init);
+module_exit(thermal_msg_exit);
 
-	ret = create_thermal_message_node();
-	if (ret)
-		return ret;
-
-
-	return 0;
-}
-
-static void __exit mi_thermal_interface_exit(void)
-{
-	destroy_thermal_message_node();
-}
-
-module_init(mi_thermal_interface_init);
-module_exit(mi_thermal_interface_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Fankl");
-MODULE_DESCRIPTION("Xiaomi thermal control interface");
-MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("Thermal message interface for 6.12 kernel");
+MODULE_ALIAS("thermal:thermal_message");
