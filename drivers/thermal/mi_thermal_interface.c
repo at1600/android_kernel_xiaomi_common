@@ -19,12 +19,17 @@
 
 #include "thermal_core.h"
 
-struct mi_thermal_device  {
-	struct device *dev;
-	struct class *class;
-	struct attribute_group attrs;
-	struct notifier_block psy_nb;
-	int usb_online;
+static struct thermal_zone_device *mi_tzd;
+
+static int mi_thermal_get_temp(struct thermal_zone_device *tzd, int *temp)
+{
+    // 替换成你实际的温度读取逻辑
+    *temp = 25000;
+    return 0;
+}
+
+static const struct thermal_zone_device_ops mi_thermal_zone_ops = {
+    .get_temp = mi_thermal_get_temp,
 };
 
 static struct mi_thermal_device mi_thermal_dev;
@@ -135,8 +140,6 @@ static int usb_online_callback(struct notifier_block *nb,
 static int create_thermal_message_node(void)
 {
 	int ret = 0;
-	mi_thermal_dev.class = &thermal_class;
-	mi_thermal_dev.dev = &thermal_message_dev;
 	mi_thermal_dev.attrs.attrs = mi_thermal_dev_attr_group;
 	ret = sysfs_create_group(&mi_thermal_dev.dev->kobj, &mi_thermal_dev.attrs);
 	if (ret) {
@@ -157,32 +160,34 @@ static void destroy_thermal_message_node(void)
 
 static int __init mi_thermal_interface_init(void)
 {
-	int ret = 0;
-	if (create_thermal_message_node()){
-		pr_warn("Thermal: create screen state failed\n");
-	}
-	sm.thermal_notifier.notifier_call = screen_state_for_thermal_callback;
-	if (mi_disp_register_client(&sm.thermal_notifier) < 0) {
-		pr_warn("Thermal: register screen state callback failed\n");
-	}
-	mi_thermal_dev.psy_nb.notifier_call = usb_online_callback;
-	ret = power_supply_reg_notifier(&mi_thermal_dev.psy_nb);
-	if (ret < 0) {
-		pr_err("usb online notifier registration error. defer. err:%d\n",
-			ret);
-		ret = -EPROBE_DEFER;
-	}
+mi_tzd = thermal_zone_device_register(
+        "mi_thermal",
+        0, 
+        0,
+        NULL,
+        &mi_thermal_zone_ops,
+        NULL,
+        0,
+        0
+    );
+
+    if (IS_ERR(mi_tzd)) {
+        pr_err("mi_thermal: register thermal zone failed, err=%ld\n",
+               PTR_ERR(mi_tzd));
+        return PTR_ERR(mi_tzd);
+    }
 	return 0;
 }
 
 static void __exit mi_thermal_interface_exit(void)
 {
-	mi_disp_unregister_client(&sm.thermal_notifier);
-	destroy_thermal_message_node();
+    if (mi_tzd)
+        thermal_zone_device_unregister(mi_tzd);
 }
 
 module_init(mi_thermal_interface_init);
 module_exit(mi_thermal_interface_exit);
+MODULE_LICENSE("GPL");
 
 MODULE_AUTHOR("Fankl");
 MODULE_DESCRIPTION("Xiaomi thermal control interface");
