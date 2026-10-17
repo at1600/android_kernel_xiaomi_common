@@ -32,6 +32,8 @@ obj-y += core.o
 obj-y += fair.o
 obj-y += build_policy.o
 obj-y += build_utility.o
+obj-y += wait.o wait_bit.o swait.o completion.o
+obj-$(CONFIG_SCHED_WALT) += walt/
 obj-$(CONFIG_ANDROID_VENDOR_HOOKS) += vendor_hooks.o
 obj-$(CONFIG_SCHED_RT_INVARIANT_TEST) += test_ksched_football.o
-obj-$(CONFIG_SCHED_WALT) += walt/
+
