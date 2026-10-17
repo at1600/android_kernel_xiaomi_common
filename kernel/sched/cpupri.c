@@ -22,7 +22,6 @@
  *  worst case complexity of O(min(101, nr_domcpus)), though the scenario that
  *  yields the worst case search is fairly contrived.
  */
-#include "sched.h"
 
 /*
  * p->rt_priority   p->prio   newpri   cpupri
@@ -197,6 +196,7 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(cpupri_find_fitness);
 
 /**
  * cpupri_set - update the CPU priority setting
@@ -288,7 +288,7 @@ int cpupri_init(struct cpupri *cp)
 			goto cleanup;
 	}
 
-	cp->cpu_to_pri = kzalloc_objs(int, nr_cpu_ids);
+	cp->cpu_to_pri = kcalloc(nr_cpu_ids, sizeof(int), GFP_KERNEL);
 	if (!cp->cpu_to_pri)
 		goto cleanup;
 

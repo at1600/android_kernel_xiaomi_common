@@ -2,10 +2,8 @@
 /*
  * Simple CPU accounting cgroup controller
  */
-#include <linux/sched/clock.h>
-#include <linux/sched/cputime.h>
-#include <linux/tsacct_kern.h>
-#include "sched.h"
+#include <linux/cpufreq_times.h>
+#include <trace/hooks/sched.h>
 
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
  #include <asm/cputime.h>
@@ -13,30 +11,30 @@
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 
-DEFINE_STATIC_KEY_FALSE(sched_clock_irqtime);
-
 /*
  * There are no locks covering percpu hardirq/softirq time.
  * They are only modified in vtime_account, on corresponding CPU
  * with interrupts disabled. So, writes are safe.
  * They are read and saved off onto struct rq in update_rq_clock().
- * This may result in other CPU reading this CPU's IRQ time and can
+ * This may result in other CPU reading this CPU's irq time and can
  * race with irq/vtime_account on this CPU. We would either get old
- * or new value with a side effect of accounting a slice of IRQ time to wrong
- * task when IRQ is in progress while we read rq->clock. That is a worthy
- * compromise in place of having locks on each IRQ in account_system_time.
+ * or new value with a side effect of accounting a slice of irq time to wrong
+ * task when irq is in progress while we read rq->clock. That is a worthy
+ * compromise in place of having locks on each irq in account_system_time.
  */
 DEFINE_PER_CPU(struct irqtime, cpu_irqtime);
+EXPORT_PER_CPU_SYMBOL_GPL(cpu_irqtime);
+
+static int sched_clock_irqtime;
 
 void enable_sched_clock_irqtime(void)
 {
-	static_branch_enable(&sched_clock_irqtime);
+	sched_clock_irqtime = 1;
 }
 
 void disable_sched_clock_irqtime(void)
 {
-	if (irqtime_enabled())
-		static_branch_disable(&sched_clock_irqtime);
+	sched_clock_irqtime = 0;
 }
 
 static void irqtime_account_delta(struct irqtime *irqtime, u64 delta,
@@ -47,8 +45,7 @@ static void irqtime_account_delta(struct irqtime *irqtime, u64 delta,
 	u64_stats_update_begin(&irqtime->sync);
 	cpustat[idx] += delta;
 	irqtime->total += delta;
-	if (!kcpustat_idle_dyntick())
-		irqtime->tick_delta += delta;
+	irqtime->tick_delta += delta;
 	u64_stats_update_end(&irqtime->sync);
 }
 
@@ -62,8 +59,9 @@ void irqtime_account_irq(struct task_struct *curr, unsigned int offset)
 	unsigned int pc;
 	s64 delta;
 	int cpu;
+	bool irq_start = true;
 
-	if (!irqtime_enabled())
+	if (!sched_clock_irqtime)
 		return;
 
 	cpu = smp_processor_id();
@@ -77,10 +75,15 @@ void irqtime_account_irq(struct task_struct *curr, unsigned int offset)
 	 * in that case, so as not to confuse scheduler with a special task
 	 * that do not consume any time, but still wants to run.
 	 */
-	if (pc & HARDIRQ_MASK)
+	if (pc & HARDIRQ_MASK) {
 		irqtime_account_delta(irqtime, delta, CPUTIME_IRQ);
-	else if ((pc & SOFTIRQ_OFFSET) && curr != this_cpu_ksoftirqd())
+		irq_start = false;
+	} else if ((pc & SOFTIRQ_OFFSET) && curr != this_cpu_ksoftirqd()) {
 		irqtime_account_delta(irqtime, delta, CPUTIME_SOFTIRQ);
+		irq_start = false;
+	}
+
+	trace_android_rvh_account_irq(curr, cpu, delta, irq_start);
 }
 
 static u64 irqtime_tick_accounted(u64 maxtime)
@@ -94,7 +97,9 @@ static u64 irqtime_tick_accounted(u64 maxtime)
 	return delta;
 }
 
-#else /* !CONFIG_IRQ_TIME_ACCOUNTING: */
+#else /* CONFIG_IRQ_TIME_ACCOUNTING */
+
+#define sched_clock_irqtime	(0)
 
 static u64 irqtime_tick_accounted(u64 dummy)
 {
@@ -137,6 +142,9 @@ void account_user_time(struct task_struct *p, u64 cputime)
 
 	/* Account for user time used */
 	acct_account_cputime(p);
+
+	/* Account power usage for user time */
+	cpufreq_acct_update_power(p, cputime);
 }
 
 /*
@@ -181,6 +189,9 @@ void account_system_index_time(struct task_struct *p,
 
 	/* Account for system time used */
 	acct_account_cputime(p);
+
+	/* Account power usage for system time */
+	cpufreq_acct_update_power(p, cputime);
 }
 
 /*
@@ -247,26 +258,13 @@ void __account_forceidle_time(struct task_struct *p, u64 delta)
 
 	task_group_account_field(p, CPUTIME_FORCEIDLE, delta);
 }
-#endif /* CONFIG_SCHED_CORE */
+#endif
 
 /*
  * When a guest is interrupted for a longer amount of time, missed clock
  * ticks are not redelivered later. Due to that, this function may on
  * occasion account more time than the calling functions think elapsed.
  */
-#ifdef CONFIG_PARAVIRT
-struct static_key paravirt_steal_enabled;
-
-#ifdef CONFIG_HAVE_PV_STEAL_CLOCK_GEN
-static u64 native_steal_clock(int cpu)
-{
-	return 0;
-}
-
-DEFINE_STATIC_CALL(pv_steal_clock, native_steal_clock);
-#endif
-#endif
-
 static __always_inline u64 steal_account_process_time(u64 maxtime)
 {
 #ifdef CONFIG_PARAVIRT
@@ -281,12 +279,12 @@ static __always_inline u64 steal_account_process_time(u64 maxtime)
 
 		return steal;
 	}
-#endif /* CONFIG_PARAVIRT */
+#endif
 	return 0;
 }
 
 /*
- * Account how much elapsed time was spent in steal, IRQ, or softirq time.
+ * Account how much elapsed time was spent in steal, irq, or softirq time.
  */
 static inline u64 account_other_time(u64 max)
 {
@@ -307,7 +305,7 @@ static inline u64 read_sum_exec_runtime(struct task_struct *t)
 {
 	return t->se.sum_exec_runtime;
 }
-#else /* !CONFIG_64BIT: */
+#else
 static u64 read_sum_exec_runtime(struct task_struct *t)
 {
 	u64 ns;
@@ -320,7 +318,7 @@ static u64 read_sum_exec_runtime(struct task_struct *t)
 
 	return ns;
 }
-#endif /* !CONFIG_64BIT */
+#endif
 
 /*
  * Accumulate raw cputime values of dead tasks (sig->[us]time) and live
@@ -329,8 +327,10 @@ static u64 read_sum_exec_runtime(struct task_struct *t)
 void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
 {
 	struct signal_struct *sig = tsk->signal;
-	struct task_struct *t;
 	u64 utime, stime;
+	struct task_struct *t;
+	unsigned int seq, nextseq;
+	unsigned long flags;
 
 	/*
 	 * Update current task runtime to account pending time since last
@@ -343,19 +343,27 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
 	if (same_thread_group(current, tsk))
 		(void) task_sched_runtime(current);
 
-	guard(rcu)();
-	scoped_seqlock_read (&sig->stats_lock, ss_lock_irqsave) {
+	rcu_read_lock();
+	/* Attempt a lockless read on the first round. */
+	nextseq = 0;
+	do {
+		seq = nextseq;
+		flags = read_seqbegin_or_lock_irqsave(&sig->stats_lock, &seq);
 		times->utime = sig->utime;
 		times->stime = sig->stime;
 		times->sum_exec_runtime = sig->sum_sched_runtime;
 
-		__for_each_thread(sig, t) {
+		for_each_thread(tsk, t) {
 			task_cputime(t, &utime, &stime);
 			times->utime += utime;
 			times->stime += stime;
 			times->sum_exec_runtime += read_sum_exec_runtime(t);
 		}
-	}
+		/* If lockless access failed, take the lock. */
+		nextseq = 1;
+	} while (need_seqretry(&sig->stats_lock, seq));
+	done_seqretry_irqrestore(&sig->stats_lock, seq, flags);
+	rcu_read_unlock();
 }
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
@@ -377,7 +385,7 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
  * Check for hardirq is done both for system and user time as there is
  * no timer going off while we are on hardirq and hence we may never get an
  * opportunity to update it solely in system time.
- * p->stime and friends are only updated on system time and not on IRQ
+ * p->stime and friends are only updated on system time and not on irq
  * softirq as those do not count in task exec_runtime any more.
  */
 static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
@@ -387,7 +395,7 @@ static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 
 	/*
 	 * When returning from idle, many ticks can get accounted at
-	 * once, including some ticks of steal, IRQ, and softirq time.
+	 * once, including some ticks of steal, irq, and softirq time.
 	 * Subtract those ticks from the amount of time accounted to
 	 * idle, or potentially user or system time. Due to rounding,
 	 * other time can exceed ticks occasionally.
@@ -414,225 +422,36 @@ static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 	} else {
 		account_system_index_time(p, cputime, CPUTIME_SYSTEM);
 	}
+	trace_android_vh_irqtime_account_process_tick(p, this_rq(), user_tick, ticks);
 }
 
-#else /* !CONFIG_IRQ_TIME_ACCOUNTING: */
+static void irqtime_account_idle_ticks(int ticks)
+{
+	irqtime_account_process_tick(current, 0, ticks);
+}
+#else /* CONFIG_IRQ_TIME_ACCOUNTING */
+static inline void irqtime_account_idle_ticks(int ticks) { }
 static inline void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 						int nr_ticks) { }
-#endif /* !CONFIG_IRQ_TIME_ACCOUNTING */
-
-#if defined(CONFIG_NO_HZ_COMMON) && !defined(CONFIG_HAVE_VIRT_CPU_ACCOUNTING_IDLE)
-static void kcpustat_idle_stop(struct kernel_cpustat *kc, u64 now)
-{
-	u64 *cpustat = kc->cpustat;
-	u64 delta, steal, steal_delta;
-	int iowait;
-
-	if (!kc->idle_elapse)
-		return;
-
-	iowait = nr_iowait_cpu(smp_processor_id()) > 0;
-	delta = now - kc->idle_entrytime;
-	steal = steal_account_process_time(delta);
-
-	/*
-	 * Record the idle time after substracting the steal time from
-	 * previous update sequence. Don't substract the steal time from
-	 * the current update sequence to avoid readers moving backward.
-	 */
-	write_seqcount_begin(&kc->idle_sleeptime_seq);
-	steal_delta = min_t(u64, kc->idle_stealtime[iowait], delta);
-	delta -= steal_delta;
-	kc->idle_stealtime[iowait] -= steal_delta;
-
-	if (iowait)
-		cpustat[CPUTIME_IOWAIT] += delta;
-	else
-		cpustat[CPUTIME_IDLE] += delta;
-
-	kc->idle_stealtime[iowait] += steal;
-	kc->idle_entrytime = now;
-	kc->idle_elapse = false;
-	write_seqcount_end(&kc->idle_sleeptime_seq);
-}
-
-static void kcpustat_idle_start(struct kernel_cpustat *kc, u64 now)
-{
-	/* Irqtime accounting might have been enabled in the middle of the IRQ */
-	if (kc->idle_elapse)
-		return;
-
-	write_seqcount_begin(&kc->idle_sleeptime_seq);
-	kc->idle_entrytime = now;
-	kc->idle_elapse = true;
-	write_seqcount_end(&kc->idle_sleeptime_seq);
-}
-
-void kcpustat_dyntick_stop(u64 now)
-{
-	struct kernel_cpustat *kc = kcpustat_this_cpu;
-
-	if (!vtime_generic_enabled_this_cpu()) {
-		WARN_ON_ONCE(!kc->idle_dyntick);
-		kcpustat_idle_stop(kc, now);
-		kc->idle_dyntick = false;
-		vtime_dyntick_stop();
-	}
-}
-
-void kcpustat_dyntick_start(u64 now)
-{
-	struct kernel_cpustat *kc = kcpustat_this_cpu;
-
-	if (!vtime_generic_enabled_this_cpu()) {
-		vtime_dyntick_start();
-		kc->idle_dyntick = true;
-		kcpustat_idle_start(kc, now);
-	}
-}
-
-void kcpustat_irq_enter(u64 now)
-{
-	struct kernel_cpustat *kc = kcpustat_this_cpu;
-
-	if (!vtime_generic_enabled_this_cpu() &&
-	    (irqtime_enabled() || vtime_accounting_enabled_this_cpu()))
-		kcpustat_idle_stop(kc, now);
-}
-
-void kcpustat_irq_exit(u64 now)
-{
-	struct kernel_cpustat *kc = kcpustat_this_cpu;
-
-	/*
-	 * Generic vtime already does its own idle accounting.
-	 * But irqtime accounting or arch vtime which also accounts IRQs
-	 * need to pause nohz accounting. Resume nohz accounting as long
-	 * as the irqtime config is enabled to handle case where irqtime
-	 * accounting got runtime disabled in the middle of an IRQ.
-	 */
-	if (!vtime_generic_enabled_this_cpu() &&
-	    (IS_ENABLED(CONFIG_IRQ_TIME_ACCOUNTING) || vtime_accounting_enabled_this_cpu()))
-		kcpustat_idle_start(kc, now);
-}
-
-static u64 kcpustat_field_dyntick(int cpu, enum cpu_usage_stat idx,
-				  bool compute_delta, u64 now)
-{
-	struct kernel_cpustat *kc = &kcpustat_cpu(cpu);
-	int iowait = idx == CPUTIME_IOWAIT;
-	u64 *cpustat = kc->cpustat;
-	unsigned int seq;
-	u64 idle;
-
-	do {
-		seq = read_seqcount_begin(&kc->idle_sleeptime_seq);
-
-		idle = cpustat[idx];
-
-		if (kc->idle_elapse && compute_delta && now > kc->idle_entrytime) {
-			u64 delta = now - kc->idle_entrytime;
-
-			delta -= min_t(u64, kc->idle_stealtime[iowait], delta);
-			idle += delta;
-		}
-	} while (read_seqcount_retry(&kc->idle_sleeptime_seq, seq));
-
-	return idle;
-}
-
-u64 kcpustat_field_idle(int cpu)
-{
-	return kcpustat_field_dyntick(cpu, CPUTIME_IDLE,
-				      !nr_iowait_cpu(cpu), ktime_get());
-}
-EXPORT_SYMBOL_GPL(kcpustat_field_idle);
-
-u64 kcpustat_field_iowait(int cpu)
-{
-	return kcpustat_field_dyntick(cpu, CPUTIME_IOWAIT,
-				      nr_iowait_cpu(cpu), ktime_get());
-}
-EXPORT_SYMBOL_GPL(kcpustat_field_iowait);
-#else
-static u64 kcpustat_field_dyntick(int cpu, enum cpu_usage_stat idx,
-				  bool compute_delta, ktime_t now)
-{
-	return kcpustat_cpu(cpu).cpustat[idx];
-}
-#endif /* CONFIG_NO_HZ_COMMON && !CONFIG_HAVE_VIRT_CPU_ACCOUNTING_IDLE */
-
-static u64 get_cpu_sleep_time_us(int cpu, enum cpu_usage_stat idx,
-				 bool compute_delta, u64 *last_update_time)
-{
-	ktime_t now = ktime_get();
-	u64 res;
-
-	if (vtime_generic_enabled_cpu(cpu))
-		res = kcpustat_field(idx, cpu);
-	else
-		res = kcpustat_field_dyntick(cpu, idx, compute_delta, now);
-
-	do_div(res, NSEC_PER_USEC);
-
-	if (last_update_time)
-		*last_update_time = ktime_to_us(now);
-
-	return res;
-}
-
-/**
- * get_cpu_idle_time_us - get the total idle time of a CPU
- * @cpu: CPU number to query
- * @last_update_time: variable to store update time in. Do not update
- * counters if NULL.
- *
- * Return the cumulative idle time (since boot) for a given
- * CPU, in microseconds. Note that this is partially broken due to
- * the counter of iowait tasks that can be remotely updated without
- * any synchronization. Therefore it is possible to observe backward
- * values within two consecutive reads.
- *
- * This time is measured via accounting rather than sampling,
- * and is as accurate as ktime_get() is.
- *
- * Return: total idle time of the @cpu
- */
-u64 get_cpu_idle_time_us(int cpu, u64 *last_update_time)
-{
-	return get_cpu_sleep_time_us(cpu, CPUTIME_IDLE,
-				     !nr_iowait_cpu(cpu), last_update_time);
-}
-EXPORT_SYMBOL_GPL(get_cpu_idle_time_us);
-
-/**
- * get_cpu_iowait_time_us - get the total iowait time of a CPU
- * @cpu: CPU number to query
- * @last_update_time: variable to store update time in. Do not update
- * counters if NULL.
- *
- * Return the cumulative iowait time (since boot) for a given
- * CPU, in microseconds. Note this is partially broken due to
- * the counter of iowait tasks that can be remotely updated without
- * any synchronization. Therefore it is possible to observe backward
- * values within two consecutive reads.
- *
- * This time is measured via accounting rather than sampling,
- * and is as accurate as ktime_get() is.
- *
- * Return: total iowait time of @cpu
- */
-u64 get_cpu_iowait_time_us(int cpu, u64 *last_update_time)
-{
-	return get_cpu_sleep_time_us(cpu, CPUTIME_IOWAIT,
-				     nr_iowait_cpu(cpu), last_update_time);
-}
-EXPORT_SYMBOL_GPL(get_cpu_iowait_time_us);
+#endif /* CONFIG_IRQ_TIME_ACCOUNTING */
 
 /*
  * Use precise platform statistics if available:
  */
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+
+# ifndef __ARCH_HAS_VTIME_TASK_SWITCH
+void vtime_task_switch(struct task_struct *prev)
+{
+	if (is_idle_task(prev))
+		vtime_account_idle(prev);
+	else
+		vtime_account_kernel(prev);
+
+	vtime_flush(prev);
+	arch_vtime_task_switch(prev);
+}
+# endif
 
 void vtime_account_irq(struct task_struct *tsk, unsigned int offset)
 {
@@ -642,15 +461,11 @@ void vtime_account_irq(struct task_struct *tsk, unsigned int offset)
 		vtime_account_hardirq(tsk);
 	} else if (pc & SOFTIRQ_OFFSET) {
 		vtime_account_softirq(tsk);
-	} else if (!kcpustat_idle_dyntick()) {
-		if (!IS_ENABLED(CONFIG_HAVE_VIRT_CPU_ACCOUNTING_IDLE) &&
-		    is_idle_task(tsk)) {
-			vtime_account_idle(tsk);
-		} else {
-			vtime_account_kernel(tsk);
-		}
+	} else if (!IS_ENABLED(CONFIG_HAVE_VIRT_CPU_ACCOUNTING_IDLE) &&
+		   is_idle_task(tsk)) {
+		vtime_account_idle(tsk);
 	} else {
-		vtime_reset();
+		vtime_account_kernel(tsk);
 	}
 }
 
@@ -677,30 +492,33 @@ void thread_group_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
 	*ut = cputime.utime;
 	*st = cputime.stime;
 }
+EXPORT_SYMBOL_GPL(thread_group_cputime_adjusted);
 
 #else /* !CONFIG_VIRT_CPU_ACCOUNTING_NATIVE: */
 
 /*
- * Account a single tick of CPU time.
+ * Account a single tick or a few ticks of CPU time.
  * @p: the process that the CPU time gets accounted to
  * @user_tick: indicates if the tick is a user or a system tick
  */
 void account_process_tick(struct task_struct *p, int user_tick)
 {
 	u64 cputime, steal;
+	int ticks = 1;
+
+	trace_android_vh_account_process_tick_gran(p, this_rq(), user_tick, &ticks);
+	if (!ticks)
+		return;
 
 	if (vtime_accounting_enabled_this_cpu())
 		return;
 
-	if (kcpustat_idle_dyntick())
-		return;
-
-	if (irqtime_enabled()) {
-		irqtime_account_process_tick(p, user_tick, 1);
+	if (sched_clock_irqtime) {
+		irqtime_account_process_tick(p, user_tick, ticks);
 		return;
 	}
 
-	cputime = TICK_NSEC;
+	cputime = TICK_NSEC * ticks;
 	steal = steal_account_process_time(ULONG_MAX);
 
 	if (steal >= cputime)
@@ -714,6 +532,29 @@ void account_process_tick(struct task_struct *p, int user_tick)
 		account_system_time(p, HARDIRQ_OFFSET, cputime);
 	else
 		account_idle_time(cputime);
+}
+
+/*
+ * Account multiple ticks of idle time.
+ * @ticks: number of stolen ticks
+ */
+void account_idle_ticks(unsigned long ticks)
+{
+	u64 cputime, steal;
+
+	if (sched_clock_irqtime) {
+		irqtime_account_idle_ticks(ticks);
+		return;
+	}
+
+	cputime = ticks * TICK_NSEC;
+	steal = steal_account_process_time(ULONG_MAX);
+
+	if (steal >= cputime)
+		return;
+
+	cputime -= steal;
+	account_idle_time(cputime);
 }
 
 /*
@@ -827,6 +668,8 @@ void thread_group_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
 	thread_group_cputime(p, &cputime);
 	cputime_adjust(&cputime, &p->signal->prev_cputime, ut, st);
 }
+EXPORT_SYMBOL_GPL(thread_group_cputime_adjusted);
+
 #endif /* !CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
 
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
@@ -956,9 +799,9 @@ void vtime_guest_exit(struct task_struct *tsk)
 }
 EXPORT_SYMBOL_GPL(vtime_guest_exit);
 
-static void __vtime_account_idle(struct vtime *vtime)
+void vtime_account_idle(struct task_struct *tsk)
 {
-	account_idle_time(get_vtime_delta(vtime));
+	account_idle_time(get_vtime_delta(&tsk->vtime));
 }
 
 void vtime_task_switch_generic(struct task_struct *prev)
@@ -967,7 +810,7 @@ void vtime_task_switch_generic(struct task_struct *prev)
 
 	write_seqcount_begin(&vtime->seqcount);
 	if (vtime->state == VTIME_IDLE)
-		__vtime_account_idle(vtime);
+		vtime_account_idle(prev);
 	else
 		__vtime_account_kernel(prev, vtime);
 	vtime->state = VTIME_INACTIVE;
@@ -1109,7 +952,6 @@ static int kcpustat_field_vtime(u64 *cpustat,
 				int cpu, u64 *val)
 {
 	struct vtime *vtime = &tsk->vtime;
-	struct rq *rq = cpu_rq(cpu);
 	unsigned int seq;
 
 	do {
@@ -1151,14 +993,6 @@ static int kcpustat_field_vtime(u64 *cpustat,
 			if (state == VTIME_GUEST && task_nice(tsk) > 0)
 				*val += vtime->gtime + vtime_delta(vtime);
 			break;
-		case CPUTIME_IDLE:
-			if (state == VTIME_IDLE && !atomic_read(&rq->nr_iowait))
-				*val += vtime_delta(vtime);
-			break;
-		case CPUTIME_IOWAIT:
-			if (state == VTIME_IDLE && atomic_read(&rq->nr_iowait) > 0)
-				*val += vtime_delta(vtime);
-			break;
 		default:
 			break;
 		}
@@ -1167,15 +1001,16 @@ static int kcpustat_field_vtime(u64 *cpustat,
 	return 0;
 }
 
-u64 kcpustat_field(enum cpu_usage_stat usage, int cpu)
+u64 kcpustat_field(struct kernel_cpustat *kcpustat,
+		   enum cpu_usage_stat usage, int cpu)
 {
-	u64 *cpustat = kcpustat_cpu(cpu).cpustat;
+	u64 *cpustat = kcpustat->cpustat;
 	u64 val = cpustat[usage];
 	struct rq *rq;
 	int err;
 
-	if (!vtime_generic_enabled_cpu(cpu))
-		return kcpustat_field_default(usage, cpu);
+	if (!vtime_accounting_enabled_cpu(cpu))
+		return val;
 
 	rq = cpu_rq(cpu);
 
@@ -1221,8 +1056,8 @@ static int kcpustat_cpu_fetch_vtime(struct kernel_cpustat *dst,
 		*dst = *src;
 		cpustat = dst->cpustat;
 
-		/* Task is sleeping or dead, nothing to add */
-		if (state < VTIME_IDLE)
+		/* Task is sleeping, dead or idle, nothing to add */
+		if (state < VTIME_SYS)
 			continue;
 
 		delta = vtime_delta(vtime);
@@ -1231,17 +1066,15 @@ static int kcpustat_cpu_fetch_vtime(struct kernel_cpustat *dst,
 		 * Task runs either in user (including guest) or kernel space,
 		 * add pending nohz time to the right place.
 		 */
-		switch (state) {
-		case VTIME_SYS:
+		if (state == VTIME_SYS) {
 			cpustat[CPUTIME_SYSTEM] += vtime->stime + delta;
-			break;
-		case VTIME_USER:
+		} else if (state == VTIME_USER) {
 			if (task_nice(tsk) > 0)
 				cpustat[CPUTIME_NICE] += vtime->utime + delta;
 			else
 				cpustat[CPUTIME_USER] += vtime->utime + delta;
-			break;
-		case VTIME_GUEST:
+		} else {
+			WARN_ON_ONCE(state != VTIME_GUEST);
 			if (task_nice(tsk) > 0) {
 				cpustat[CPUTIME_GUEST_NICE] += vtime->gtime + delta;
 				cpustat[CPUTIME_NICE] += vtime->gtime + delta;
@@ -1249,15 +1082,6 @@ static int kcpustat_cpu_fetch_vtime(struct kernel_cpustat *dst,
 				cpustat[CPUTIME_GUEST] += vtime->gtime + delta;
 				cpustat[CPUTIME_USER] += vtime->gtime + delta;
 			}
-			break;
-		case VTIME_IDLE:
-			if (atomic_read(&cpu_rq(cpu)->nr_iowait) > 0)
-				cpustat[CPUTIME_IOWAIT] += delta;
-			else
-				cpustat[CPUTIME_IDLE] += delta;
-			break;
-		default:
-			WARN_ON_ONCE(1);
 		}
 	} while (read_seqcount_retry(&vtime->seqcount, seq));
 
@@ -1270,8 +1094,8 @@ void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
 	struct rq *rq;
 	int err;
 
-	if (!vtime_generic_enabled_cpu(cpu)) {
-		kcpustat_cpu_fetch_default(dst, cpu);
+	if (!vtime_accounting_enabled_cpu(cpu)) {
+		*dst = *src;
 		return;
 	}
 
@@ -1284,7 +1108,7 @@ void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
 		curr = rcu_dereference(rq->curr);
 		if (WARN_ON_ONCE(!curr)) {
 			rcu_read_unlock();
-			kcpustat_cpu_fetch_default(dst, cpu);
+			*dst = *src;
 			return;
 		}
 
