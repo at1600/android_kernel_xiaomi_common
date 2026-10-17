@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
@@ -20,9 +20,8 @@ enum pause_type {
 
 /* if a cpu is halting */
 struct cpumask __cpu_halt_mask;
-EXPORT_SYMBOL_GPL(__cpu_halt_mask);
 struct cpumask __cpu_partial_halt_mask;
-EXPORT_SYMBOL_GPL(__cpu_partial_halt_mask);
+
 
 /* spin lock to allow calling from non-preemptible context */
 static DEFINE_RAW_SPINLOCK(halt_lock);
@@ -121,10 +120,7 @@ static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf)
 		if (rq->nr_running == 1)
 			break;
 
-		next = pick_task(rq);
-
-		if (walt_is_idle_task(next))
-			break;
+		next = pick_migrate_task(rq);
 
 		/*
 		 * Argh ... no iterator for tasks, we need to remove the
@@ -298,7 +294,7 @@ void restrict_cpus_and_freq(struct cpumask *cpus)
 
 struct task_struct *walt_drain_thread;
 
-static int halt_cpus(struct cpumask *cpus, enum pause_type type, enum pause_client client)
+static int halt_cpus(struct cpumask *cpus, enum pause_type type)
 {
 	int cpu;
 	int ret = 0;
@@ -341,13 +337,13 @@ static int halt_cpus(struct cpumask *cpus, enum pause_type type, enum pause_clie
 		wake_up_process(walt_drain_thread);
 	}
 out:
-	trace_halt_cpus(cpus, start_time, 1, ret, client);
+	trace_halt_cpus(cpus, start_time, 1, ret);
 
 	return ret;
 }
 
 /* start the cpus again, and kick them to balance */
-static int start_cpus(struct cpumask *cpus, enum pause_type type, enum pause_client client)
+static int start_cpus(struct cpumask *cpus, enum pause_type type)
 {
 	u64 start_time = sched_clock();
 	struct halt_cpu_state *halt_cpu_state;
@@ -374,7 +370,7 @@ static int start_cpus(struct cpumask *cpus, enum pause_type type, enum pause_cli
 
 	restrict_cpus_and_freq(cpus);
 
-	trace_halt_cpus(cpus, start_time, 0, 0, client);
+	trace_halt_cpus(cpus, start_time, 0, 0);
 
 	return 0;
 }
@@ -427,7 +423,7 @@ static int walt_halt_cpus(struct cpumask *cpus, enum pause_client client, enum p
 		goto unlock;
 	}
 
-	ret = halt_cpus(cpus, type, client);
+	ret = halt_cpus(cpus, type);
 
 	if (ret < 0)
 		pr_debug("halt_cpus failure ret=%d cpus=%*pbl\n", ret,
@@ -470,7 +466,7 @@ static int walt_start_cpus(struct cpumask *cpus, enum pause_client client, enum 
 	/* remove cpus that should still be halted */
 	update_halt_cpus(cpus, type);
 
-	ret = start_cpus(cpus, type, client);
+	ret = start_cpus(cpus, type);
 
 	if (ret < 0) {
 		pr_debug("halt_cpus failure ret=%d cpus=%*pbl\n", ret,
@@ -706,6 +702,7 @@ void walt_halt_init(void)
 	}
 
 	sched_setscheduler_nocheck(walt_drain_thread, SCHED_FIFO, &param);
+
 
 	register_trace_android_rvh_get_nohz_timer_target(android_rvh_get_nohz_timer_target, NULL);
 	register_trace_android_rvh_set_cpus_allowed_by_task(

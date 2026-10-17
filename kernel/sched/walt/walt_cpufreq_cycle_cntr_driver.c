@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
-#include <linux/platform_device.h>
 #include <linux/topology.h>
 
 #include "walt.h"
@@ -135,8 +134,9 @@ static int walt_cpufreq_cycle_cntr_driver_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static void walt_cpufreq_cycle_cntr_driver_remove(struct platform_device *pdev)
+static int walt_cpufreq_cycle_cntr_driver_remove(struct platform_device *pdev)
 {
+	return 0;
 }
 
 static const struct walt_cpufreq_soc_data hw_soc_data = {
