@@ -15,7 +15,7 @@
  *  Author: Srivatsa Vaddagiri <vatsa@linux.vnet.ibm.com>
  *
  *  Scaled math optimizations by Thomas Gleixner
- *  Copyright (C) 2007, Thomas Gleixner <tglx@linutronix.de>
+ *  Copyright (C) 2007, Linutronix GmbH, Thomas Gleixner <tglx@kernel.org>
  *
  *  Adaptive scheduling granularity, math enhancements by Peter Zijlstra
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
@@ -23,6 +23,7 @@
  *  Move PELT related code from fair.c into this pelt.c file
  *  Author: Vincent Guittot <vincent.guittot@linaro.org>
  */
+#include "pelt.h"
 
 /*
  * Approximate:
@@ -176,11 +177,10 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  *   load_avg = u_0` + y*(u_0 + u_1*y + u_2*y^2 + ... )
  *            = u_0 + u_1*y + u_2*y^2 + ... [re-labeling u_i --> u_{i+1}]
  */
-__always_inline int
+static __always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
 {
-	int force_update = 0;
 	u64 delta;
 
 	delta = now - sa->last_update_time;
@@ -206,7 +206,7 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	/*
 	 * running is a subset of runnable (weight) so running can't be set if
 	 * runnable is clear. But there are some corner cases where the current
-	 * se has been already dequeued but cfs_rq->curr still points to it.
+	 * se has been already dequeued but cfs_rq->h_curr still points to it.
 	 * This means that weight will be 0 but not running for a sched_entity
 	 * but also for a cfs_rq if the latter becomes idle. As an example,
 	 * this happens during sched_balance_newidle() which calls
@@ -217,8 +217,6 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	if (!load)
 		runnable = running = 0;
 
-	trace_android_rvh_update_load_sum(&force_update);
-
 	/*
 	 * Now we know we crossed measurement unit boundaries. The *_avg
 	 * accrues by two steps:
@@ -227,11 +225,10 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * crossed period boundaries, finish.
 	 */
 	if (!accumulate_sum(delta, sa, load, runnable, running))
-		return force_update;
+		return 0;
 
 	return 1;
 }
-EXPORT_SYMBOL_GPL(___update_load_sum);
 
 /*
  * When syncing *_avg with *_sum, we must take into account the current
@@ -279,7 +276,7 @@ ___update_load_avg(struct sched_avg *sa, unsigned long load)
  *
  *   group: [ see update_cfs_group() ]
  *     se_weight()   = tg->weight * grq->load_avg / tg->load_avg
- *     se_runnable() = grq->h_nr_queued
+ *     se_runnable() = grq->h_nr_runnable
  *
  *   runnable_sum = se_runnable() * runnable = grq->runnable_sum
  *   runnable_avg = runnable_sum
@@ -298,12 +295,6 @@ ___update_load_avg(struct sched_avg *sa, unsigned long load)
 
 int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
 {
-	int ret = -1;
-
-	trace_android_rvh_update_load_avg_blocked_se(now, se, &ret);
-	if (ret != -1)
-		return ret;
-
 	if (___update_load_sum(now, &se->avg, 0, 0, 0)) {
 		___update_load_avg(&se->avg, se_weight(se));
 		trace_pelt_se_tp(se);
@@ -312,18 +303,11 @@ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(__update_load_avg_blocked_se);
 
 int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	int ret = -1;
-
-	trace_android_rvh_update_load_avg_se(now, cfs_rq, se, &ret);
-	if (ret != -1)
-		return ret;
-
 	if (___update_load_sum(now, &se->avg, !!se->on_rq, se_runnable(se),
-				cfs_rq->curr == se)) {
+				cfs_rq->h_curr == se)) {
 
 		___update_load_avg(&se->avg, se_weight(se));
 		cfs_se_util_change(&se->avg);
@@ -336,16 +320,10 @@ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se
 
 int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq)
 {
-	int ret = -1;
-
-	trace_android_rvh_update_load_avg_cfs_rq(now, cfs_rq, &ret);
-	if (ret != -1)
-		return ret;
-
 	if (___update_load_sum(now, &cfs_rq->avg,
 				scale_load_down(cfs_rq->load.weight),
-				cfs_rq->h_nr_queued - cfs_rq->h_nr_delayed,
-				cfs_rq->curr != NULL)) {
+				cfs_rq->h_nr_runnable,
+				cfs_rq->h_curr != NULL)) {
 
 		___update_load_avg(&cfs_rq->avg, 1);
 		trace_pelt_cfs_tp(cfs_rq);
@@ -368,12 +346,6 @@ int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq)
 
 int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
 {
-	int ret = -1;
-
-	trace_android_rvh_update_rt_rq_load_avg_internal(now, rq, running, &ret);
-	if (ret != -1)
-		return ret;
-
 	if (___update_load_sum(now, &rq->avg_rt,
 				running,
 				running,
@@ -442,7 +414,7 @@ int update_hw_load_avg(u64 now, struct rq *rq, u64 capacity)
 
 	return 0;
 }
-#endif
+#endif /* CONFIG_SCHED_HW_PRESSURE */
 
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 /*
@@ -495,7 +467,7 @@ int update_irq_load_avg(struct rq *rq, u64 running)
 
 	return ret;
 }
-#endif
+#endif /* CONFIG_HAVE_SCHED_AVG_IRQ */
 
 /*
  * Load avg and utiliztion metrics need to be updated periodically and before
@@ -516,67 +488,3 @@ bool update_other_load_avgs(struct rq *rq)
 		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
 		update_irq_load_avg(rq, 0);
 }
-
-__read_mostly unsigned int sched_pelt_lshift;
-
-#ifdef CONFIG_SYSCTL
-#include <trace/hooks/sched.h>
-static unsigned int sysctl_sched_pelt_multiplier = 1;
-
-int sched_pelt_multiplier(const struct ctl_table *table, int write, void *buffer,
-			  size_t *lenp, loff_t *ppos)
-{
-	static DEFINE_MUTEX(mutex);
-	unsigned int old;
-	int ret;
-
-	mutex_lock(&mutex);
-	old = sysctl_sched_pelt_multiplier;
-	ret = proc_dointvec(table, write, buffer, lenp, ppos);
-	if (ret)
-		goto undo;
-	if (!write)
-		goto done;
-
-	trace_android_vh_sched_pelt_multiplier(old, sysctl_sched_pelt_multiplier, &ret);
-	if (ret)
-		goto undo;
-
-	switch (sysctl_sched_pelt_multiplier)  {
-	case 1:
-		fallthrough;
-	case 2:
-		fallthrough;
-	case 4:
-		WRITE_ONCE(sched_pelt_lshift,
-			   sysctl_sched_pelt_multiplier >> 1);
-		goto done;
-	default:
-		ret = -EINVAL;
-	}
-
-undo:
-	sysctl_sched_pelt_multiplier = old;
-done:
-	mutex_unlock(&mutex);
-
-	return ret;
-}
-
-static struct ctl_table sched_pelt_sysctls[] = {
-	{
-		.procname       = "sched_pelt_multiplier",
-		.data           = &sysctl_sched_pelt_multiplier,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_pelt_multiplier,
-	},
-};
-
-static int __init sched_pelt_sysctl_init(void)
-{
-	register_sysctl_init("kernel", sched_pelt_sysctls);
-	return 0;
-}
-late_initcall(sched_pelt_sysctl_init);
-#endif

@@ -22,6 +22,7 @@
  *  worst case complexity of O(min(101, nr_domcpus)), though the scenario that
  *  yields the worst case search is fairly contrived.
  */
+#include "sched.h"
 
 /*
  * p->rt_priority   p->prio   newpri   cpupri
@@ -96,17 +97,12 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 	if (skip)
 		return 0;
 
-	if ((p && cpumask_any_and(&p->cpus_mask, vec->mask) >= nr_cpu_ids) ||
-	    (!p && cpumask_any(vec->mask) >= nr_cpu_ids))
+	if (cpumask_any_and(&p->cpus_mask, vec->mask) >= nr_cpu_ids)
 		return 0;
 
 	if (lowest_mask) {
-		if (p) {
-			cpumask_and(lowest_mask, &p->cpus_mask, vec->mask);
-			cpumask_and(lowest_mask, lowest_mask, cpu_active_mask);
-		} else {
-			cpumask_copy(lowest_mask, vec->mask);
-		}
+		cpumask_and(lowest_mask, &p->cpus_mask, vec->mask);
+		cpumask_and(lowest_mask, lowest_mask, cpu_active_mask);
 
 		/*
 		 * We have to ensure that we have at least one bit
@@ -123,11 +119,10 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 	return 1;
 }
 
-int cpupri_find(struct cpupri *cp, struct task_struct *sched_ctx,
-		struct task_struct *exec_ctx,
+int cpupri_find(struct cpupri *cp, struct task_struct *p,
 		struct cpumask *lowest_mask)
 {
-	return cpupri_find_fitness(cp, sched_ctx, exec_ctx, lowest_mask, NULL);
+	return cpupri_find_fitness(cp, p, lowest_mask, NULL);
 }
 
 /**
@@ -147,19 +142,18 @@ int cpupri_find(struct cpupri *cp, struct task_struct *sched_ctx,
  *
  * Return: (int)bool - CPUs were found
  */
-int cpupri_find_fitness(struct cpupri *cp, struct task_struct *sched_ctx,
-			struct task_struct *exec_ctx,
-			struct cpumask *lowest_mask,
-			bool (*fitness_fn)(struct task_struct *p, int cpu))
+int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
+		struct cpumask *lowest_mask,
+		bool (*fitness_fn)(struct task_struct *p, int cpu))
 {
-	int task_pri = convert_prio(sched_ctx->prio);
+	int task_pri = convert_prio(p->prio);
 	int idx, cpu;
 
 	WARN_ON_ONCE(task_pri >= CPUPRI_NR_PRIORITIES);
 
 	for (idx = 0; idx < task_pri; idx++) {
 
-		if (!__cpupri_find(cp, exec_ctx, lowest_mask, idx))
+		if (!__cpupri_find(cp, p, lowest_mask, idx))
 			continue;
 
 		if (!lowest_mask || !fitness_fn)
@@ -167,7 +161,7 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *sched_ctx,
 
 		/* Ensure the capacity of the CPUs fit the task */
 		for_each_cpu(cpu, lowest_mask) {
-			if (!fitness_fn(sched_ctx, cpu))
+			if (!fitness_fn(p, cpu))
 				cpumask_clear_cpu(cpu, lowest_mask);
 		}
 
@@ -199,11 +193,10 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *sched_ctx,
 	 * really care.
 	 */
 	if (fitness_fn)
-		return cpupri_find(cp, sched_ctx, exec_ctx, lowest_mask);
+		return cpupri_find(cp, p, lowest_mask);
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(cpupri_find_fitness);
 
 /**
  * cpupri_set - update the CPU priority setting
@@ -295,7 +288,7 @@ int cpupri_init(struct cpupri *cp)
 			goto cleanup;
 	}
 
-	cp->cpu_to_pri = kcalloc(nr_cpu_ids, sizeof(int), GFP_KERNEL);
+	cp->cpu_to_pri = kzalloc_objs(int, nr_cpu_ids);
 	if (!cp->cpu_to_pri)
 		goto cleanup;
 
