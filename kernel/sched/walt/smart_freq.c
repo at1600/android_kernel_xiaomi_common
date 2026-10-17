@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/tick.h>
@@ -10,23 +10,27 @@
 bool smart_freq_init_done;
 char reason_dump[1024];
 static DEFINE_MUTEX(freq_reason_mutex);
-//MIUI ADD: Task_Attribute_Sched
-int sched_smart_freq_level_update_by_cluser(struct walt_sched_cluster *cluster ,unsigned int sysctl_ipc_freq_levels_cluster[SMART_FMAX_IPC_MAX])
-{
-	int ret = 0;
-	mutex_lock(&freq_reason_mutex);
-	default_freq_config[cluster->id].smart_freq_ipc_participation_mask = 0;
-	default_freq_config[cluster->id].legacy_reason_config[NO_REASON_SMART_FREQ].freq_allowed = sysctl_ipc_freq_levels_cluster[0];
-	for (int i = 0; i < SMART_FMAX_IPC_MAX; i++) {
-		default_freq_config[cluster->id].ipc_reason_config[i].freq_allowed = sysctl_ipc_freq_levels_cluster[i];
-		}
-	default_freq_config[cluster->id].smart_freq_ipc_participation_mask = IPC_PARTICIPATION;
-	mutex_unlock(&freq_reason_mutex);
-	return ret;
-}
-//END Task_Attribute_Sched
 
-int sched_smart_freq_legacy_dump_handler(struct ctl_table *table, int write,
+inline bool cluster_in_smart_lrpb(struct walt_sched_cluster *cluster)
+{
+	int cpu;
+	struct walt_rq *wrq;
+
+	if (!(default_freq_config[cluster->id].smart_freq_participation_mask &
+								BIT(LRPB_SMART_FREQ)))
+		return false;
+
+	for_each_cpu(cpu, &cluster->cpus) {
+		wrq = &per_cpu(walt_rq, cpu);
+		if (wrq->lrb_pipeline_start_time)
+			return true;
+	}
+
+	return false;
+}
+
+
+int sched_smart_freq_legacy_dump_handler(const struct ctl_table *table, int write,
 					 void __user *buffer, size_t *lenp,
 					 loff_t *ppos)
 {
@@ -52,7 +56,7 @@ int sched_smart_freq_legacy_dump_handler(struct ctl_table *table, int write,
 	return ret;
 }
 
-int sched_smart_freq_ipc_dump_handler(struct ctl_table *table, int write,
+int sched_smart_freq_ipc_dump_handler(const struct ctl_table *table, int write,
 					 void __user *buffer, size_t *lenp,
 					 loff_t *ppos)
 {
@@ -80,16 +84,17 @@ int sched_smart_freq_ipc_dump_handler(struct ctl_table *table, int write,
 	return ret;
 }
 
-int sched_smart_freq_legacy_freq_handler(struct ctl_table *table, int write,
+int sched_smart_freq_legacy_freq_handler(const struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp,
 		loff_t *ppos)
 {
-	int ret;
+	int ret = 0;
 	int i;
 	int id = -1;
 	unsigned int size = 0;
 	unsigned int *data = (unsigned int *)table->data;
 	int val[LEGACY_SMART_FREQ*2] = {[0 ... (LEGACY_SMART_FREQ*2)-1] = -1};
+	unsigned long no_reason_freq = 0;
 	struct ctl_table tmp = {
 		.data	= &val,
 		.maxlen	= sizeof(unsigned int) * (LEGACY_SMART_FREQ*2),
@@ -106,6 +111,35 @@ int sched_smart_freq_legacy_freq_handler(struct ctl_table *table, int write,
 				write, buffer, lenp, ppos);
 	}
 
+	/*
+	 * if a malformed (odd number of entries) or beyond LEGACY_MART_FREQ reason
+	 * is specified reject all
+	 */
+	ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+	if (ret)
+		goto out;
+
+
+	for (i = 0; i < LEGACY_SMART_FREQ*2; i++) {
+		if (val[i] == -1)
+			break;
+
+		if (i%2 == 0 && (val[i] < 0 || val[i] >= LEGACY_SMART_FREQ)) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (i%2 == 0 && val[i] == NO_REASON_SMART_FREQ && val[i+1] != -1)
+			no_reason_freq = val[i + 1];
+
+		size++;
+	}
+
+	if (size%2 != 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	mutex_lock(&freq_reason_mutex);
 
 	if (data == &sysctl_legacy_freq_levels_cluster0[0])
@@ -117,24 +151,23 @@ int sched_smart_freq_legacy_freq_handler(struct ctl_table *table, int write,
 	else if (data == &sysctl_legacy_freq_levels_cluster3[0])
 		id = 3;
 
-	ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
-	if (ret)
-		goto exit;
+	/*
+	 * IPC/freq should be in increasing order, and since NO_REASON_SMART_FREQ and IPC_A  need
+	 * to be same ensure the no_reason_freq if set here is lesser than IPC_B and when so
+	 * update both IPC_A as well as NO_REASON_SMART_FREQ
+	 */
+	if (no_reason_freq != 0
+		&& default_freq_config[id].smart_freq_ipc_participation_mask) {
+		if (no_reason_freq >
+			default_freq_config[id].ipc_reason_config[IPC_B].freq_allowed) {
+			ret = -EINVAL;
+			goto unlock;
+		}
 
-	ret = -EINVAL;
-
-	for (i = 0; i < LEGACY_SMART_FREQ*2; i++) {
-		if (val[i] == -1)
-			break;
-
-		if (i%2 == 0 && (val[i] < 0 || val[i] >= LEGACY_SMART_FREQ))
-			goto exit;
-
-		size++;
+		default_freq_config[id].legacy_reason_config[NO_REASON_SMART_FREQ].freq_allowed =
+			no_reason_freq;
+		default_freq_config[id].ipc_reason_config[IPC_A].freq_allowed = no_reason_freq;
 	}
-
-	if (size%2 != 0)
-		goto exit;
 
 	for (i = 0; i < size; i += 2) {
 		default_freq_config[id].legacy_reason_config[val[i]].freq_allowed =
@@ -143,28 +176,85 @@ int sched_smart_freq_legacy_freq_handler(struct ctl_table *table, int write,
 			BIT(val[i]);
 	}
 
-	ret = 0;
-	goto out;
-
-exit:
-	default_freq_config[id].smart_freq_participation_mask = BIT(NO_REASON_SMART_FREQ);
-
-	for (i = 0; i < LEGACY_SMART_FREQ; i++) {
-		default_freq_config[id].legacy_reason_config[i].freq_allowed =
-			FREQ_QOS_MAX_DEFAULT_VALUE;
-	}
-
+unlock:
+	mutex_unlock(&freq_reason_mutex);
 out:
-	if (default_freq_config[id].smart_freq_ipc_participation_mask) {
-		default_freq_config[id].legacy_reason_config[NO_REASON_SMART_FREQ].freq_allowed =
-			default_freq_config[id].ipc_reason_config[IPC_A].freq_allowed;
+	return ret;
+}
+
+int sched_smart_freq_ipc_levels_handler(const struct ctl_table *table, int write,
+				      void __user *buffer, size_t *lenp,
+				      loff_t *ppos)
+{
+	int i;
+	int ret;
+	int cluster_id = -1;
+	int count = 0;
+	unsigned int val[SMART_FMAX_IPC_MAX] = {[0 ... SMART_FMAX_IPC_MAX-1] = UINT_MAX};
+	unsigned int *data = (unsigned int *)table->data;
+	struct ctl_table tmp = {
+		.data	= &val,
+		.maxlen	= sizeof(unsigned int) * SMART_FMAX_IPC_MAX,
+		.mode	= table->mode,
+	};
+
+	if (!smart_freq_init_done)
+		return -EINVAL;
+
+	mutex_lock(&freq_reason_mutex);
+
+	if (!write) {
+		tmp.data = table->data;
+		ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+		goto unlock;
 	}
 
+	ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+	if (ret)
+		goto unlock;
+
+	ret = -EINVAL;
+
+	if (data == &sysctl_ipc_levels_cluster0[0])
+		cluster_id = 0;
+	if (data == &sysctl_ipc_levels_cluster1[0])
+		cluster_id = 1;
+	if (data == &sysctl_ipc_levels_cluster2[0])
+		cluster_id = 2;
+	if (data == &sysctl_ipc_levels_cluster3[0])
+		cluster_id = 3;
+
+	/*
+	 * Make sure all ipc levels are in increasing order
+	 */
+	count = 1;
+	for (i = 1; i < SMART_FMAX_IPC_MAX; i++) {
+		if (val[i] == UINT_MAX)
+			break;
+		if (val[i] < val[i-1])
+			goto unlock;
+		count++;
+	}
+	if (count != SMART_FMAX_IPC_MAX) {
+		if (default_freq_config[cluster_id].ipc_reason_config[count].ipc < val[count-1])
+			goto unlock;
+	}
+
+	for (i = 0; i < SMART_FMAX_IPC_MAX; i++) {
+		if (val[i] == UINT_MAX)
+			break;
+		default_freq_config[cluster_id].ipc_reason_config[i].ipc = val[i];
+		data[i] = val[i];
+	}
+
+	ret = 0;
+
+unlock:
 	mutex_unlock(&freq_reason_mutex);
 	return ret;
 }
 
-int sched_smart_freq_ipc_handler(struct ctl_table *table, int write,
+int sched_smart_freq_ipc_handler(const struct ctl_table *table, int write,
 				      void __user *buffer, size_t *lenp,
 				      loff_t *ppos)
 {
@@ -283,6 +373,9 @@ static inline bool has_internal_freq_limit_changed(struct walt_sched_cluster *cl
 	unsigned int internal_freq, ipc_freq;
 	int i;
 	struct smart_freq_cluster_info *smci = cluster->smart_freq_info;
+	unsigned int prev_id;
+	struct walt_sched_cluster *prev_cluster;
+	unsigned long prev_cluster_limit = 0;
 
 	internal_freq = cluster->walt_internal_freq_limit;
 	cluster->walt_internal_freq_limit = cluster->max_freq;
@@ -297,6 +390,16 @@ static inline bool has_internal_freq_limit_changed(struct walt_sched_cluster *cl
 	cluster->walt_internal_freq_limit = max(ipc_freq,
 			     cluster->walt_internal_freq_limit);
 
+	if (cluster->id > 0 && sysctl_walt_feat(WALT_FEAT_SYNC_FREQ_CAP_BIT)) {
+		prev_id = cluster->id - 1;
+		prev_cluster = sched_cluster[prev_id];
+		prev_cluster_limit = prev_cluster->walt_internal_freq_limit;
+		if (prev_cluster_limit == FREQ_QOS_MAX_DEFAULT_VALUE)
+			prev_cluster_limit = prev_cluster->max_possible_freq;
+
+		if (cluster->walt_internal_freq_limit < prev_cluster_limit)
+			cluster->walt_internal_freq_limit = prev_cluster_limit;
+	}
 	return cluster->walt_internal_freq_limit != internal_freq;
 }
 
@@ -346,27 +449,35 @@ static void smart_freq_update_one_cluster(struct walt_sched_cluster *cluster,
 			smart_freq_info->legacy_reason_status[i].deactivate_ns = 0;
 			smart_freq_info->cluster_active_reason |= BIT(i);
 		} else if (cluster_active_reason) {
-			if (!smart_freq_info->legacy_reason_status[i].deactivate_ns)
+			if (!smart_freq_info->legacy_reason_status[i].deactivate_ns) {
 				smart_freq_info->legacy_reason_status[i].deactivate_ns = wallclock;
-		}
-
-		if (cluster_active_reason) {
-			/*
-			 * For reasons with deactivation hysteresis, check here if we have
-			 * crossed the hysteresis time and then deactivate the reason.
-			 * We are relying on scheduler tick path to call this function
-			 * thus deactivation of reason is only at tick
-			 * boundary.
-			 */
-			if (smart_freq_info->legacy_reason_status[i].deactivate_ns) {
+			} else {
+				/*
+				 * For reasons with deactivation hysteresis, check here if we have
+				 * crossed the hysteresis time and then deactivate the reason.
+				 * We are relying on scheduler tick path to call this function
+				 * thus deactivation of reason is only at tick
+				 * boundary.
+				 */
 				u64 delta = wallclock -
 					smart_freq_info->legacy_reason_status[i].deactivate_ns;
 				if (delta >= smart_freq_info->legacy_reason_config[i].hyst_ns) {
 					smart_freq_info->legacy_reason_status[i].deactivate_ns = 0;
 					smart_freq_info->cluster_active_reason &= ~BIT(i);
-					continue;
+					cluster_active_reason &= ~BIT(i);
 				}
 			}
+		}
+
+		/*
+		 * Once we reach here reason which is not currently active can have two
+		 * possbilities:
+		 * 1. reason is within it's hysteresis time and in that case reason bit is
+		 * present in 'cluster_active_reason'.
+		 * 2. reason expired it's  hysteresis time and in that case reason bit already
+		 * cleared from 'cluster_active_reason'.
+		 */
+		if (cluster_active_reason || current_reason) {
 			if (max_cap < smart_freq_info->legacy_reason_config[i].freq_allowed) {
 				max_cap = smart_freq_info->legacy_reason_config[i].freq_allowed;
 				max_reason = i;
@@ -477,7 +588,7 @@ void smart_freq_update_reason_common(u64 wallclock, int nr_big, u32 wakeup_ctr_s
 		 * TRAILBLAZER
 		 */
 		if (cluster_participation_mask & BIT(TRAILBLAZER_SMART_FREQ)) {
-			current_state = trailblazer_state;
+			current_state = trailblazer_boost_state_ns ? true : false;
 			if (current_state)
 				cluster_reasons |= BIT(TRAILBLAZER_SMART_FREQ);
 		}
@@ -555,6 +666,15 @@ void smart_freq_update_reason_common(u64 wallclock, int nr_big, u32 wakeup_ctr_s
 				cluster_reasons |= BIT(THERMAL_ROTATION_SMART_FREQ);
 		}
 
+		/*
+		 * LRPB
+		 */
+		if (cluster_participation_mask & BIT(LRPB_SMART_FREQ)) {
+			current_state = cluster_in_smart_lrpb(cluster);
+			if (current_state)
+				cluster_reasons |= BIT(LRPB_SMART_FREQ);
+		}
+
 		cluster_active_reason = cluster->smart_freq_info->cluster_active_reason;
 out:
 		/* update the reasons for all the clusters */
@@ -610,7 +730,8 @@ void smart_freq_init(const char *name)
 	if (!name)
 		goto done;
 
-	if (!strcmp(name, "SUN") || !strcmp(name, "SUNP")) {
+	if (!strcmp(name, "SUN") || !strcmp(name, "SUNP") || !strcmp(name, "CANOE")
+			|| !strcmp(name, "ALOR_INTERPOSER")) {
 		for_each_sched_cluster(cluster) {
 			if (cluster->id == 0) {
 				/* Legacy */
@@ -634,11 +755,15 @@ void smart_freq_init(const char *name)
 					BIT(THERMAL_ROTATION_SMART_FREQ);
 
 				/* IPC */
-				cluster->smart_freq_info->ipc_reason_config[0].ipc = 120;
-				cluster->smart_freq_info->ipc_reason_config[1].ipc = 180;
-				cluster->smart_freq_info->ipc_reason_config[2].ipc = 220;
-				cluster->smart_freq_info->ipc_reason_config[3].ipc = 260;
-				cluster->smart_freq_info->ipc_reason_config[4].ipc = 300;
+				sysctl_ipc_levels_cluster0[0] = 120;
+				sysctl_ipc_levels_cluster0[1] = 180;
+				sysctl_ipc_levels_cluster0[2] = 220;
+				sysctl_ipc_levels_cluster0[3] = 260;
+				sysctl_ipc_levels_cluster0[4] = 300;
+				for (i = 0; i < SMART_FMAX_IPC_MAX; i++)
+					cluster->smart_freq_info->ipc_reason_config[i].ipc =
+						sysctl_ipc_levels_cluster0[i];
+
 				cluster->smart_freq_info->smart_freq_ipc_participation_mask =
 					BIT(IPC_A) | BIT(IPC_B) | BIT(IPC_C) | BIT(IPC_D) |
 					BIT(IPC_E);
@@ -665,18 +790,66 @@ void smart_freq_init(const char *name)
 					BIT(THERMAL_ROTATION_SMART_FREQ);
 
 				/* IPC */
-				cluster->smart_freq_info->ipc_reason_config[0].ipc = 220;
-				cluster->smart_freq_info->ipc_reason_config[1].ipc = 260;
-				cluster->smart_freq_info->ipc_reason_config[2].ipc = 280;
-				cluster->smart_freq_info->ipc_reason_config[3].ipc = 320;
-				cluster->smart_freq_info->ipc_reason_config[4].ipc = 400;
+				sysctl_ipc_levels_cluster1[0] = 220;
+				sysctl_ipc_levels_cluster1[1] = 260;
+				sysctl_ipc_levels_cluster1[2] = 280;
+				sysctl_ipc_levels_cluster1[3] = 320;
+				sysctl_ipc_levels_cluster1[4] = 400;
+				for (i = 0; i < SMART_FMAX_IPC_MAX; i++)
+					cluster->smart_freq_info->ipc_reason_config[i].ipc =
+						sysctl_ipc_levels_cluster1[i];
+
 				cluster->smart_freq_info->smart_freq_ipc_participation_mask =
 					BIT(IPC_A) | BIT(IPC_B) | BIT(IPC_C) | BIT(IPC_D) |
 					BIT(IPC_E);
 				cluster->smart_freq_info->min_cycles = 7004160;
 			}
 		}
-	} else if (!strcmp(name, "TUNA") || !strcmp(name, "TUNA7") || !strcmp(name, "TUNAP")) {
+	} else if (!strcmp(name, "ALOR")) {
+		for_each_sched_cluster(cluster) {
+			if (cluster->id == 0) {
+				/* Legacy */
+				cluster->smart_freq_info->legacy_reason_config[0].freq_allowed =
+					2400000;
+				cluster->smart_freq_info->legacy_reason_config[2].hyst_ns =
+					1000000000;
+				cluster->smart_freq_info->legacy_reason_config[3].hyst_ns =
+					1000000000;
+				cluster->smart_freq_info->legacy_reason_config[4].hyst_ns =
+					300000000;
+				cluster->smart_freq_info->smart_freq_participation_mask |=
+					BIT(BOOST_SMART_FREQ) |
+					BIT(SUSTAINED_HIGH_UTIL_SMART_FREQ) |
+					BIT(BIG_TASKCNT_SMART_FREQ) |
+					BIT(TRAILBLAZER_SMART_FREQ) |
+					BIT(SBT_SMART_FREQ) |
+					BIT(PIPELINE_60FPS_OR_LESSER_SMART_FREQ) |
+					BIT(PIPELINE_90FPS_SMART_FREQ) |
+					BIT(PIPELINE_120FPS_OR_GREATER_SMART_FREQ) |
+					BIT(THERMAL_ROTATION_SMART_FREQ);
+			} else if (cluster->id == 1) {
+				/* Legacy */
+				cluster->smart_freq_info->legacy_reason_config[0].freq_allowed =
+					3513600;
+				cluster->smart_freq_info->legacy_reason_config[2].hyst_ns =
+					1000000000;
+				cluster->smart_freq_info->legacy_reason_config[3].hyst_ns =
+					1000000000;
+				cluster->smart_freq_info->legacy_reason_config[4].hyst_ns =
+					300000000;
+				cluster->smart_freq_info->smart_freq_participation_mask |=
+					BIT(BOOST_SMART_FREQ) |
+					BIT(SUSTAINED_HIGH_UTIL_SMART_FREQ) |
+					BIT(BIG_TASKCNT_SMART_FREQ) |
+					BIT(TRAILBLAZER_SMART_FREQ) |
+					BIT(SBT_SMART_FREQ) |
+					BIT(PIPELINE_60FPS_OR_LESSER_SMART_FREQ) |
+					BIT(PIPELINE_90FPS_SMART_FREQ) |
+					BIT(PIPELINE_120FPS_OR_GREATER_SMART_FREQ) |
+					BIT(THERMAL_ROTATION_SMART_FREQ);
+			}
+		}
+	} else if (!strcmp(name, "TUNA")) {
 		for_each_sched_cluster(cluster) {
 			if (cluster->id == 0) {
 				/* Legacy */

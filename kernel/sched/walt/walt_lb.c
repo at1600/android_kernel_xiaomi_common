@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <trace/hooks/sched.h>
 
 #include "walt.h"
 #include "trace.h"
+#include "sysctl_walt_stats.h"
+
 
 inline unsigned long walt_lb_cpu_util(int cpu)
 {
@@ -20,6 +22,12 @@ void walt_detach_task(struct task_struct *p, struct rq *src_rq,
 			     struct rq *dst_rq)
 {
 	//TODO can we just replace with detach_task in fair.c??
+
+	if (p->se.sched_delayed)
+		WALT_BUG(WALT_BUG_WALT, p,
+			"Dequeuing when task is delayed: src_cpu=%d dst_cpu=%d\n",
+			cpu_of(src_rq), cpu_of(dst_rq));
+
 	deactivate_task(src_rq, p, 0);
 	set_task_cpu(p, dst_rq->cpu);
 }
@@ -27,7 +35,7 @@ void walt_detach_task(struct task_struct *p, struct rq *src_rq,
 void walt_attach_task(struct task_struct *p, struct rq *rq)
 {
 	activate_task(rq, p, 0);
-	check_preempt_curr(rq, p, 0);
+	wakeup_preempt(rq, p, 0);
 }
 
 int stop_walt_lb_active_migration(void *data)
@@ -76,6 +84,7 @@ out_unlock: /* called with busiest_rq lock */
 		raw_spin_lock(&target_rq->__lock);
 		walt_attach_task(push_task, target_rq);
 		raw_spin_unlock(&target_rq->__lock);
+		walt_inc_active_balance_migration_counter(target_cpu);
 	}
 
 	if (push_task)
@@ -162,7 +171,7 @@ static void walt_lb_check_for_rotation(struct rq *src_rq)
 		if (!rq->misfit_task_load || !walt_fair_task(rq->curr))
 			continue;
 
-		wts = (struct walt_task_struct *) rq->curr->android_vendor_data1;
+		wts = (struct walt_task_struct *)android_task_vendor_data(rq->curr);
 		wait = wc - wts->last_enqueued_ts;
 		if (wait > max_wait) {
 			max_wait = wait;
@@ -188,7 +197,7 @@ static void walt_lb_check_for_rotation(struct rq *src_rq)
 		if (rq->nr_running > 1)
 			continue;
 
-		wts = (struct walt_task_struct *) rq->curr->android_vendor_data1;
+		wts = (struct walt_task_struct *)android_task_vendor_data(rq->curr);
 		run = wc - wts->last_enqueued_ts;
 
 		if (run < WALT_ROTATION_THRESHOLD_NS)
@@ -236,10 +245,16 @@ static inline bool _walt_can_migrate_task(struct task_struct *p, int dst_cpu,
 					  bool to_lower, bool to_higher, bool force)
 {
 	struct walt_rq *wrq = &per_cpu(walt_rq, task_cpu(p));
-	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+
+	if (p->se.sched_delayed)
+		return false;
 
 	/* Don't detach task if it is under active migration */
 	if (wrq->push_task == p)
+		return false;
+
+	if (pipeline_in_progress() && walt_pipeline_low_latency_task(p))
 		return false;
 
 	if (to_lower) {
@@ -247,8 +262,6 @@ static inline bool _walt_can_migrate_task(struct task_struct *p, int dst_cpu,
 			return false;
 		if (per_task_boost(p) == TASK_BOOST_STRICT_MAX &&
 				task_in_related_thread_group(p))
-			return false;
-		if (pipeline_in_progress() && walt_pipeline_low_latency_task(p))
 			return false;
 		if (!force && walt_get_rtg_status(p))
 			return false;
@@ -270,7 +283,7 @@ static inline bool _walt_can_migrate_task(struct task_struct *p, int dst_cpu,
 static inline bool need_active_lb(struct task_struct *p, int dst_cpu,
 				  int src_cpu)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
 
 	if (cpu_rq(src_cpu)->active_balance)
 		return false;
@@ -293,7 +306,8 @@ static inline bool need_active_lb(struct task_struct *p, int dst_cpu,
 	return true;
 }
 
-static int walt_lb_pull_tasks(int dst_cpu, int src_cpu, struct task_struct **pulled_task_struct)
+static int walt_lb_pull_tasks(int dst_cpu, int src_cpu,
+		struct task_struct **pulled_task_struct)
 {
 	struct rq *dst_rq = cpu_rq(dst_cpu);
 	struct rq *src_rq = cpu_rq(src_cpu);
@@ -316,10 +330,6 @@ static int walt_lb_pull_tasks(int dst_cpu, int src_cpu, struct task_struct **pul
 	task_visited = 0;
 	list_for_each_entry_reverse(p, &src_rq->cfs_tasks, se.group_node) {
 		if (!cpumask_test_cpu(dst_cpu, p->cpus_ptr))
-			continue;
-
-		wts = (struct walt_task_struct *) p->android_vendor_data1;
-		if (wts->pipeline_cpu != -1)
 			continue;
 
 		if (task_on_cpu(src_rq, p))
@@ -355,10 +365,6 @@ static int walt_lb_pull_tasks(int dst_cpu, int src_cpu, struct task_struct **pul
 		if (!cpumask_test_cpu(dst_cpu, p->cpus_ptr))
 			continue;
 
-		wts = (struct walt_task_struct *) p->android_vendor_data1;
-		if (wts->pipeline_cpu != -1)
-			continue;
-
 		if (task_on_cpu(src_rq, p))
 			continue;
 
@@ -387,16 +393,14 @@ static int walt_lb_pull_tasks(int dst_cpu, int src_cpu, struct task_struct **pul
 	}
 
 	list_for_each_entry_reverse(p, &src_rq->cfs_tasks, se.group_node) {
-
-		wts = (struct walt_task_struct *) p->android_vendor_data1;
-		if (wts->pipeline_cpu != -1)
+		if (pipeline_in_progress() && walt_pipeline_low_latency_task(p))
 			continue;
 
 		if (task_on_cpu(src_rq, p)) {
-			if (cpumask_test_cpu(dst_cpu, p->cpus_ptr)
-				&& need_active_lb(p, dst_cpu, src_cpu)) {
+			if (cpumask_test_cpu(dst_cpu, p->cpus_ptr) &&
+					!p->se.sched_delayed &&
+					need_active_lb(p, dst_cpu, src_cpu)) {
 				bool success;
-
 				active_balance = true;
 				src_rq->active_balance = 1;
 				src_rq->push_cpu = dst_cpu;
@@ -411,6 +415,7 @@ static int walt_lb_pull_tasks(int dst_cpu, int src_cpu, struct task_struct **pul
 				 * Using our custom active load balance callback so that
 				 * the push_task is really pulled onto this CPU.
 				 */
+				wts = (struct walt_task_struct *)android_task_vendor_data(p);
 				trace_walt_active_load_balance(p, src_cpu, dst_cpu, wts);
 				success = stop_one_cpu_nowait(src_cpu,
 						stop_walt_lb_active_migration,
@@ -433,6 +438,7 @@ unlock:
 	raw_spin_lock_irqsave(&dst_rq->__lock, flags);
 	walt_attach_task(pull_me, dst_rq);
 	raw_spin_unlock_irqrestore(&dst_rq->__lock, flags);
+	walt_inc_idle_balance_migration_counter(dst_cpu);
 
 	*pulled_task_struct = pull_me;
 	return 1; /* we pulled 1 task */
@@ -694,7 +700,7 @@ void walt_lb_tick(struct rq *rq)
 	struct task_struct *p = rq->curr;
 	unsigned long flags;
 	struct walt_rq *prev_wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
 
 	raw_spin_lock(&rq->__lock);
 	if (available_idle_cpu(prev_cpu) && is_reserved(prev_cpu) && !rq->active_balance)
@@ -744,6 +750,13 @@ void walt_lb_tick(struct rq *rq)
 		goto out_unlock;
 
 	raw_spin_lock(&rq->__lock);
+
+	/* Confirm task is still running */
+	if (READ_ONCE(p->__state) != TASK_RUNNING) {
+		raw_spin_unlock(&rq->__lock);
+		goto out_unlock;
+	}
+
 	if (rq->active_balance) {
 		raw_spin_unlock(&rq->__lock);
 		goto out_unlock;
@@ -820,7 +833,7 @@ static bool walt_balance_rt(struct rq *this_rq)
 	if (!cpumask_test_cpu(this_cpu, p->cpus_ptr))
 		goto unlock;
 
-	wts = (struct walt_task_struct *) p->android_vendor_data1;
+	wts = (struct walt_task_struct *)android_task_vendor_data(p);
 
 	/*
 	 * Use rq->clock directly instead of rq_clock() since
@@ -920,7 +933,7 @@ static void walt_newidle_balance(struct rq *this_rq,
 	if (walt_balance_rt(this_rq) || this_rq->nr_running)
 		goto rt_pulled;
 
-	if (!force_overload && !READ_ONCE(this_rq->rd->overload))
+	if (!force_overload && !READ_ONCE(this_rq->rd->overloaded))
 		goto repin;
 
 	if (atomic_read(&this_rq->nr_iowait) && !enough_idle)
@@ -953,7 +966,8 @@ static void walt_newidle_balance(struct rq *this_rq,
 		 */
 		if (!enough_idle &&
 			(capacity_orig_of(this_cpu) < capacity_orig_of(busy_cpu) ||
-			(capacity_orig_of(this_cpu) > capacity_orig_of(busy_cpu) && !has_misfit)))
+			(capacity_orig_of(this_cpu) > capacity_orig_of(busy_cpu) &&
+			 !has_misfit)))
 			continue;
 
 		/* if helping farthest cluster,  kick a middle */
@@ -1144,6 +1158,7 @@ static void walt_sched_newidle_balance(void *unused, struct rq *this_rq,
 		walt_newidle_balance(this_rq, rf, pulled_task, done, false);
 }
 
+u64 oscillate_ts_ns;
 void sched_walt_oscillate(unsigned int busy_cpu)
 {
 	struct rq *src_rq;
@@ -1168,11 +1183,16 @@ void sched_walt_oscillate(unsigned int busy_cpu)
 	raw_spin_lock_irqsave(&src_rq->__lock, flags);
 
 	p = src_rq->curr;
+	if (READ_ONCE(p->__state) != TASK_RUNNING) {
+		no_oscillate_reason = 100;
+		goto unlock;
+	}
+
 	if (cpumask_test_cpu(dst_cpu, p->cpus_ptr)) {
 		bool success;
 
 		if (src_rq->active_balance) {
-			no_oscillate_reason = 100;
+			no_oscillate_reason = 101;
 			goto unlock;
 		}
 
@@ -1189,20 +1209,29 @@ void sched_walt_oscillate(unsigned int busy_cpu)
 		 * Using our custom active load balance callback so that
 		 * the push_task is really pulled onto this CPU.
 		 */
-		wts = (struct walt_task_struct *) p->android_vendor_data1;
+		wts = (struct walt_task_struct *)android_task_vendor_data(p);
 		oscillate_cpu = src_cpu;
 		success = stop_one_cpu_nowait(src_cpu,
 				stop_walt_lb_active_migration,
 				src_rq, &src_rq->active_balance_work);
 
 		if (!success) {
-			no_oscillate_reason = 101;
+			no_oscillate_reason = 102;
 			clear_reserved(dst_cpu);
 			goto out_fail;
 		} else {
 			wake_up_if_idle(dst_cpu);
+			/* This api is called from the FAST interrupt
+			 * to initiate oscillation - use the irqtime
+			 * start for timestamp instead of reading
+			 * from the clock hw.
+			 */
+			oscillate_ts_ns = (per_cpu(cpu_irqtime,
+						raw_smp_processor_id())).irq_start_time;
 		}
 		goto out;
+	} else {
+		no_oscillate_reason = 103;
 	}
 unlock:
 	raw_spin_unlock_irqrestore(&src_rq->__lock, flags);
