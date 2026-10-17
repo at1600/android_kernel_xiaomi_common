@@ -9,6 +9,7 @@
 #include <linux/spinlock.h>
 
 #include <asm/current.h>
+#include <uapi/linux/wait.h>
 
 typedef struct wait_queue_entry wait_queue_entry_t;
 
@@ -18,9 +19,10 @@ int default_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, int 
 /* wait_queue_entry::flags */
 #define WQ_FLAG_EXCLUSIVE	0x01
 #define WQ_FLAG_WOKEN		0x02
-#define WQ_FLAG_CUSTOM		0x04
-#define WQ_FLAG_DONE		0x08
-#define WQ_FLAG_PRIORITY	0x10
+#define WQ_FLAG_BOOKMARK	0x04
+#define WQ_FLAG_CUSTOM		0x08
+#define WQ_FLAG_DONE		0x10
+#define WQ_FLAG_PRIORITY	0x20
 
 /*
  * A single wait-queue entry structure:
@@ -210,6 +212,8 @@ __remove_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq
 int __wake_up(struct wait_queue_head *wq_head, unsigned int mode, int nr, void *key);
 void __wake_up_on_current_cpu(struct wait_queue_head *wq_head, unsigned int mode, void *key);
 void __wake_up_locked_key(struct wait_queue_head *wq_head, unsigned int mode, void *key);
+void __wake_up_locked_key_bookmark(struct wait_queue_head *wq_head,
+		unsigned int mode, void *key, wait_queue_entry_t *bookmark);
 void __wake_up_sync_key(struct wait_queue_head *wq_head, unsigned int mode, void *key);
 void __wake_up_locked_sync_key(struct wait_queue_head *wq_head, unsigned int mode, void *key);
 void __wake_up_locked(struct wait_queue_head *wq_head, unsigned int mode, int nr);
@@ -221,12 +225,12 @@ void __wake_up_pollfree(struct wait_queue_head *wq_head);
 #define wake_up_all(x)			__wake_up(x, TASK_NORMAL, 0, NULL)
 #define wake_up_locked(x)		__wake_up_locked((x), TASK_NORMAL, 1)
 #define wake_up_all_locked(x)		__wake_up_locked((x), TASK_NORMAL, 0)
-#define wake_up_sync(x)			__wake_up_sync(x, TASK_NORMAL)
 
 #define wake_up_interruptible(x)	__wake_up(x, TASK_INTERRUPTIBLE, 1, NULL)
 #define wake_up_interruptible_nr(x, nr)	__wake_up(x, TASK_INTERRUPTIBLE, nr, NULL)
 #define wake_up_interruptible_all(x)	__wake_up(x, TASK_INTERRUPTIBLE, 0, NULL)
 #define wake_up_interruptible_sync(x)	__wake_up_sync((x), TASK_INTERRUPTIBLE)
+#define wake_up_sync(x)			__wake_up_sync((x), TASK_NORMAL)
 
 /*
  * Wakeup macros to be used to report events to the targets.

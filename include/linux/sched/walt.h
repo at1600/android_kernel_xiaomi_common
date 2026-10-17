@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _LINUX_SCHED_WALT_H
@@ -10,7 +10,6 @@
 #include <linux/types.h>
 #include <linux/spinlock_types.h>
 #include <linux/cpumask.h>
-#include <linux/sched/task.h>
 
 enum pause_client {
 	PAUSE_CORE_CTL	= 0x01,
@@ -107,9 +106,6 @@ struct walt_task_struct {
 	 *
 	 * 'prev_on_rq' tracks enqueue/dequeue of a task for error conditions
 	 * 0 = nothing, 1 = enqueued, 2 = dequeued
-	 *
-	 * 'lib_app_state' tracks if task is a lib based application
-	 * <bit 7>: result of lib evaluation, <bit 6-0>: lib name update count
 	 */
 	u32				flags;
 	u64				mark_start;
@@ -146,6 +142,10 @@ struct walt_task_struct {
 	int				prev_on_rq;
 	int				prev_on_rq_cpu;
 	struct list_head		mvp_list;
+//MIUI ADD: Performance_BoostFramework
+	struct list_head		runnable_list;
+	u64				runnable_start;
+//END Performance_BoostFramework
 	u64				sum_exec_snapshot_for_slice;
 	u64				sum_exec_snapshot_for_total;
 	u64				total_exec;
@@ -167,30 +167,33 @@ struct walt_task_struct {
 	u32				period_contrib_run;
 	u64				yield_ts;
 	u64				yield_total_sleep_usec;
-	s64				lst_tgt_ns;
-	int				lst_state_counter;
-	bool				lst;
-	int				pipeline_activity_cnt;
-	atomic_t			event_windows;
-	u8				lib_app_state;
+	s64				lst_start_ns;
+	s64				lst_cnt;
+	bool			lst;
+
+	s64				pipeline_cnt;
+	unsigned int			event_windows;
+	unsigned int			continous_active;
+// MIUI ADD: Game_MIGT
+	int                             mmlock_wakeup;
+// END Game_MIGT
 };
 
 #define wts_to_ts(wts) ({ \
 		void *__mptr = (void *)(wts); \
-		(u64 *)wts == &vendor_data_pad[0] ? &init_task :\
 		((struct task_struct *)(__mptr - \
-			sizeof(struct task_struct))); })
+			offsetof(struct task_struct, android_vendor_data1))); })
 
 static inline bool sched_get_wake_up_idle(struct task_struct *p)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 
 	return wts->wake_up_idle;
 }
 
 static inline int sched_set_wake_up_idle(struct task_struct *p, bool wake_up_idle)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 
 	wts->wake_up_idle = wake_up_idle;
 	return 0;
@@ -198,7 +201,7 @@ static inline int sched_set_wake_up_idle(struct task_struct *p, bool wake_up_idl
 
 static inline void set_wake_up_idle(bool wake_up_idle)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(current);
+	struct walt_task_struct *wts = (struct walt_task_struct *) current->android_vendor_data1;
 
 	wts->wake_up_idle = wake_up_idle;
 }
@@ -317,7 +320,7 @@ static inline int walt_set_enforce_high_irq_cpus(struct cpumask *set)
 	return -EINVAL;
 }
 
-static inline int walt_unset_enforce_high_irq_cpus(struct cpumask *unset)
+static inline void walt_unset_enforce_high_irq_cpus(struct cpumask *unset)
 {
 	return -EINVAL;
 }
