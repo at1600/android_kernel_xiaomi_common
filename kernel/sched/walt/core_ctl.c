@@ -105,30 +105,6 @@ static unsigned int get_assist_active_cpu_count(const struct cluster_data *clust
 static unsigned int active_cpu_count_from_mask(const cpumask_t *cpus);
 static void __ref do_core_ctl(void);
 
-// MIUI ADD: Task_Attribute_Sched
-void miui_corectl_cpu_busy(unsigned int flag, unsigned int val)
-{
-	struct cluster_data *cluster;
-	unsigned long flags;
-	unsigned int index = 0;
-  	int i = 0;
-	spin_lock_irqsave(&state_lock, flags);
-	for_each_cluster(cluster, index) {
-	if (!cluster) {
-			printk(KERN_ERR "miui_corectl_cpu_busy: cluster at index %u is NULL\n", index);
-			continue;
-	}
-	if (flag == 1) {
-		for (i = 0; i < cluster->num_cpus; i++)
-			cluster->busy_up_thres[i] = val;
-	} else {
-		for (i = 0; i < cluster->num_cpus; i++)
-		cluster->busy_down_thres[i] = val;
-	}
-	}
-	spin_unlock_irqrestore(&state_lock, flags);
-}
-// END Task_Attribute_Sched
 cpumask_t part_haltable_cpus = { CPU_BITS_NONE };
 /* ========================= sysfs interface =========================== */
 
@@ -229,7 +205,6 @@ static ssize_t store_task_thres(struct cluster_data *state,
 
 	return count;
 }
-
 
 static ssize_t show_offline_delay_ms(const struct cluster_data *state,
 				     char *buf)
@@ -894,7 +869,6 @@ static int compute_cluster_nr_misfit_assist(int index)
 	return nr_misfit_assist;
 }
 
-
 /**
  * cluster_real_big_tasks
  * @index: cluster index
@@ -1064,7 +1038,6 @@ static void update_running_avg(u64 window_start, u32 wakeup_ctr_sum)
 
 		cluster->nr_big = cluster_real_big_tasks(index);
 		big_avg += cluster->nr_big;
-
 		for_each_cpu(cpu, &cluster->cpu_mask)
 			giant += nr_stats[cpu].nr_giant;
 	}
@@ -1418,9 +1391,6 @@ static inline bool core_ctl_is_sbt(int prev_is_sbt_windows, u32 wakeup_ctr_sum)
 		goto out;
 
 	if (!core_ctl_non_large_cpus_below_busy_pct())
-		goto out;
-
-	if (is_large_cpu_cap_low())
 		goto out;
 
 	ret = true;

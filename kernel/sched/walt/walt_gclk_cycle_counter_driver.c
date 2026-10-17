@@ -7,7 +7,6 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
-#include <linux/platform_device.h>
 
 #include "walt.h"
 
@@ -106,8 +105,9 @@ static int walt_gclk_cycle_counter_driver_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static void walt_gclk_cycle_counter_driver_remove(struct platform_device *pdev)
+static int walt_gclk_cycle_counter_driver_remove(struct platform_device *pdev)
 {
+	return 0;
 }
 
 static const struct of_device_id walt_gclk_cycle_counter_match[] = {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include "walt.h"
@@ -77,8 +77,6 @@ static bool move_task(int src_cpu, int dst_cpu, cpumask_t *dst_cpu_mask_to_avoid
 	}
 
 	list_for_each_entry_reverse(p, &src_rq->cfs_tasks, se.group_node) {
-		if (p->se.sched_delayed)
-			continue;
 
 		if (!walt_fair_task(p))
 			continue;
