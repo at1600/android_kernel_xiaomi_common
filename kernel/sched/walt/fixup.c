@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <trace/hooks/cpufreq.h>
@@ -27,6 +27,7 @@ static bool is_sched_lib_based_app(pid_t pid)
 	char *tmp_lib_name;
 	bool found = false;
 	struct task_struct *p;
+	struct walt_task_struct *wts;
 	struct mm_struct *mm;
 
 	if (strnlen(sched_lib_name, LIB_PATH_LENGTH) == 0)
@@ -42,6 +43,18 @@ static bool is_sched_lib_based_app(pid_t pid)
 	if (!p) {
 		kfree(tmp_lib_name);
 		return false;
+	}
+
+	/*
+	 * if cached lib_update_cnt in wts is same as global 'lib_update_cnt' then
+	 * the task is already evaluated and return the evaluated value (Bit 15).
+	 * For cased lib_update_cnt is different(cases where lib name is udpated)
+	 * re-evaluate the state.
+	 */
+	wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	if ((wts->lib_app_state & LIB_UPDATE_CNT_MAX) == lib_update_cnt) {
+		kfree(tmp_lib_name);
+		return !!(wts->lib_app_state & 0x80);
 	}
 
 	mm = get_task_mm(p);
@@ -74,20 +87,20 @@ release_sem:
 		mmput(mm);
 
 	}
+	wts->lib_app_state = found ? BIT(7) : 0;
+	wts->lib_app_state |= (lib_update_cnt & LIB_UPDATE_CNT_MAX);
 	put_task_struct(p);
 	kfree(tmp_lib_name);
 	return found;
 }
 
-struct task_struct *sched_lib_task_struct;
 bool is_sched_lib_task(void)
 {
 	if (strnlen(sched_lib_task, LIB_PATH_LENGTH) == 0)
 		return false;
 
-	if (strnstr(current->comm, sched_lib_task, strnlen(current->comm, LIB_PATH_LENGTH))) {
+	if (strnstr(current->comm, sched_lib_task, strnlen(current->comm, LIB_PATH_LENGTH)))
 		return true;
-	}
 
 	return false;
 }
@@ -120,9 +133,12 @@ static void android_rvh_cpu_capacity_show(void *unused,
 u8 contiguous_yielding_windows;
 unsigned int total_yield_cnt;
 unsigned int total_sleep_cnt;
+u64 frame_size_ns;
 
-static u64 frame_from_ravg_window(void)
+static u64 get_frame_time(void)
 {
+	if (frame_size_ns > 0)
+		return frame_size_ns;
 	if (sched_ravg_window <= SCHED_RAVG_8MS_WINDOW)
 		return FRAME120_WINDOW_NSEC;
 	if (sched_ravg_window == SCHED_RAVG_12MS_WINDOW)
@@ -134,31 +150,12 @@ static u64 frame_from_ravg_window(void)
 
 void account_yields(u64 wallclock)
 {
-	struct walt_sched_cluster *cluster = cpu_cluster(task_cpu(current));
-	struct smart_freq_cluster_info *smart_freq_info = cluster->smart_freq_info;
 	static u64 yield_counting_window_ts;
 	u64 delta = wallclock - yield_counting_window_ts;
-	unsigned int target_threshold_wake = MAX_YIELD_CNT_GLOBAL_THR_DEFAULT;
-	unsigned int target_threshold_sleep = MAX_YIELD_SLEEP_CNT_GLOBAL_THR;
-	u8 continuous_window_th = MIN_CONTIGUOUS_YIELDING_WINDOW;
+	unsigned int target_threshold_wake = FORCE_MAX_YIELD_CNT_GLOBAL_THR_DEFAULT;
+	unsigned int target_threshold_sleep = FORCE_MAX_YIELD_SLEEP_CNT_GLOBAL_THR;
+	u8 continuous_window_th = FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW;
 	bool high_util = false;
-	/*
-	 * use force threshold if force_frequent_yielder feature is enabled
-	 * else if system is runnign under pipeline use pipeline specific
-	 * threshold.
-	 * default trhehsold count is high to avoid inetrference with normal
-	 * operations.
-	 */
-	if (sysctl_force_frequent_yielder) {
-		target_threshold_wake = FORCE_MAX_YIELD_CNT_GLOBAL_THR_DEFAULT;
-		target_threshold_sleep = FORCE_MAX_YIELD_SLEEP_CNT_GLOBAL_THR;
-		continuous_window_th = FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW;
-	} else if (smart_freq_info->cluster_active_reason &
-					(BIT(PIPELINE_60FPS_OR_LESSER_SMART_FREQ) |
-					BIT(PIPELINE_90FPS_SMART_FREQ) |
-					BIT(PIPELINE_120FPS_OR_GREATER_SMART_FREQ))) {
-		target_threshold_wake = MAX_YIELD_CNT_GLOBAL_THR_PIPELINE;
-	}
 
 	/* window boundary crossed */
 	if (delta > YIELD_WINDOW_SIZE_NSEC) {
@@ -170,10 +167,11 @@ void account_yields(u64 wallclock)
 
 		if (unlikely(delta > YIELD_WINDOW_SIZE_NSEC + YIELD_GRACE_PERIOD_NSEC)) {
 			target_threshold_wake = div64_u64(delta * target_threshold_wake,
-							YIELD_WINDOW_SIZE_NSEC);
+					YIELD_WINDOW_SIZE_NSEC);
 			target_threshold_sleep = div64_u64(delta * target_threshold_sleep,
-							YIELD_WINDOW_SIZE_NSEC);
+					YIELD_WINDOW_SIZE_NSEC);
 		}
+
 		if (!sysctl_force_frequent_yielder)
 			high_util = any_large_above_util_threshold(200);
 
@@ -185,11 +183,10 @@ void account_yields(u64 wallclock)
 			contiguous_yielding_windows = 0;
 		}
 
-		trace_sched_yielder(wallclock, yield_counting_window_ts,
-				    contiguous_yielding_windows,
-				    total_yield_cnt, target_threshold_wake,
-				    total_sleep_cnt, target_threshold_sleep,
-				    smart_freq_info->cluster_active_reason);
+		trace_walt_account_yields(wallclock, yield_counting_window_ts,
+				contiguous_yielding_windows,
+				total_yield_cnt, target_threshold_wake,
+				total_sleep_cnt, target_threshold_sleep);
 
 		yield_counting_window_ts = wallclock;
 		total_yield_cnt = 0;
@@ -199,7 +196,7 @@ void account_yields(u64 wallclock)
 
 /*
  * Sleep time prediction:
- * Mark two adjacent yieldsa
+ * Mark two adjacent yields
  * cy: time now (current yield)
  * py: previous yield time stamp
  *
@@ -230,7 +227,7 @@ void account_yields(u64 wallclock)
  */
 
 DEFINE_PER_CPU(unsigned int, walt_yield_to_sleep);
-static void induce_pipeline_sleep(struct walt_task_struct *wts)
+static void inject_sleep(struct walt_task_struct *wts)
 {
 	struct rq *rq = task_rq(current);
 	struct rq_flags rf;
@@ -256,7 +253,7 @@ static void induce_pipeline_sleep(struct walt_task_struct *wts)
 	rq_unlock_irqrestore(rq, &rf);
 	current_ts = rq->clock;
 	if (current_ts > wts->yield_ts + MIN_FRAME_YIELD_INTERVAL_NSEC) {
-		frame = frame_from_ravg_window();
+		frame = get_frame_time();
 		delta = current_ts - wts->yield_ts;
 		wts->yield_total_sleep_usec = 0;
 		if (frame > delta + YIELD_SLEEP_HEADROOM) {
@@ -279,14 +276,7 @@ static void induce_pipeline_sleep(struct walt_task_struct *wts)
 
 static void walt_do_sched_yield_before(void *unused, long *skip)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)current->android_vendor_data1;
-	struct walt_sched_cluster *cluster = cpu_cluster(task_cpu(current));
-	struct smart_freq_cluster_info *smart_freq_info = cluster->smart_freq_info;
-	bool in_legacy_uncap;
-	struct rq *rq = task_rq(current);
-	struct rq_flags rf;
-	u64 current_ts = 0;
-	u64 frame = 0, delta = 0, sleep_nsec = 0;
+	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(current);
 
 	if (unlikely(walt_disabled))
 		return;
@@ -294,61 +284,18 @@ static void walt_do_sched_yield_before(void *unused, long *skip)
 	if (!walt_fair_task(current))
 		return;
 
-	if (wts->pipeline_cpu != -1) {
+	if (sysctl_force_frequent_yielder && pipeline_in_progress() &&
+						walt_pipeline_low_latency_task(current)) {
 		*skip = true;
-		induce_pipeline_sleep(wts);
+		inject_sleep(wts);
 		return;
 	}
-	cluster = cpu_cluster(task_cpu(current));
-	smart_freq_info = cluster->smart_freq_info;
 
 	if ((wts->yield_state & YIELD_CNT_MASK) >= MAX_YIELD_CNT_PER_TASK_THR) {
 		total_yield_cnt++;
-		if (contiguous_yielding_windows >=
-			(sysctl_force_frequent_yielder ? FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW :
-								MIN_CONTIGUOUS_YIELDING_WINDOW)) {
-			/*
-			 * if we are under any legacy frequency uncap other than
-			 * pipeline(i.e some load condition, ignore injecting sleep
-			 * for the yielding task.
-			 */
-			in_legacy_uncap = !sysctl_force_frequent_yielder &&
-					!!(smart_freq_info->cluster_active_reason &
-					~(BIT(NO_REASON_SMART_FREQ) |
-					  BIT(PIPELINE_60FPS_OR_LESSER_SMART_FREQ) |
-					  BIT(PIPELINE_90FPS_SMART_FREQ) |
-					  BIT(PIPELINE_120FPS_OR_GREATER_SMART_FREQ)));
-			if (!in_legacy_uncap) {
-				wts->yield_state |= YIELD_INDUCED_SLEEP;
-				total_sleep_cnt++;
-				*skip = true;
-				/*
-				 * updating and reading clock will not hurt here as this cpu is
-				 * already in yield cycle not doing anything significant.
-				 */
-				rq_lock_irqsave(rq, &rf);
-				update_rq_clock(rq);
-				rq_unlock_irqrestore(rq, &rf);
-				current_ts = rq->clock;
-				if (current_ts > wts->yield_ts + MIN_FRAME_YIELD_INTERVAL_NSEC) {
-					frame = frame_from_ravg_window();
-					delta = current_ts - wts->yield_ts;
-					wts->yield_total_sleep_usec = 0;
-					if (frame > delta) {
-						sleep_nsec = (frame - delta) - YIELD_SLEEP_HEADROOM;
-						wts->yield_total_sleep_usec = sleep_nsec /
-										NSEC_PER_USEC;
-					}
-				}
-				wts->yield_ts = current_ts;
-				if (wts->yield_total_sleep_usec >= YIELD_SLEEP_TIME_USEC) {
-					per_cpu(walt_yield_to_sleep, raw_smp_processor_id())++;
-					usleep_range_state(YIELD_SLEEP_TIME_USEC,
-							YIELD_SLEEP_TIME_USEC, TASK_INTERRUPTIBLE);
-					wts->yield_total_sleep_usec = wts->yield_total_sleep_usec -
-							YIELD_SLEEP_TIME_USEC;
-				}
-			}
+		if (contiguous_yielding_windows >= FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW) {
+			*skip = true;
+			inject_sleep(wts);
 		}
 	} else {
 		wts->yield_state++;

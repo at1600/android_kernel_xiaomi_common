@@ -66,16 +66,17 @@ static void long_running_rt_task_notifier(void *unused, struct rq *rq)
 	}
 }
 
-int sched_long_running_rt_task_ms_handler(struct ctl_table *table, int write,
+int sched_long_running_rt_task_ms_handler(const struct ctl_table *table, int write,
 				       void __user *buffer, size_t *lenp,
 				       loff_t *ppos)
 {
 	int ret;
 	static DEFINE_MUTEX(mutex);
+	struct ctl_table local_table = *table;
 
 	mutex_lock(&mutex);
 
-	ret = proc_douintvec_minmax(table, write, buffer, lenp, ppos);
+	ret = proc_douintvec_minmax(&local_table, write, buffer, lenp, ppos);
 
 	if (sysctl_sched_long_running_rt_task_ms > 0 &&
 			sysctl_sched_long_running_rt_task_ms < 800)
@@ -92,7 +93,7 @@ int sched_long_running_rt_task_ms_handler(struct ctl_table *table, int write,
 	return ret;
 }
 
-static void walt_rt_energy_aware_wake_cpu(struct task_struct *task, struct cpumask *lowest_mask,
+extern void walt_rt_energy_aware_wake_cpu(struct task_struct *task, struct cpumask *lowest_mask,
 					  int ret, int *best_cpu)
 {
 	int cpu;
@@ -199,6 +200,7 @@ static void walt_rt_energy_aware_wake_cpu(struct task_struct *task, struct cpuma
 
 	rcu_read_unlock();
 }
+EXPORT_SYMBOL_GPL(walt_rt_energy_aware_wake_cpu);
 
 #ifdef CONFIG_UCLAMP_TASK
 static inline bool walt_rt_task_fits_capacity(struct task_struct *p, int cpu)
@@ -265,7 +267,7 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 
 	this_cpu = raw_smp_processor_id();
 	this_cpu_rq = cpu_rq(this_cpu);
-	wts = (struct walt_task_struct *) task->android_vendor_data1;
+	wts = (struct walt_task_struct *)android_task_vendor_data(task);
 
 	/*
 	 * Respect the sync flag as long as the task can run on this CPU.
@@ -274,7 +276,6 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 	    cpumask_test_cpu(this_cpu, task->cpus_ptr) &&
 	    cpumask_test_cpu(this_cpu, &wts->reduce_mask) &&
 	    walt_should_honor_rt_sync(this_cpu_rq, task, sync)) {
-
 		fastpath = SYNC_WAKEUP;
 		*new_cpu = this_cpu;
 		goto out;
@@ -302,7 +303,16 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 	 * requirement of the task - which is only important on heterogeneous
 	 * systems like big.LITTLE.
 	 */
-	may_not_preempt = cpu_busy_with_softirqs(cpu);
+	/*
+	 * RT_SOFTIRQ_AWARE_SCHED feature is not available on
+	 * android-mainline. During the most recent LTS merge, the
+	 * changes were not picked up. Since WALT initialization cannot wait
+	 * until next LTS merge, provide this workaround of not using the
+	 * cpu_busy_with_softirqs function until it is present in the downstream
+	 * kernel.
+	 */
+	may_not_preempt = false;
+	//may_not_preempt = cpu_busy_with_softirqs(cpu);
 
 	lowest_mask = this_cpu_cpumask_var_ptr(walt_local_cpu_mask);
 
@@ -310,10 +320,11 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 	 * If we're on asym system ensure we consider the different capacities
 	 * of the CPUs when searching for the lowest_mask.
 	 */
-	ret = cpupri_find_fitness(&task_rq(task)->rd->cpupri, task,
+	ret = cpupri_find_fitness(&task_rq(task)->rd->cpupri, task, task,
 				lowest_mask, walt_rt_task_fits_capacity);
 
 	packing_cpu = walt_find_and_choose_cluster_packing_cpu(0, task);
+
 	if (packing_cpu >= 0) {
 		while (packing_cpu < WALT_NR_CPUS) {
 			if (cpumask_test_cpu(packing_cpu, &wts->reduce_mask) &&
@@ -321,7 +332,8 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 				cpu_active(packing_cpu) &&
 				!cpu_halted(packing_cpu) &&
 				(cpu_rq(packing_cpu)->rt.rt_nr_running <= 1))
-                          	break;
+				break;
+
 			packing_cpu++;
 		}
 
@@ -333,6 +345,7 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 	}
 
 	cpumask_and(&lowest_mask_reduced, lowest_mask, &wts->reduce_mask);
+
 	if (!cpumask_empty(&lowest_mask_reduced))
 		walt_rt_energy_aware_wake_cpu(task, &lowest_mask_reduced, ret, &target);
 	if (target == -1)
@@ -347,13 +360,13 @@ static void walt_select_task_rq_rt(void *unused, struct task_struct *task, int c
 	if (target != -1 &&
 	    (may_not_preempt || task->prio < cpu_rq(target)->rt.highest_prio.curr))
 		*new_cpu = target;
-
 	/* if backup or chosen cpu is halted, pick something else */
 	if (cpu_halted(*new_cpu)) {
 		cpumask_t non_halted;
 
 		/* choose the lowest-order, unhalted, allowed CPU */
 		cpumask_andnot(&non_halted, task->cpus_ptr, cpu_halt_mask);
+
 		target = cpumask_first(&non_halted);
 		if (target < nr_cpu_ids)
 			*new_cpu = target;
@@ -364,8 +377,10 @@ out:
 	trace_sched_select_task_rt(task, fastpath, *new_cpu, lowest_mask);
 }
 
-static void walt_rt_find_lowest_rq(void *unused, struct task_struct *task,
-				   struct cpumask *lowest_mask, int ret, int *best_cpu)
+
+static void walt_rt_find_lowest_rq(void *unused, struct task_struct *sched_ctx,
+				   struct task_struct *exec_ctx, struct cpumask *lowest_mask,
+				   int ret, int *best_cpu)
 
 {
 	int packing_cpu = -1;
@@ -376,17 +391,18 @@ static void walt_rt_find_lowest_rq(void *unused, struct task_struct *task,
 	if (unlikely(walt_disabled))
 		return;
 
-	wts = (struct walt_task_struct *) task->android_vendor_data1;
+	wts = (struct walt_task_struct *)android_task_vendor_data(sched_ctx);
 
-	packing_cpu = walt_find_and_choose_cluster_packing_cpu(0, task);
+	packing_cpu = walt_find_and_choose_cluster_packing_cpu(0, sched_ctx);
 	if (packing_cpu >= 0) {
 		while (packing_cpu < WALT_NR_CPUS) {
 			if (cpumask_test_cpu(packing_cpu, &wts->reduce_mask) &&
-				cpumask_test_cpu(packing_cpu, task->cpus_ptr) &&
+				cpumask_test_cpu(packing_cpu, sched_ctx->cpus_ptr) &&
 				cpu_active(packing_cpu) &&
 				!cpu_halted(packing_cpu) &&
 				(cpu_rq(packing_cpu)->rt.rt_nr_running <= 2))
-                          	break;
+				break;
+
 			packing_cpu++;
 		}
 
@@ -398,10 +414,11 @@ static void walt_rt_find_lowest_rq(void *unused, struct task_struct *task,
 	}
 
 	cpumask_and(&lowest_mask_reduced, lowest_mask, &wts->reduce_mask);
+
 	if (!cpumask_empty(&lowest_mask_reduced))
-		walt_rt_energy_aware_wake_cpu(task, &lowest_mask_reduced, ret, best_cpu);
+		walt_rt_energy_aware_wake_cpu(sched_ctx, &lowest_mask_reduced, ret, best_cpu);
 	if (*best_cpu == -1)
-		walt_rt_energy_aware_wake_cpu(task, lowest_mask, ret, best_cpu);
+		walt_rt_energy_aware_wake_cpu(sched_ctx, lowest_mask, ret, best_cpu);
 
 	/*
 	 * Walt was not able to find a non-halted best cpu. Ensure that
@@ -411,7 +428,7 @@ static void walt_rt_find_lowest_rq(void *unused, struct task_struct *task,
 	if (*best_cpu == -1)
 		cpumask_andnot(lowest_mask, lowest_mask, cpu_halt_mask);
 out:
-	trace_sched_rt_find_lowest_rq(task, fastpath, *best_cpu, lowest_mask);
+	trace_sched_rt_find_lowest_rq(sched_ctx, fastpath, *best_cpu, lowest_mask);
 }
 
 void walt_rt_init(void)
