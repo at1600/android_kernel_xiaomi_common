@@ -42,6 +42,8 @@
 
 #include "futex.h"
 #include "../locking/rtmutex_common.h"
+#include <trace/hooks/futex.h>
+#include <trace/hooks/timer.h>
 
 /*
  * The base of the bucket array and its size are always used together
@@ -137,9 +139,16 @@ struct hrtimer_sleeper *
 futex_setup_timer(ktime_t *time, struct hrtimer_sleeper *timeout,
 		  int flags, u64 range_ns)
 {
+	ktime_t expires;
+	u64 delta_ns;
+
 	if (!time)
 		return NULL;
 
+	expires = *time;
+	delta_ns = range_ns;
+	trace_android_vh_adjust_timer_slack(current, &expires, &delta_ns,
+					    ANDROID_TIMER_SLACK_FUTEX);
 	hrtimer_init_sleeper_on_stack(timeout, (flags & FLAGS_CLOCKRT) ?
 				      CLOCK_REALTIME : CLOCK_MONOTONIC,
 				      HRTIMER_MODE_ABS);
@@ -147,7 +156,7 @@ futex_setup_timer(ktime_t *time, struct hrtimer_sleeper *timeout,
 	 * If range_ns is 0, calling hrtimer_set_expires_range_ns() is
 	 * effectively the same as calling hrtimer_set_expires().
 	 */
-	hrtimer_set_expires_range_ns(&timeout->timer, *time, range_ns);
+	hrtimer_set_expires_range_ns(&timeout->timer, expires, delta_ns);
 
 	return timeout;
 }
@@ -554,9 +563,11 @@ void futex_q_unlock(struct futex_hash_bucket *hb)
 	futex_hb_waiters_dec(hb);
 }
 
-void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb)
+void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb,
+		   struct task_struct *task)
 {
 	int prio;
+	bool already_on_hb = false;
 
 	/*
 	 * The priority used to register this element is
@@ -569,8 +580,10 @@ void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb)
 	prio = min(current->normal_prio, MAX_RT_PRIO);
 
 	plist_node_init(&q->list, prio);
-	plist_add(&q->list, &hb->chain);
-	q->task = current;
+	trace_android_vh_alter_futex_plist_add(&q->list, &hb->chain, &already_on_hb);
+	if (!already_on_hb)
+		plist_add(&q->list, &hb->chain);
+	q->task = task;
 }
 
 /**

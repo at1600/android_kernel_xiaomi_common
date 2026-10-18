@@ -169,6 +169,36 @@ config MODVERSIONS
 	  make them incompatible with the kernel you are running.  If
 	  unsure, say N.
 
+choice
+	prompt "Module versioning implementation"
+	depends on MODVERSIONS
+	help
+	  Select the tool used to calculate symbol versions for modules.
+
+	  If unsure, select GENKSYMS.
+
+config GENKSYMS
+	bool "genksyms (from source code)"
+	help
+	  Calculate symbol versions from pre-processed source code using
+	  genksyms.
+
+	  If unsure, say Y.
+
+config GENDWARFKSYMS
+	bool "gendwarfksyms (from debugging information)"
+	depends on DEBUG_INFO
+	# Requires full debugging information, split DWARF not supported.
+	depends on !DEBUG_INFO_REDUCED && !DEBUG_INFO_SPLIT
+	# Requires ELF object files.
+	depends on !LTO
+	help
+	  Calculate symbol versions from DWARF debugging information using
+	  gendwarfksyms. Requires DEBUG_INFO to be enabled.
+
+	  If unsure, say N.
+endchoice
+
 config ASM_MODVERSIONS
 	bool
 	default HAVE_ASM_MODVERSIONS && MODVERSIONS
@@ -176,6 +206,31 @@ config ASM_MODVERSIONS
 	  This enables module versioning for exported symbols also from
 	  assembly. This can be enabled only when the target architecture
 	  supports it.
+
+config EXTENDED_MODVERSIONS
+	bool "Extended Module Versioning Support"
+	depends on MODVERSIONS
+	help
+	  This enables extended MODVERSIONs support, allowing long symbol
+	  names to be versioned.
+
+	  The most likely reason you would enable this is to enable Rust
+	  support. If unsure, say N.
+
+config BASIC_MODVERSIONS
+	bool "Basic Module Versioning Support"
+	depends on MODVERSIONS
+	default y
+	help
+	  This enables basic MODVERSIONS support, allowing older tools or
+	  kernels to potentially load modules.
+
+	  Disabling this may cause older `modprobe` or `kmod` to be unable
+	  to read MODVERSIONS information from built modules. With this
+	  disabled, older kernels may treat this module as unversioned.
+
+	  This is enabled by default when MODVERSIONS are enabled.
+	  If unsure, say Y.
 
 config MODULE_SRCVERSION_ALL
 	bool "Source checksum for all modules"
@@ -187,6 +242,20 @@ config MODULE_SRCVERSION_ALL
 	  others sometimes change the module source without updating
 	  the version).  With this option, such a "srcversion" field
 	  will be created for all modules.  If unsure, say N.
+
+config MODULE_SCMVERSION
+	bool "SCM version for modules"
+	depends on LOCALVERSION_AUTO
+	help
+	  This enables the module attribute "scmversion" which can be used
+	  by developers to identify the SCM version of a given module, e.g.
+	  git sha1 or hg sha1. The SCM version can be queried by modinfo or
+	  via the sysfs node: /sys/modules/MODULENAME/scmversion. This is
+	  useful when the kernel or kernel modules are updated separately
+	  since that causes the vermagic of the kernel and the module to
+	  differ.
+
+	  If unsure, say N.
 
 config MODULE_SIG
 	bool "Module signature verification"
@@ -227,6 +296,24 @@ config MODULE_SIG_ALL
 
 comment "Do not forget to sign required modules with scripts/sign-file"
 	depends on MODULE_SIG_FORCE && !MODULE_SIG_ALL
+
+config MODULE_SIG_PROTECT_LIST
+	string "File with signed module names whose exports are to be protected"
+	default ""
+	depends on MODULE_SIG && !MODULE_SIG_FORCE
+	help
+	  Enables symbol export protection support for the listed signed
+	  modules. This option prevents unsigned modules from exporting symbols
+	  which are exported by the listed modules. Any unsigned module which
+	  tries to export such a symbol will fail to load.
+
+	  The value to set here is the path to a text file in the source
+	  directory containing the list of module names, one per line. The path
+	  can be absolute, or relative to the kernel source or obj tree.
+
+config MODULE_SIG_PROTECT
+	def_bool y
+	depends on MODULE_SIG_PROTECT_LIST != ""
 
 choice
 	prompt "Hash algorithm to sign modules"

@@ -15,6 +15,7 @@
 #include <linux/device.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
+#include <linux/android_kabi.h>
 #include <uapi/linux/thermal.h>
 
 /* invalid cooling state */
@@ -56,6 +57,9 @@ enum thermal_notify_event {
 	THERMAL_TZ_UNBIND_CDEV, /* Cooling dev is unbind from the thermal zone */
 	THERMAL_INSTANCE_WEIGHT_CHANGED, /* Thermal instance weight changed */
 	THERMAL_TZ_RESUME, /* Thermal zone is resuming after system sleep */
+	THERMAL_TZ_ADD_THRESHOLD, /* Threshold added */
+	THERMAL_TZ_DEL_THRESHOLD, /* Threshold deleted */
+	THERMAL_TZ_FLUSH_THRESHOLDS, /* All thresholds deleted */
 };
 
 /**
@@ -83,8 +87,6 @@ struct thermal_trip {
 #define THERMAL_TRIP_PRIV_TO_INT(_val_)	(uintptr_t)(_val_)
 #define THERMAL_INT_TO_TRIP_PRIV(_val_)	(void *)(uintptr_t)(_val_)
 
-struct thermal_zone_device;
-
 struct cooling_spec {
 	unsigned long upper;	/* Highest cooling state  */
 	unsigned long lower;	/* Lowest cooling state  */
@@ -108,6 +110,8 @@ struct thermal_zone_device_ops {
 			  const struct thermal_trip *, enum thermal_trend *);
 	void (*hot)(struct thermal_zone_device *);
 	void (*critical)(struct thermal_zone_device *);
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct thermal_cooling_device_ops {
@@ -117,6 +121,8 @@ struct thermal_cooling_device_ops {
 	int (*get_requested_power)(struct thermal_cooling_device *, u32 *);
 	int (*state2power)(struct thermal_cooling_device *, unsigned long, u32 *);
 	int (*power2state)(struct thermal_cooling_device *, u32, unsigned long *);
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct thermal_cooling_device {
@@ -135,6 +141,8 @@ struct thermal_cooling_device {
 #ifdef CONFIG_THERMAL_DEBUGFS
 	struct thermal_debugfs *debugfs;
 #endif
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 /* Structure to define Thermal Zone parameters */
@@ -185,6 +193,8 @@ struct thermal_zone_params {
 	 * 		Used by thermal zone drivers (default 0).
 	 */
 	int offset;
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 /* Function declarations */

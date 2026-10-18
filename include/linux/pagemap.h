@@ -145,6 +145,8 @@ static inline bool mapping_empty(struct address_space *mapping)
 	return xa_empty(&mapping->i_pages);
 }
 
+extern void _trace_android_rvh_mapping_shrinkable(bool *shrinkable);
+
 /*
  * mapping_shrinkable - test if page cache state allows inode reclaim
  * @mapping: the page cache mapping
@@ -169,7 +171,11 @@ static inline bool mapping_empty(struct address_space *mapping)
 static inline bool mapping_shrinkable(struct address_space *mapping)
 {
 	void *head;
+	bool shrinkable = false;
 
+	_trace_android_rvh_mapping_shrinkable(&shrinkable);
+	if (shrinkable)
+		return true;
 	/*
 	 * On highmem systems, there could be lowmem pressure from the
 	 * inodes before there is highmem pressure from the page
@@ -677,10 +683,12 @@ static inline struct page *__page_cache_alloc(gfp_t gfp)
 	return &filemap_alloc_folio(gfp, 0)->page;
 }
 
-static inline gfp_t readahead_gfp_mask(struct address_space *x)
+static inline gfp_t __readahead_gfp_mask(struct address_space *x)
 {
 	return mapping_gfp_mask(x) | __GFP_NORETRY | __GFP_NOWARN;
 }
+
+gfp_t readahead_gfp_mask(struct address_space *x);
 
 typedef int filler_t(struct file *, struct folio *);
 
@@ -710,6 +718,7 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
  * * %FGP_NOFS - __GFP_FS will get cleared in gfp.
  * * %FGP_NOWAIT - Don't block on the folio lock.
  * * %FGP_STABLE - Wait for the folio to be stable (finished writeback)
+ * * %FGP_DONTCACHE - Uncached buffered IO
  * * %FGP_WRITEBEGIN - The flags to use in a filesystem write_begin()
  *   implementation.
  */
@@ -723,6 +732,7 @@ typedef unsigned int __bitwise fgf_t;
 #define FGP_NOWAIT		((__force fgf_t)0x00000020)
 #define FGP_FOR_MMAP		((__force fgf_t)0x00000040)
 #define FGP_STABLE		((__force fgf_t)0x00000080)
+#define FGP_DONTCACHE		((__force fgf_t)0x00000100)
 #define FGF_GET_ORDER(fgf)	(((__force unsigned)fgf) >> 26)	/* top 6 bits */
 
 #define FGP_WRITEBEGIN		(FGP_LOCK | FGP_WRITE | FGP_CREAT | FGP_STABLE)
@@ -1351,7 +1361,9 @@ struct readahead_control {
 	unsigned int _nr_pages;
 	unsigned int _batch_count;
 	bool _workingset;
+	ANDROID_KABI_IGNORE(1, bool dropbehind);
 	unsigned long _pflags;
+	ANDROID_OEM_DATA(1);
 };
 
 #define DEFINE_READAHEAD(ractl, f, r, m, i)				\

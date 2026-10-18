@@ -33,6 +33,7 @@ enum prs_errcode {
 	PERR_CPUSEMPTY,
 	PERR_HKEEPING,
 	PERR_ACCESS,
+	PERR_REMOTE,
 };
 
 /* bits in struct cpuset flags field */
@@ -180,6 +181,8 @@ struct cpuset {
 
 	/* Used to merge intersecting subsets for generate_sched_domains */
 	struct uf_node node;
+
+	ANDROID_BACKPORT_RESERVE(1);
 };
 
 static inline struct cpuset *css_cs(struct cgroup_subsys_state *css)

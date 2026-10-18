@@ -9,6 +9,7 @@
 #include <linux/prefetch.h>
 #include <linux/srcu.h>
 #include <linux/rw_hint.h>
+#include <linux/android_kabi.h>
 
 struct blk_mq_tags;
 struct blk_flush_queue;
@@ -85,7 +86,7 @@ enum {
 
 /* flags that prevent us from merging requests: */
 #define RQF_NOMERGE_FLAGS \
-	(RQF_STARTED | RQF_FLUSH_SEQ | RQF_SPECIAL_PAYLOAD)
+	(RQF_STARTED | RQF_FLUSH_SEQ | RQF_DONTPREP | RQF_SPECIAL_PAYLOAD)
 
 enum mq_rq_state {
 	MQ_RQ_IDLE		= 0,
@@ -156,9 +157,6 @@ struct request {
 	struct blk_crypto_keyslot *crypt_keyslot;
 #endif
 
-	enum rw_hint write_hint;
-	unsigned short ioprio;
-
 	enum mq_rq_state state;
 	atomic_t ref;
 
@@ -208,6 +206,9 @@ struct request {
 	 */
 	rq_end_io_fn *end_io;
 	void *end_io_data;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_OEM_DATA(1);
 };
 
 static inline enum req_op req_op(const struct request *req)
@@ -222,7 +223,9 @@ static inline bool blk_rq_is_passthrough(struct request *rq)
 
 static inline unsigned short req_get_ioprio(struct request *req)
 {
-	return req->ioprio;
+	if (req->bio)
+		return req->bio->bi_ioprio;
+	return 0;
 }
 
 #define rq_data_dir(rq)		(op_is_write(req_op(rq)) ? WRITE : READ)
@@ -230,61 +233,60 @@ static inline unsigned short req_get_ioprio(struct request *req)
 #define rq_dma_dir(rq) \
 	(op_is_write(req_op(rq)) ? DMA_TO_DEVICE : DMA_FROM_DEVICE)
 
-#define rq_list_add(listptr, rq)	do {		\
-	(rq)->rq_next = *(listptr);			\
-	*(listptr) = rq;				\
-} while (0)
-
-#define rq_list_add_tail(lastpptr, rq)	do {		\
-	(rq)->rq_next = NULL;				\
-	**(lastpptr) = rq;				\
-	*(lastpptr) = &rq->rq_next;			\
-} while (0)
-
-#define rq_list_pop(listptr)				\
-({							\
-	struct request *__req = NULL;			\
-	if ((listptr) && *(listptr))	{		\
-		__req = *(listptr);			\
-		*(listptr) = __req->rq_next;		\
-	}						\
-	__req;						\
-})
-
-#define rq_list_peek(listptr)				\
-({							\
-	struct request *__req = NULL;			\
-	if ((listptr) && *(listptr))			\
-		__req = *(listptr);			\
-	__req;						\
-})
-
-#define rq_list_for_each(listptr, pos)			\
-	for (pos = rq_list_peek((listptr)); pos; pos = rq_list_next(pos))
-
-#define rq_list_for_each_safe(listptr, pos, nxt)			\
-	for (pos = rq_list_peek((listptr)), nxt = rq_list_next(pos);	\
-		pos; pos = nxt, nxt = pos ? rq_list_next(pos) : NULL)
-
-#define rq_list_next(rq)	(rq)->rq_next
-#define rq_list_empty(list)	((list) == (struct request *) NULL)
-
-/**
- * rq_list_move() - move a struct request from one list to another
- * @src: The source list @rq is currently in
- * @dst: The destination list that @rq will be appended to
- * @rq: The request to move
- * @prev: The request preceding @rq in @src (NULL if @rq is the head)
- */
-static inline void rq_list_move(struct request **src, struct request **dst,
-				struct request *rq, struct request *prev)
+static inline int rq_list_empty(const struct rq_list *rl)
 {
-	if (prev)
-		prev->rq_next = rq->rq_next;
-	else
-		*src = rq->rq_next;
-	rq_list_add(dst, rq);
+	return rl->head == NULL;
 }
+
+static inline void rq_list_init(struct rq_list *rl)
+{
+	rl->head = NULL;
+	rl->tail = NULL;
+}
+
+static inline void rq_list_add_tail(struct rq_list *rl, struct request *rq)
+{
+	rq->rq_next = NULL;
+	if (rl->tail)
+		rl->tail->rq_next = rq;
+	else
+		rl->head = rq;
+	rl->tail = rq;
+}
+
+static inline void rq_list_add_head(struct rq_list *rl, struct request *rq)
+{
+	rq->rq_next = rl->head;
+	rl->head = rq;
+	if (!rl->tail)
+		rl->tail = rq;
+}
+
+static inline struct request *rq_list_pop(struct rq_list *rl)
+{
+	struct request *rq = rl->head;
+
+	if (rq) {
+		rl->head = rl->head->rq_next;
+		if (!rl->head)
+			rl->tail = NULL;
+		rq->rq_next = NULL;
+	}
+
+	return rq;
+}
+
+static inline struct request *rq_list_peek(struct rq_list *rl)
+{
+	return rl->head;
+}
+
+#define rq_list_for_each(rl, pos)					\
+	for (pos = rq_list_peek((rl)); (pos); pos = pos->rq_next)
+
+#define rq_list_for_each_safe(rl, pos, nxt)				\
+	for (pos = rq_list_peek((rl)), nxt = pos->rq_next;		\
+		pos; pos = nxt, nxt = pos ? pos->rq_next : NULL)
 
 /**
  * enum blk_eh_timer_return - How the timeout handler should proceed
@@ -450,6 +452,8 @@ struct blk_mq_hw_ctx {
 	 * q->unused_hctx_list.
 	 */
 	struct list_head	hctx_list;
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -536,6 +540,8 @@ struct blk_mq_tag_set {
 	struct mutex		tag_list_lock;
 	struct list_head	tag_list;
 	struct srcu_struct	*srcu;
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -577,7 +583,7 @@ struct blk_mq_ops {
 	 * empty the @rqlist completely, then the rest will be queued
 	 * individually by the block layer upon return.
 	 */
-	void (*queue_rqs)(struct request **rqlist);
+	void (*queue_rqs)(struct rq_list *rqlist);
 
 	/**
 	 * @get_budget: Reserve budget before queue request, once .queue_rq is
@@ -666,6 +672,8 @@ struct blk_mq_ops {
 	 */
 	void (*show_rq)(struct seq_file *m, struct request *rq);
 #endif
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 /* Keep hctx_flag_name[] in sync with the definitions below */
@@ -774,6 +782,7 @@ struct blk_mq_tags {
 	 * request pool
 	 */
 	spinlock_t lock;
+	ANDROID_OEM_DATA(1);
 };
 
 static inline struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags,
@@ -871,28 +880,46 @@ static inline bool blk_mq_is_reserved_rq(struct request *rq)
 	return rq->rq_flags & RQF_RESV;
 }
 
-/*
+/**
+ * blk_mq_add_to_batch() - add a request to the completion batch
+ * @req: The request to add to batch
+ * @iob: The batch to add the request
+ * @is_error: Specify true if the request failed with an error
+ * @complete: The completaion handler for the request
+ *
  * Batched completions only work when there is no I/O error and no special
  * ->end_io handler.
+ *
+ * Return: true when the request was added to the batch, otherwise false
  */
 static inline bool blk_mq_add_to_batch(struct request *req,
-				       struct io_comp_batch *iob, int ioerror,
+				       struct io_comp_batch *iob, bool is_error,
 				       void (*complete)(struct io_comp_batch *))
 {
 	/*
-	 * blk_mq_end_request_batch() can't end request allocated from
-	 * sched tags
+	 * Check various conditions that exclude batch processing:
+	 * 1) No batch container
+	 * 2) Has scheduler data attached
+	 * 3) Not a passthrough request and end_io set
+	 * 4) Not a passthrough request and failed with an error
 	 */
-	if (!iob || (req->rq_flags & RQF_SCHED_TAGS) || ioerror ||
-			(req->end_io && !blk_rq_is_passthrough(req)))
+	if (!iob)
 		return false;
+	if (req->rq_flags & RQF_SCHED_TAGS)
+		return false;
+	if (!blk_rq_is_passthrough(req)) {
+		if (req->end_io)
+			return false;
+		if (is_error)
+			return false;
+	}
 
 	if (!iob->complete)
 		iob->complete = complete;
 	else if (iob->complete != complete)
 		return false;
 	iob->need_ts |= blk_mq_need_time_stamp(req);
-	rq_list_add(&iob->req_list, req);
+	rq_list_add_tail(&iob->req_list, req);
 	return true;
 }
 
@@ -925,8 +952,12 @@ void blk_freeze_queue_start(struct request_queue *q);
 void blk_mq_freeze_queue_wait(struct request_queue *q);
 int blk_mq_freeze_queue_wait_timeout(struct request_queue *q,
 				     unsigned long timeout);
+void blk_mq_unfreeze_queue_non_owner(struct request_queue *q);
+void blk_freeze_queue_start_non_owner(struct request_queue *q);
 
 void blk_mq_map_queues(struct blk_mq_queue_map *qmap);
+void blk_mq_map_hw_queues(struct blk_mq_queue_map *qmap,
+			  struct device *dev, unsigned int offset);
 void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues);
 
 void blk_mq_quiesce_queue_nowait(struct request_queue *q);
@@ -989,7 +1020,6 @@ static inline void blk_rq_bio_prep(struct request *rq, struct bio *bio,
 	rq->nr_phys_segments = nr_segs;
 	rq->__data_len = bio->bi_iter.bi_size;
 	rq->bio = rq->biotail = bio;
-	rq->ioprio = bio_prio(bio);
 }
 
 void blk_mq_hctx_set_fq_lock_class(struct blk_mq_hw_ctx *hctx,
@@ -1175,5 +1205,16 @@ static inline int blk_rq_map_sg(struct request_queue *q, struct request *rq,
 	return __blk_rq_map_sg(q, rq, sglist, &last_sg);
 }
 void blk_dump_rq_flags(struct request *, char *);
+
+static inline bool blk_rq_is_seq_zoned_write(struct request *rq)
+{
+	switch (req_op(rq)) {
+	case REQ_OP_WRITE:
+	case REQ_OP_WRITE_ZEROES:
+		return bdev_zone_is_seq(rq->q->disk->part0, blk_rq_pos(rq));
+	default:
+		return false;
+	}
+}
 
 #endif /* BLK_MQ_H */

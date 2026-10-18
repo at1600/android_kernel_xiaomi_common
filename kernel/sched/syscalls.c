@@ -16,6 +16,9 @@
 #include "sched.h"
 #include "autogroup.h"
 
+#include <trace/hooks/sched.h>
+#undef TRACE_INCLUDE_PATH
+
 static inline int __normal_prio(int policy, int rt_prio, int nice)
 {
 	int prio;
@@ -67,7 +70,9 @@ void set_user_nice(struct task_struct *p, long nice)
 	bool queued, running;
 	struct rq *rq;
 	int old_prio;
+	bool allowed = true;
 
+	trace_android_rvh_set_user_nice(p, &nice);
 	if (task_nice(p) == nice || nice < MIN_NICE || nice > MAX_NICE)
 		return;
 	/*
@@ -78,6 +83,10 @@ void set_user_nice(struct task_struct *p, long nice)
 	rq = rq_guard.rq;
 
 	update_rq_clock(rq);
+
+	trace_android_rvh_set_user_nice_locked(p, &nice, &allowed);
+	if (!allowed)
+		return;
 
 	/*
 	 * The RT priorities are set via sched_setscheduler(), but we still
@@ -91,7 +100,7 @@ void set_user_nice(struct task_struct *p, long nice)
 	}
 
 	queued = task_on_rq_queued(p);
-	running = task_current(rq, p);
+	running = task_current_donor(rq, p);
 	if (queued)
 		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
 	if (running)
@@ -233,6 +242,7 @@ int available_idle_cpu(int cpu)
 
 	return 1;
 }
+EXPORT_SYMBOL_GPL(available_idle_cpu);
 
 /**
  * idle_task - return the idle task for a given CPU.
@@ -353,6 +363,12 @@ static int uclamp_validate(struct task_struct *p,
 {
 	int util_min = p->uclamp_req[UCLAMP_MIN].value;
 	int util_max = p->uclamp_req[UCLAMP_MAX].value;
+	bool done = false;
+	int ret = 0;
+
+	trace_android_vh_uclamp_validate(p, attr, &ret, &done);
+	if (done)
+		return ret;
 
 	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN) {
 		util_min = attr->sched_util_min;
@@ -378,7 +394,8 @@ static int uclamp_validate(struct task_struct *p,
 	 * blocking operation which obviously cannot be done while holding
 	 * scheduler locks.
 	 */
-	static_branch_enable(&sched_uclamp_used);
+	if (!uclamp_is_used())
+		static_branch_enable(&sched_uclamp_used);
 
 	return 0;
 }
@@ -440,12 +457,14 @@ static void __setscheduler_uclamp(struct task_struct *p,
 	    attr->sched_util_min != -1) {
 		uclamp_se_set(&p->uclamp_req[UCLAMP_MIN],
 			      attr->sched_util_min, true);
+		trace_android_vh_setscheduler_uclamp(p, UCLAMP_MIN, attr->sched_util_min);
 	}
 
 	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX &&
 	    attr->sched_util_max != -1) {
 		uclamp_se_set(&p->uclamp_req[UCLAMP_MAX],
 			      attr->sched_util_max, true);
+		trace_android_vh_setscheduler_uclamp(p, UCLAMP_MAX, attr->sched_util_max);
 	}
 }
 
@@ -513,6 +532,12 @@ static int user_check_sched_setscheduler(struct task_struct *p,
 	/* Normal users shall not reset the sched_reset_on_fork flag: */
 	if (p->sched_reset_on_fork && !reset_on_fork)
 		goto req_priv;
+
+	if (!capable(CAP_SYS_NICE)) {
+		/* Can't change util-clamps */
+		if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)
+			return -EPERM;
+	}
 
 	return 0;
 
@@ -708,12 +733,14 @@ change:
 
 	prev_class = p->sched_class;
 	next_class = __setscheduler_class(policy, newprio);
+	trace_android_vh_setscheduler_class(&next_class, NULL, p, policy, newprio);
 
 	if (prev_class != next_class && p->se.sched_delayed)
 		dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
 
+	trace_android_vh_scx_restore_flags(prev_class, next_class, &queue_flags);
 	queued = task_on_rq_queued(p);
-	running = task_current(rq, p);
+	running = task_current_donor(rq, p);
 	if (queued)
 		dequeue_task(rq, p, queue_flags);
 	if (running)
@@ -723,6 +750,7 @@ change:
 		__setscheduler_params(p, attr);
 		p->sched_class = next_class;
 		p->prio = newprio;
+		trace_android_rvh_setscheduler(p);
 	}
 	__setscheduler_uclamp(p, attr);
 	check_class_changing(rq, p, prev_class);
@@ -804,11 +832,13 @@ int sched_setscheduler(struct task_struct *p, int policy,
 {
 	return _sched_setscheduler(p, policy, param, true);
 }
+EXPORT_SYMBOL_GPL(sched_setscheduler);
 
 int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
 {
 	return __sched_setscheduler(p, attr, true, true);
 }
+EXPORT_SYMBOL_GPL(sched_setattr);
 
 int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
 {
@@ -834,6 +864,7 @@ int sched_setscheduler_nocheck(struct task_struct *p, int policy,
 {
 	return _sched_setscheduler(p, policy, param, false);
 }
+EXPORT_SYMBOL_GPL(sched_setscheduler_nocheck);
 
 /*
  * SCHED_FIFO is a broken scheduler model; that is, it is fundamentally
@@ -1238,7 +1269,7 @@ int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 			bool empty = !cpumask_and(new_mask, new_mask,
 						  ctx->user_mask);
 
-			if (WARN_ON_ONCE(empty))
+			if (empty)
 				cpumask_copy(new_mask, cpus_allowed);
 		}
 		__set_cpus_allowed_ptr(p, ctx);
@@ -1256,7 +1287,8 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 {
 	struct affinity_context ac;
 	struct cpumask *user_mask;
-	int retval;
+	int retval = 0;
+	bool skip = false;
 
 	CLASS(find_get_task, p)(pid);
 	if (!p)
@@ -1271,6 +1303,9 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 			return -EPERM;
 	}
 
+	trace_android_vh_sched_setaffinity_early(p, in_mask, &skip);
+	if (skip)
+		return retval;
 	retval = security_task_setscheduler(p);
 	if (retval)
 		return retval;
@@ -1293,6 +1328,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	};
 
 	retval = __sched_setaffinity(p, &ac);
+	trace_android_rvh_sched_setaffinity(p, in_mask, &retval);
 	kfree(ac.user_mask);
 
 	return retval;
@@ -1394,11 +1430,19 @@ static void do_sched_yield(void)
 {
 	struct rq_flags rf;
 	struct rq *rq;
+	long skip = 0;
+
+	trace_android_rvh_before_do_sched_yield(&skip);
+	if (skip)
+		return;
 
 	rq = this_rq_lock_irq(&rf);
 
 	schedstat_inc(rq->yld_count);
-	current->sched_class->yield_task(rq);
+	if (rq->donor->sched_class->yield_task)
+		rq->donor->sched_class->yield_task(rq);
+
+	trace_android_rvh_do_sched_yield(rq);
 
 	preempt_disable();
 	rq_unlock_irq(rq, &rf);
@@ -1467,12 +1511,13 @@ EXPORT_SYMBOL(yield);
  */
 int __sched yield_to(struct task_struct *p, bool preempt)
 {
-	struct task_struct *curr = current;
+	struct task_struct *curr;
 	struct rq *rq, *p_rq;
 	int yielded = 0;
 
-	scoped_guard (irqsave) {
+	scoped_guard (raw_spinlock_irqsave, &p->pi_lock) {
 		rq = this_rq();
+		curr = rq->donor;
 
 again:
 		p_rq = task_rq(p);

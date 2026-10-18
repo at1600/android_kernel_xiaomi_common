@@ -12,6 +12,7 @@
  *  Copyright (C) 2004-2006 Ingo Molnar
  *  Copyright (C) 2004 Nadia Yvette Chambers
  */
+#include <linux/page_size_compat_defs.h>
 #include <linux/ring_buffer.h>
 #include <linux/utsname.h>
 #include <linux/stacktrace.h>
@@ -26,6 +27,7 @@
 #include <linux/hardirq.h>
 #include <linux/linkage.h>
 #include <linux/uaccess.h>
+#include <linux/cleanup.h>
 #include <linux/vmalloc.h>
 #include <linux/ftrace.h>
 #include <linux/module.h>
@@ -48,6 +50,9 @@
 #include <linux/fsnotify.h>
 #include <linux/irq_work.h>
 #include <linux/workqueue.h>
+#include <linux/sort.h>
+#include <linux/io.h> /* vmap_page_range() */
+#include <trace/hooks/ftrace_dump.h>
 
 #include <asm/setup.h> /* COMMAND_LINE_SIZE */
 
@@ -535,19 +540,16 @@ LIST_HEAD(ftrace_trace_arrays);
 int trace_array_get(struct trace_array *this_tr)
 {
 	struct trace_array *tr;
-	int ret = -ENODEV;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 	list_for_each_entry(tr, &ftrace_trace_arrays, list) {
 		if (tr == this_tr) {
 			tr->ref++;
-			ret = 0;
-			break;
+			return 0;
 		}
 	}
-	mutex_unlock(&trace_types_lock);
 
-	return ret;
+	return -ENODEV;
 }
 
 static void __trace_array_put(struct trace_array *this_tr)
@@ -789,7 +791,10 @@ int trace_pid_write(struct trace_pid_list *filtered_pids,
 		/* copy the current bits to the new max */
 		ret = trace_pid_list_first(filtered_pids, &pid);
 		while (!ret) {
-			trace_pid_list_set(pid_list, pid);
+			ret = trace_pid_list_set(pid_list, pid);
+			if (ret < 0)
+				goto out;
+
 			ret = trace_pid_list_next(filtered_pids, pid + 1, &pid);
 			nr_pids++;
 		}
@@ -826,6 +831,7 @@ int trace_pid_write(struct trace_pid_list *filtered_pids,
 		trace_parser_clear(&parser);
 		ret = 0;
 	}
+ out:
 	trace_parser_put(&parser);
 
 	if (ret < 0) {
@@ -988,7 +994,8 @@ static inline void trace_access_lock_init(void)
 #endif
 
 #ifdef CONFIG_STACKTRACE
-static void __ftrace_trace_stack(struct trace_buffer *buffer,
+static void __ftrace_trace_stack(struct trace_array *tr,
+				 struct trace_buffer *buffer,
 				 unsigned int trace_ctx,
 				 int skip, struct pt_regs *regs);
 static inline void ftrace_trace_stack(struct trace_array *tr,
@@ -997,7 +1004,8 @@ static inline void ftrace_trace_stack(struct trace_array *tr,
 				      int skip, struct pt_regs *regs);
 
 #else
-static inline void __ftrace_trace_stack(struct trace_buffer *buffer,
+static inline void __ftrace_trace_stack(struct trace_array *tr,
+					struct trace_buffer *buffer,
 					unsigned int trace_ctx,
 					int skip, struct pt_regs *regs)
 {
@@ -1062,7 +1070,6 @@ void tracing_on(void)
 {
 	tracer_tracing_on(&global_trace);
 }
-EXPORT_SYMBOL_GPL(tracing_on);
 
 
 static __always_inline void
@@ -1454,22 +1461,20 @@ EXPORT_SYMBOL_GPL(tracing_snapshot_alloc);
 int tracing_snapshot_cond_enable(struct trace_array *tr, void *cond_data,
 				 cond_update_fn_t update)
 {
-	struct cond_snapshot *cond_snapshot;
-	int ret = 0;
+	struct cond_snapshot *cond_snapshot __free(kfree) =
+		kzalloc(sizeof(*cond_snapshot), GFP_KERNEL);
+	int ret;
 
-	cond_snapshot = kzalloc(sizeof(*cond_snapshot), GFP_KERNEL);
 	if (!cond_snapshot)
 		return -ENOMEM;
 
 	cond_snapshot->cond_data = cond_data;
 	cond_snapshot->update = update;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 
-	if (tr->current_trace->use_max_tr) {
-		ret = -EBUSY;
-		goto fail_unlock;
-	}
+	if (tr->current_trace->use_max_tr)
+		return -EBUSY;
 
 	/*
 	 * The cond_snapshot can only change to NULL without the
@@ -1479,29 +1484,20 @@ int tracing_snapshot_cond_enable(struct trace_array *tr, void *cond_data,
 	 * do safely with only holding the trace_types_lock and not
 	 * having to take the max_lock.
 	 */
-	if (tr->cond_snapshot) {
-		ret = -EBUSY;
-		goto fail_unlock;
-	}
+	if (tr->cond_snapshot)
+		return -EBUSY;
 
 	ret = tracing_arm_snapshot_locked(tr);
 	if (ret)
-		goto fail_unlock;
+		return ret;
 
 	local_irq_disable();
 	arch_spin_lock(&tr->max_lock);
-	tr->cond_snapshot = cond_snapshot;
+	tr->cond_snapshot = no_free_ptr(cond_snapshot);
 	arch_spin_unlock(&tr->max_lock);
 	local_irq_enable();
 
-	mutex_unlock(&trace_types_lock);
-
-	return ret;
-
- fail_unlock:
-	mutex_unlock(&trace_types_lock);
-	kfree(cond_snapshot);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(tracing_snapshot_cond_enable);
 
@@ -1639,7 +1635,6 @@ int tracing_is_on(void)
 {
 	return tracer_tracing_is_on(&global_trace);
 }
-EXPORT_SYMBOL_GPL(tracing_is_on);
 
 static int __init set_buf_size(char *str)
 {
@@ -1765,7 +1760,7 @@ int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 
 	ret = get_user(ch, ubuf++);
 	if (ret)
-		goto out;
+		goto fail;
 
 	read++;
 	cnt--;
@@ -1779,7 +1774,7 @@ int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 		while (cnt && isspace(ch)) {
 			ret = get_user(ch, ubuf++);
 			if (ret)
-				goto out;
+				goto fail;
 			read++;
 			cnt--;
 		}
@@ -1789,8 +1784,7 @@ int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 		/* only spaces were written */
 		if (isspace(ch) || !ch) {
 			*ppos += read;
-			ret = read;
-			goto out;
+			return read;
 		}
 	}
 
@@ -1800,11 +1794,12 @@ int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 			parser->buffer[parser->idx++] = ch;
 		else {
 			ret = -EINVAL;
-			goto out;
+			goto fail;
 		}
+
 		ret = get_user(ch, ubuf++);
 		if (ret)
-			goto out;
+			goto fail;
 		read++;
 		cnt--;
 	}
@@ -1820,13 +1815,13 @@ int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 		parser->buffer[parser->idx] = 0;
 	} else {
 		ret = -EINVAL;
-		goto out;
+		goto fail;
 	}
 
 	*ppos += read;
-	ret = read;
-
-out:
+	return read;
+fail:
+	trace_parser_fail(parser);
 	return ret;
 }
 
@@ -2214,10 +2209,10 @@ static __init int init_trace_selftests(void)
 
 	selftests_can_run = true;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 
 	if (list_empty(&postponed_selftests))
-		goto out;
+		return 0;
 
 	pr_info("Running postponed tracer tests:\n");
 
@@ -2245,9 +2240,6 @@ static __init int init_trace_selftests(void)
 		kfree(p);
 	}
 	tracing_selftest_running = false;
-
- out:
-	mutex_unlock(&trace_types_lock);
 
 	return 0;
 }
@@ -2332,10 +2324,10 @@ int __init register_tracer(struct tracer *type)
 	mutex_unlock(&trace_types_lock);
 
 	if (ret || !default_bootup_tracer)
-		goto out_unlock;
+		return ret;
 
 	if (strncmp(default_bootup_tracer, type->name, MAX_TRACER_SIZE))
-		goto out_unlock;
+		return 0;
 
 	printk(KERN_INFO "Starting tracer '%s'\n", type->name);
 	/* Do we want this tracer to start on bootup? */
@@ -2347,8 +2339,7 @@ int __init register_tracer(struct tracer *type)
 	/* disable other selftests, since this will break it. */
 	disable_tracing_selftest("running a tracer");
 
- out_unlock:
-	return ret;
+	return 0;
 }
 
 static void tracing_reset_cpu(struct array_buffer *buf, int cpu)
@@ -2816,7 +2807,7 @@ int tracepoint_printk_sysctl(const struct ctl_table *table, int write,
 	int save_tracepoint_printk;
 	int ret;
 
-	mutex_lock(&tracepoint_printk_mutex);
+	guard(mutex)(&tracepoint_printk_mutex);
 	save_tracepoint_printk = tracepoint_printk;
 
 	ret = proc_dointvec(table, write, buffer, lenp, ppos);
@@ -2829,15 +2820,12 @@ int tracepoint_printk_sysctl(const struct ctl_table *table, int write,
 		tracepoint_printk = 0;
 
 	if (save_tracepoint_printk == tracepoint_printk)
-		goto out;
+		return ret;
 
 	if (tracepoint_printk)
 		static_key_enable(&tracepoint_printk_key.key);
 	else
 		static_key_disable(&tracepoint_printk_key.key);
-
- out:
-	mutex_unlock(&tracepoint_printk_mutex);
 
 	return ret;
 }
@@ -2947,7 +2935,8 @@ struct ftrace_stacks {
 static DEFINE_PER_CPU(struct ftrace_stacks, ftrace_stacks);
 static DEFINE_PER_CPU(int, ftrace_stack_reserve);
 
-static void __ftrace_trace_stack(struct trace_buffer *buffer,
+static void __ftrace_trace_stack(struct trace_array *tr,
+				 struct trace_buffer *buffer,
 				 unsigned int trace_ctx,
 				 int skip, struct pt_regs *regs)
 {
@@ -2994,6 +2983,20 @@ static void __ftrace_trace_stack(struct trace_buffer *buffer,
 		nr_entries = stack_trace_save(fstack->calls, size, skip);
 	}
 
+#ifdef CONFIG_DYNAMIC_FTRACE
+	/* Mark entry of stack trace as trampoline code */
+	if (tr->ops && tr->ops->trampoline) {
+		unsigned long tramp_start = tr->ops->trampoline;
+		unsigned long tramp_end = tramp_start + tr->ops->trampoline_size;
+		unsigned long *calls = fstack->calls;
+
+		for (int i = 0; i < nr_entries; i++) {
+			if (calls[i] >= tramp_start && calls[i] < tramp_end)
+				calls[i] = FTRACE_TRAMPOLINE_MARKER;
+		}
+	}
+#endif
+
 	event = __trace_buffer_lock_reserve(buffer, TRACE_STACK,
 				    struct_size(entry, caller, nr_entries),
 				    trace_ctx);
@@ -3024,7 +3027,7 @@ static inline void ftrace_trace_stack(struct trace_array *tr,
 	if (!(tr->trace_flags & TRACE_ITER_STACKTRACE))
 		return;
 
-	__ftrace_trace_stack(buffer, trace_ctx, skip, regs);
+	__ftrace_trace_stack(tr, buffer, trace_ctx, skip, regs);
 }
 
 void __trace_stack(struct trace_array *tr, unsigned int trace_ctx,
@@ -3033,7 +3036,7 @@ void __trace_stack(struct trace_array *tr, unsigned int trace_ctx,
 	struct trace_buffer *buffer = tr->array_buffer.buffer;
 
 	if (rcu_is_watching()) {
-		__ftrace_trace_stack(buffer, trace_ctx, skip, NULL);
+		__ftrace_trace_stack(tr, buffer, trace_ctx, skip, NULL);
 		return;
 	}
 
@@ -3050,7 +3053,7 @@ void __trace_stack(struct trace_array *tr, unsigned int trace_ctx,
 		return;
 
 	ct_irq_enter_irqson();
-	__ftrace_trace_stack(buffer, trace_ctx, skip, NULL);
+	__ftrace_trace_stack(tr, buffer, trace_ctx, skip, NULL);
 	ct_irq_exit_irqson();
 }
 
@@ -3067,8 +3070,8 @@ void trace_dump_stack(int skip)
 	/* Skip 1 to skip this function. */
 	skip++;
 #endif
-	__ftrace_trace_stack(printk_trace->array_buffer.buffer,
-			     tracing_gen_ctx(), skip, NULL);
+	__ftrace_trace_stack(printk_trace, printk_trace->array_buffer.buffer,
+				tracing_gen_ctx(), skip, NULL);
 }
 EXPORT_SYMBOL_GPL(trace_dump_stack);
 
@@ -3345,10 +3348,9 @@ out_nobuffer:
 }
 EXPORT_SYMBOL_GPL(trace_vbprintk);
 
-__printf(3, 0)
-static int
-__trace_array_vprintk(struct trace_buffer *buffer,
-		      unsigned long ip, const char *fmt, va_list args)
+static __printf(3, 0)
+int __trace_array_vprintk(struct trace_buffer *buffer,
+			  unsigned long ip, const char *fmt, va_list args)
 {
 	struct trace_event_call *call = &event_print;
 	struct ring_buffer_event *event;
@@ -3401,7 +3403,6 @@ out_nobuffer:
 	return len;
 }
 
-__printf(3, 0)
 int trace_array_vprintk(struct trace_array *tr,
 			unsigned long ip, const char *fmt, va_list args)
 {
@@ -3431,7 +3432,6 @@ int trace_array_vprintk(struct trace_array *tr,
  * Note, trace_array_init_printk() must be called on @tr before this
  * can be used.
  */
-__printf(3, 0)
 int trace_array_printk(struct trace_array *tr,
 		       unsigned long ip, const char *fmt, ...)
 {
@@ -3476,7 +3476,6 @@ int trace_array_init_printk(struct trace_array *tr)
 }
 EXPORT_SYMBOL_GPL(trace_array_init_printk);
 
-__printf(3, 4)
 int trace_array_printk_buf(struct trace_buffer *buffer,
 			   unsigned long ip, const char *fmt, ...)
 {
@@ -3492,7 +3491,6 @@ int trace_array_printk_buf(struct trace_buffer *buffer,
 	return ret;
 }
 
-__printf(2, 0)
 int trace_vprintk(unsigned long ip, const char *fmt, va_list args)
 {
 	return trace_array_vprintk(printk_trace, ip, fmt, args);
@@ -3618,16 +3616,11 @@ char *trace_iter_expand_format(struct trace_iterator *iter)
 }
 
 /* Returns true if the string is safe to dereference from an event */
-static bool trace_safe_str(struct trace_iterator *iter, const char *str,
-			   bool star, int len)
+static bool trace_safe_str(struct trace_iterator *iter, const char *str)
 {
 	unsigned long addr = (unsigned long)str;
 	struct trace_event *trace_event;
 	struct trace_event_call *event;
-
-	/* Ignore strings with no length */
-	if (star && !len)
-		return true;
 
 	/* OK if part of the event data */
 	if ((addr >= (unsigned long)iter->ent) &&
@@ -3668,181 +3661,69 @@ static bool trace_safe_str(struct trace_iterator *iter, const char *str,
 	return false;
 }
 
-static DEFINE_STATIC_KEY_FALSE(trace_no_verify);
-
-static int test_can_verify_check(const char *fmt, ...)
-{
-	char buf[16];
-	va_list ap;
-	int ret;
-
-	/*
-	 * The verifier is dependent on vsnprintf() modifies the va_list
-	 * passed to it, where it is sent as a reference. Some architectures
-	 * (like x86_32) passes it by value, which means that vsnprintf()
-	 * does not modify the va_list passed to it, and the verifier
-	 * would then need to be able to understand all the values that
-	 * vsnprintf can use. If it is passed by value, then the verifier
-	 * is disabled.
-	 */
-	va_start(ap, fmt);
-	vsnprintf(buf, 16, "%d", ap);
-	ret = va_arg(ap, int);
-	va_end(ap);
-
-	return ret;
-}
-
-static void test_can_verify(void)
-{
-	if (!test_can_verify_check("%d %d", 0, 1)) {
-		pr_info("trace event string verifier disabled\n");
-		static_branch_inc(&trace_no_verify);
-	}
-}
-
 /**
- * trace_check_vprintf - Check dereferenced strings while writing to the seq buffer
+ * ignore_event - Check dereferenced fields while writing to the seq buffer
  * @iter: The iterator that holds the seq buffer and the event being printed
- * @fmt: The format used to print the event
- * @ap: The va_list holding the data to print from @fmt.
  *
- * This writes the data into the @iter->seq buffer using the data from
- * @fmt and @ap. If the format has a %s, then the source of the string
- * is examined to make sure it is safe to print, otherwise it will
- * warn and print "[UNSAFE MEMORY]" in place of the dereferenced string
- * pointer.
+ * At boot up, test_event_printk() will flag any event that dereferences
+ * a string with "%s" that does exist in the ring buffer. It may still
+ * be valid, as the string may point to a static string in the kernel
+ * rodata that never gets freed. But if the string pointer is pointing
+ * to something that was allocated, there's a chance that it can be freed
+ * by the time the user reads the trace. This would cause a bad memory
+ * access by the kernel and possibly crash the system.
+ *
+ * This function will check if the event has any fields flagged as needing
+ * to be checked at runtime and perform those checks.
+ *
+ * If it is found that a field is unsafe, it will write into the @iter->seq
+ * a message stating what was found to be unsafe.
+ *
+ * @return: true if the event is unsafe and should be ignored,
+ *          false otherwise.
  */
-void trace_check_vprintf(struct trace_iterator *iter, const char *fmt,
-			 va_list ap)
+bool ignore_event(struct trace_iterator *iter)
 {
-	long text_delta = 0;
-	long data_delta = 0;
-	const char *p = fmt;
-	const char *str;
-	bool good;
-	int i, j;
+	struct ftrace_event_field *field;
+	struct trace_event *trace_event;
+	struct trace_event_call *event;
+	struct list_head *head;
+	struct trace_seq *seq;
+	const void *ptr;
 
-	if (WARN_ON_ONCE(!fmt))
-		return;
+	trace_event = ftrace_find_event(iter->ent->type);
 
-	if (static_branch_unlikely(&trace_no_verify))
-		goto print;
+	seq = &iter->seq;
 
-	/*
-	 * When the kernel is booted with the tp_printk command line
-	 * parameter, trace events go directly through to printk().
-	 * It also is checked by this function, but it does not
-	 * have an associated trace_array (tr) for it.
-	 */
-	if (iter->tr) {
-		text_delta = iter->tr->text_delta;
-		data_delta = iter->tr->data_delta;
+	if (!trace_event) {
+		trace_seq_printf(seq, "EVENT ID %d NOT FOUND?\n", iter->ent->type);
+		return true;
 	}
 
-	/* Don't bother checking when doing a ftrace_dump() */
-	if (iter->fmt == static_fmt_buf)
-		goto print;
+	event = container_of(trace_event, struct trace_event_call, event);
+	if (!(event->flags & TRACE_EVENT_FL_TEST_STR))
+		return false;
 
-	while (*p) {
-		bool star = false;
-		int len = 0;
+	head = trace_get_fields(event);
+	if (!head) {
+		trace_seq_printf(seq, "FIELDS FOR EVENT '%s' NOT FOUND?\n",
+				 trace_event_name(event));
+		return true;
+	}
 
-		j = 0;
+	/* Offsets are from the iter->ent that points to the raw event */
+	ptr = iter->ent;
 
-		/*
-		 * We only care about %s and variants
-		 * as well as %p[sS] if delta is non-zero
-		 */
-		for (i = 0; p[i]; i++) {
-			if (i + 1 >= iter->fmt_size) {
-				/*
-				 * If we can't expand the copy buffer,
-				 * just print it.
-				 */
-				if (!trace_iter_expand_format(iter))
-					goto print;
-			}
+	list_for_each_entry(field, head, link) {
+		const char *str;
+		bool good;
 
-			if (p[i] == '\\' && p[i+1]) {
-				i++;
-				continue;
-			}
-			if (p[i] == '%') {
-				/* Need to test cases like %08.*s */
-				for (j = 1; p[i+j]; j++) {
-					if (isdigit(p[i+j]) ||
-					    p[i+j] == '.')
-						continue;
-					if (p[i+j] == '*') {
-						star = true;
-						continue;
-					}
-					break;
-				}
-				if (p[i+j] == 's')
-					break;
-
-				if (text_delta && p[i+1] == 'p' &&
-				    ((p[i+2] == 's' || p[i+2] == 'S')))
-					break;
-
-				star = false;
-			}
-			j = 0;
-		}
-		/* If no %s found then just print normally */
-		if (!p[i])
-			break;
-
-		/* Copy up to the %s, and print that */
-		strncpy(iter->fmt, p, i);
-		iter->fmt[i] = '\0';
-		trace_seq_vprintf(&iter->seq, iter->fmt, ap);
-
-		/* Add delta to %pS pointers */
-		if (p[i+1] == 'p') {
-			unsigned long addr;
-			char fmt[4];
-
-			fmt[0] = '%';
-			fmt[1] = 'p';
-			fmt[2] = p[i+2]; /* Either %ps or %pS */
-			fmt[3] = '\0';
-
-			addr = va_arg(ap, unsigned long);
-			addr += text_delta;
-			trace_seq_printf(&iter->seq, fmt, (void *)addr);
-
-			p += i + 3;
+		if (!field->needs_test)
 			continue;
-		}
 
-		/*
-		 * If iter->seq is full, the above call no longer guarantees
-		 * that ap is in sync with fmt processing, and further calls
-		 * to va_arg() can return wrong positional arguments.
-		 *
-		 * Ensure that ap is no longer used in this case.
-		 */
-		if (iter->seq.full) {
-			p = "";
-			break;
-		}
+		str = *(const char **)(ptr + field->offset);
 
-		if (star)
-			len = va_arg(ap, int);
-
-		/* The ap now points to the string data of the %s */
-		str = va_arg(ap, const char *);
-
-		good = trace_safe_str(iter, str, star, len);
-
-		/* Could be from the last boot */
-		if (data_delta && !good) {
-			str += data_delta;
-			good = trace_safe_str(iter, str, star, len);
-		}
+		good = trace_safe_str(iter, str);
 
 		/*
 		 * If you hit this warning, it is likely that the
@@ -3853,44 +3734,14 @@ void trace_check_vprintf(struct trace_iterator *iter, const char *fmt,
 		 * instead. See samples/trace_events/trace-events-sample.h
 		 * for reference.
 		 */
-		if (WARN_ONCE(!good, "fmt: '%s' current_buffer: '%s'",
-			      fmt, seq_buf_str(&iter->seq.seq))) {
-			int ret;
-
-			/* Try to safely read the string */
-			if (star) {
-				if (len + 1 > iter->fmt_size)
-					len = iter->fmt_size - 1;
-				if (len < 0)
-					len = 0;
-				ret = copy_from_kernel_nofault(iter->fmt, str, len);
-				iter->fmt[len] = 0;
-				star = false;
-			} else {
-				ret = strncpy_from_kernel_nofault(iter->fmt, str,
-								  iter->fmt_size);
-			}
-			if (ret < 0)
-				trace_seq_printf(&iter->seq, "(0x%px)", str);
-			else
-				trace_seq_printf(&iter->seq, "(0x%px:%s)",
-						 str, iter->fmt);
-			str = "[UNSAFE-MEMORY]";
-			strcpy(iter->fmt, "%s");
-		} else {
-			strncpy(iter->fmt, p + i, j + 1);
-			iter->fmt[j+1] = '\0';
+		if (WARN_ONCE(!good, "event '%s' has unsafe pointer field '%s'",
+			      trace_event_name(event), field->name)) {
+			trace_seq_printf(seq, "EVENT %s: HAS UNSAFE POINTER FIELD '%s'\n",
+					 trace_event_name(event), field->name);
+			return true;
 		}
-		if (star)
-			trace_seq_printf(&iter->seq, iter->fmt, len, str);
-		else
-			trace_seq_printf(&iter->seq, iter->fmt, str);
-
-		p += i + j + 1;
 	}
- print:
-	if (*p)
-		trace_seq_vprintf(&iter->seq, p, ap);
+	return false;
 }
 
 const char *trace_event_format(struct trace_iterator *iter, const char *fmt)
@@ -4360,6 +4211,15 @@ static enum print_line_t print_trace_fmt(struct trace_iterator *iter)
 	if (event) {
 		if (tr->trace_flags & TRACE_ITER_FIELDS)
 			return print_event_fields(iter, event);
+		/*
+		 * For TRACE_EVENT() events, the print_fmt is not
+		 * safe to use if the array has delta offsets
+		 * Force printing via the fields.
+		 */
+		if ((tr->text_delta) &&
+		    event->type > __TRACE_LAST_TYPE)
+			return print_event_fields(iter, event);
+
 		return event->funcs->trace(iter, sym_flags, event);
 	}
 
@@ -4793,21 +4653,15 @@ __tracing_open(struct inode *inode, struct file *file, bool snapshot)
 	if (iter->cpu_file == RING_BUFFER_ALL_CPUS) {
 		for_each_tracing_cpu(cpu) {
 			iter->buffer_iter[cpu] =
-				ring_buffer_read_prepare(iter->array_buffer->buffer,
-							 cpu, GFP_KERNEL);
-		}
-		ring_buffer_read_prepare_sync();
-		for_each_tracing_cpu(cpu) {
-			ring_buffer_read_start(iter->buffer_iter[cpu]);
+				ring_buffer_read_start(iter->array_buffer->buffer,
+						       cpu, GFP_KERNEL);
 			tracing_iter_reset(iter, cpu);
 		}
 	} else {
 		cpu = iter->cpu_file;
 		iter->buffer_iter[cpu] =
-			ring_buffer_read_prepare(iter->array_buffer->buffer,
-						 cpu, GFP_KERNEL);
-		ring_buffer_read_prepare_sync();
-		ring_buffer_read_start(iter->buffer_iter[cpu]);
+			ring_buffer_read_start(iter->array_buffer->buffer,
+					       cpu, GFP_KERNEL);
 		tracing_iter_reset(iter, cpu);
 	}
 
@@ -5232,6 +5086,9 @@ tracing_cpumask_write(struct file *filp, const char __user *ubuf,
 	cpumask_var_t tracing_cpumask_new;
 	int err;
 
+	if (count == 0 || count > KMALLOC_MAX_SIZE)
+		return -EINVAL;
+
 	if (!zalloc_cpumask_var(&tracing_cpumask_new, GFP_KERNEL))
 		return -ENOMEM;
 
@@ -5268,7 +5125,8 @@ static int tracing_trace_options_show(struct seq_file *m, void *v)
 	u32 tracer_flags;
 	int i;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
+
 	tracer_flags = tr->current_trace->flags->val;
 	trace_opts = tr->current_trace->flags->opts;
 
@@ -5285,7 +5143,6 @@ static int tracing_trace_options_show(struct seq_file *m, void *v)
 		else
 			seq_printf(m, "no%s\n", trace_opts[i].name);
 	}
-	mutex_unlock(&trace_types_lock);
 
 	return 0;
 }
@@ -5950,7 +5807,7 @@ trace_insert_eval_map_file(struct module *mod, struct trace_eval_map **start,
 		return;
 	}
 
-	mutex_lock(&trace_eval_mutex);
+	guard(mutex)(&trace_eval_mutex);
 
 	if (!trace_eval_maps)
 		trace_eval_maps = map_array;
@@ -5974,8 +5831,6 @@ trace_insert_eval_map_file(struct module *mod, struct trace_eval_map **start,
 		map_array++;
 	}
 	memset(map_array, 0, sizeof(*map_array));
-
-	mutex_unlock(&trace_eval_mutex);
 }
 
 static void trace_create_eval_file(struct dentry *d_tracer)
@@ -6137,32 +5992,164 @@ static int __tracing_resize_ring_buffer(struct trace_array *tr,
 ssize_t tracing_resize_ring_buffer(struct trace_array *tr,
 				  unsigned long size, int cpu_id)
 {
-	int ret;
-
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 
 	if (cpu_id != RING_BUFFER_ALL_CPUS) {
 		/* make sure, this cpu is enabled in the mask */
-		if (!cpumask_test_cpu(cpu_id, tracing_buffer_mask)) {
-			ret = -EINVAL;
-			goto out;
-		}
+		if (!cpumask_test_cpu(cpu_id, tracing_buffer_mask))
+			return -EINVAL;
 	}
 
-	ret = __tracing_resize_ring_buffer(tr, size, cpu_id);
-	if (ret < 0)
-		ret = -ENOMEM;
-
-out:
-	mutex_unlock(&trace_types_lock);
-
-	return ret;
+	return __tracing_resize_ring_buffer(tr, size, cpu_id);
 }
+
+struct trace_mod_entry {
+	unsigned long	mod_addr;
+	char		mod_name[MODULE_NAME_LEN];
+};
+
+struct trace_scratch {
+	unsigned int		clock_id;
+	unsigned long		text_addr;
+	unsigned long		nr_entries;
+	struct trace_mod_entry	entries[];
+};
+
+static DEFINE_MUTEX(scratch_mutex);
+
+static int cmp_mod_entry(const void *key, const void *pivot)
+{
+	unsigned long addr = (unsigned long)key;
+	const struct trace_mod_entry *ent = pivot;
+
+	if (addr >= ent[0].mod_addr && addr < ent[1].mod_addr)
+		return 0;
+	else
+		return addr - ent->mod_addr;
+}
+
+/* For KMI fixup, accessors to module_delta which is stored at data_delta. */
+static struct trace_module_delta *
+trace_array_get_module_delta(struct trace_array *tr)
+{
+	return (struct trace_module_delta *)READ_ONCE(tr->data_delta);
+}
+
+static void
+trace_array_set_module_delta(struct trace_array *tr, struct trace_module_delta *delta)
+{
+	WRITE_ONCE(tr->data_delta, *(long *)&delta);
+}
+
+static struct trace_scratch *trace_array_scratch(struct trace_array *tr, unsigned int *size)
+{
+	if (!tr->range_addr_start || !tr->range_addr_size)
+		return NULL;
+	return (struct trace_scratch *)ring_buffer_meta_scratch(tr->array_buffer.buffer, size);
+}
+
+/**
+ * trace_adjust_address() - Adjust prev boot address to current address.
+ * @tr: Persistent ring buffer's trace_array.
+ * @addr: Address in @tr which is adjusted.
+ */
+unsigned long trace_adjust_address(struct trace_array *tr, unsigned long addr)
+{
+	struct trace_module_delta *module_delta;
+	struct trace_scratch *tscratch;
+	struct trace_mod_entry *entry;
+	unsigned long raddr;
+	int idx = 0, nr_entries;
+
+	/* If we don't have last boot delta, return the address */
+	if (!(tr->flags & TRACE_ARRAY_FL_LAST_BOOT))
+		return addr;
+
+	/* module_delta must be protected by rcu. */
+	guard(rcu)();
+	tscratch = trace_array_scratch(tr, NULL);
+	/* if there is no tscrach, module_delta must be NULL. */
+	module_delta = trace_array_get_module_delta(tr);
+	if (!module_delta || !tscratch->nr_entries ||
+	    tscratch->entries[0].mod_addr > addr) {
+		raddr = addr + tr->text_delta;
+		return __is_kernel(raddr) || is_kernel_core_data(raddr) ||
+			is_kernel_rodata(raddr) ? raddr : addr;
+	}
+
+	/* Note that entries must be sorted. */
+	nr_entries = tscratch->nr_entries;
+	if (nr_entries == 1 ||
+	    tscratch->entries[nr_entries - 1].mod_addr < addr)
+		idx = nr_entries - 1;
+	else {
+		entry = __inline_bsearch((void *)addr,
+				tscratch->entries,
+				nr_entries - 1,
+				sizeof(tscratch->entries[0]),
+				cmp_mod_entry);
+		if (entry)
+			idx = entry - tscratch->entries;
+	}
+
+	return addr + module_delta->delta[idx];
+}
+
+#ifdef CONFIG_MODULES
+static int save_mod(struct module *mod, void *data)
+{
+	struct trace_array *tr = data;
+	struct trace_scratch *tscratch;
+	struct trace_mod_entry *entry;
+	unsigned int size;
+
+	tscratch = trace_array_scratch(tr, &size);
+	if (!tscratch)
+		return -1;
+
+	if (struct_size(tscratch, entries, tscratch->nr_entries + 1) > size)
+		return -1;
+
+	entry = &tscratch->entries[tscratch->nr_entries];
+
+	tscratch->nr_entries++;
+
+	entry->mod_addr = (unsigned long)mod->mem[MOD_TEXT].base;
+	strscpy(entry->mod_name, mod->name);
+
+	return 0;
+}
+#else
+static int save_mod(struct module *mod, void *data)
+{
+	return 0;
+}
+#endif
 
 static void update_last_data(struct trace_array *tr)
 {
-	if (!tr->text_delta && !tr->data_delta)
+	struct trace_module_delta *module_delta;
+	struct trace_scratch *tscratch = trace_array_scratch(tr, NULL);
+
+	if (!(tr->flags & TRACE_ARRAY_FL_BOOT))
 		return;
+
+	if (!(tr->flags & TRACE_ARRAY_FL_LAST_BOOT))
+		return;
+
+	/* Only if the buffer has previous boot data clear and update it. */
+	tr->flags &= ~TRACE_ARRAY_FL_LAST_BOOT;
+
+	/* Reset the module list and reload them */
+	if (tscratch) {
+		tscratch->clock_id = tr->clock_id;
+		memset(tscratch->entries, 0,
+		       flex_array_size(tscratch, entries, tscratch->nr_entries));
+		tscratch->nr_entries = 0;
+
+		guard(mutex)(&scratch_mutex);
+		module_for_each_mod(save_mod, tr);
+	}
 
 	/*
 	 * Need to clear all CPU buffers as there cannot be events
@@ -6174,7 +6161,16 @@ static void update_last_data(struct trace_array *tr)
 
 	/* Using current data now */
 	tr->text_delta = 0;
-	tr->data_delta = 0;
+
+	if (!tscratch)
+		return;
+
+	module_delta = trace_array_get_module_delta(tr);
+	trace_array_set_module_delta(tr, NULL);
+	kfree_rcu(module_delta, rcu);
+
+	/* Set the persistent ring buffer meta data to this address */
+	tscratch->text_addr = (unsigned long)_text;
 }
 
 /**
@@ -6247,9 +6243,9 @@ int tracing_set_tracer(struct trace_array *tr, const char *buf)
 #ifdef CONFIG_TRACER_MAX_TRACE
 	bool had_max_tr;
 #endif
-	int ret = 0;
+	int ret;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 
 	update_last_data(tr);
 
@@ -6257,7 +6253,7 @@ int tracing_set_tracer(struct trace_array *tr, const char *buf)
 		ret = __tracing_resize_ring_buffer(tr, trace_buf_size,
 						RING_BUFFER_ALL_CPUS);
 		if (ret < 0)
-			goto out;
+			return ret;
 		ret = 0;
 	}
 
@@ -6265,43 +6261,37 @@ int tracing_set_tracer(struct trace_array *tr, const char *buf)
 		if (strcmp(t->name, buf) == 0)
 			break;
 	}
-	if (!t) {
-		ret = -EINVAL;
-		goto out;
-	}
+	if (!t)
+		return -EINVAL;
+
 	if (t == tr->current_trace)
-		goto out;
+		return 0;
 
 #ifdef CONFIG_TRACER_SNAPSHOT
 	if (t->use_max_tr) {
 		local_irq_disable();
 		arch_spin_lock(&tr->max_lock);
-		if (tr->cond_snapshot)
-			ret = -EBUSY;
+		ret = tr->cond_snapshot ? -EBUSY : 0;
 		arch_spin_unlock(&tr->max_lock);
 		local_irq_enable();
 		if (ret)
-			goto out;
+			return ret;
 	}
 #endif
 	/* Some tracers won't work on kernel command line */
 	if (system_state < SYSTEM_RUNNING && t->noboot) {
 		pr_warn("Tracer '%s' is not allowed on command line, ignored\n",
 			t->name);
-		goto out;
+		return 0;
 	}
 
 	/* Some tracers are only allowed for the top level buffer */
-	if (!trace_ok_for_array(t, tr)) {
-		ret = -EINVAL;
-		goto out;
-	}
+	if (!trace_ok_for_array(t, tr))
+		return -EINVAL;
 
 	/* If trace pipe files are being read, we can't change the tracer */
-	if (tr->trace_ref) {
-		ret = -EBUSY;
-		goto out;
-	}
+	if (tr->trace_ref)
+		return -EBUSY;
 
 	trace_branch_disable();
 
@@ -6332,7 +6322,7 @@ int tracing_set_tracer(struct trace_array *tr, const char *buf)
 	if (!had_max_tr && t->use_max_tr) {
 		ret = tracing_arm_snapshot_locked(tr);
 		if (ret)
-			goto out;
+			return ret;
 	}
 #else
 	tr->current_trace = &nop_trace;
@@ -6345,17 +6335,15 @@ int tracing_set_tracer(struct trace_array *tr, const char *buf)
 			if (t->use_max_tr)
 				tracing_disarm_snapshot(tr);
 #endif
-			goto out;
+			return ret;
 		}
 	}
 
 	tr->current_trace = t;
 	tr->current_trace->enabled++;
 	trace_branch_enable(tr);
- out:
-	mutex_unlock(&trace_types_lock);
 
-	return ret;
+	return 0;
 }
 
 static ssize_t
@@ -6433,22 +6421,18 @@ tracing_thresh_write(struct file *filp, const char __user *ubuf,
 	struct trace_array *tr = filp->private_data;
 	int ret;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 	ret = tracing_nsecs_write(&tracing_thresh, ubuf, cnt, ppos);
 	if (ret < 0)
-		goto out;
+		return ret;
 
 	if (tr->current_trace->update_thresh) {
 		ret = tr->current_trace->update_thresh(tr);
 		if (ret < 0)
-			goto out;
+			return ret;
 	}
 
-	ret = cnt;
-out:
-	mutex_unlock(&trace_types_lock);
-
-	return ret;
+	return cnt;
 }
 
 #ifdef CONFIG_TRACER_MAX_TRACE
@@ -6652,6 +6636,22 @@ static int tracing_wait_pipe(struct file *filp)
 	return 1;
 }
 
+static bool update_last_data_if_empty(struct trace_array *tr)
+{
+	if (!(tr->flags & TRACE_ARRAY_FL_LAST_BOOT))
+		return false;
+
+	if (!ring_buffer_empty(tr->array_buffer.buffer))
+		return false;
+
+	/*
+	 * If the buffer contains the last boot data and all per-cpu
+	 * buffers are empty, reset it from the kernel side.
+	 */
+	update_last_data(tr);
+	return true;
+}
+
 /*
  * Consumer reader.
  */
@@ -6667,31 +6667,32 @@ tracing_read_pipe(struct file *filp, char __user *ubuf,
 	 * This is just a matter of traces coherency, the ring buffer itself
 	 * is protected.
 	 */
-	mutex_lock(&iter->mutex);
+	guard(mutex)(&iter->mutex);
 
 	/* return any leftover data */
 	sret = trace_seq_to_user(&iter->seq, ubuf, cnt);
 	if (sret != -EBUSY)
-		goto out;
+		return sret;
 
 	trace_seq_init(&iter->seq);
 
 	if (iter->trace->read) {
 		sret = iter->trace->read(iter, filp, ubuf, cnt, ppos);
 		if (sret)
-			goto out;
+			return sret;
 	}
 
 waitagain:
+	if (update_last_data_if_empty(iter->tr))
+		return 0;
+
 	sret = tracing_wait_pipe(filp);
 	if (sret <= 0)
-		goto out;
+		return sret;
 
 	/* stop when tracing is finished */
-	if (trace_empty(iter)) {
-		sret = 0;
-		goto out;
-	}
+	if (trace_empty(iter))
+		return 0;
 
 	if (cnt >= TRACE_SEQ_BUFFER_SIZE)
 		cnt = TRACE_SEQ_BUFFER_SIZE - 1;
@@ -6754,9 +6755,6 @@ waitagain:
 	 */
 	if (sret == -EBUSY)
 		goto waitagain;
-
-out:
-	mutex_unlock(&iter->mutex);
 
 	return sret;
 }
@@ -6870,13 +6868,14 @@ static ssize_t tracing_splice_read_pipe(struct file *filp,
 		/* Copy the data into the page, so we can start over. */
 		ret = trace_seq_to_buffer(&iter->seq,
 					  page_address(spd.pages[i]),
-					  trace_seq_used(&iter->seq));
+					  min((size_t)trace_seq_used(&iter->seq),
+						  (size_t)PAGE_SIZE));
 		if (ret < 0) {
 			__free_page(spd.pages[i]);
 			break;
 		}
 		spd.partial[i].offset = 0;
-		spd.partial[i].len = trace_seq_used(&iter->seq);
+		spd.partial[i].len = ret;
 
 		trace_seq_init(&iter->seq);
 	}
@@ -7000,19 +6999,102 @@ tracing_total_entries_read(struct file *filp, char __user *ubuf,
 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
 }
 
-static ssize_t
-tracing_last_boot_read(struct file *filp, char __user *ubuf, size_t cnt, loff_t *ppos)
+#define LAST_BOOT_HEADER ((void *)1)
+
+static void *l_next(struct seq_file *m, void *v, loff_t *pos)
 {
-	struct trace_array *tr = filp->private_data;
-	struct seq_buf seq;
-	char buf[64];
+	struct trace_array *tr = m->private;
+	struct trace_scratch *tscratch = trace_array_scratch(tr, NULL);
+	unsigned int index = *pos;
 
-	seq_buf_init(&seq, buf, 64);
+	(*pos)++;
 
-	seq_buf_printf(&seq, "text delta:\t%ld\n", tr->text_delta);
-	seq_buf_printf(&seq, "data delta:\t%ld\n", tr->data_delta);
+	if (*pos == 1)
+		return LAST_BOOT_HEADER;
 
-	return simple_read_from_buffer(ubuf, cnt, ppos, buf, seq_buf_used(&seq));
+	/* Only show offsets of the last boot data */
+	if (!tscratch || !(tr->flags & TRACE_ARRAY_FL_LAST_BOOT))
+		return NULL;
+
+	/* *pos 0 is for the header, 1 is for the first module */
+	index--;
+
+	if (index >= tscratch->nr_entries)
+		return NULL;
+
+	return &tscratch->entries[index];
+}
+
+static void *l_start(struct seq_file *m, loff_t *pos)
+{
+	mutex_lock(&scratch_mutex);
+
+	return l_next(m, NULL, pos);
+}
+
+static void l_stop(struct seq_file *m, void *p)
+{
+	mutex_unlock(&scratch_mutex);
+}
+
+static void show_last_boot_header(struct seq_file *m, struct trace_array *tr)
+{
+	struct trace_scratch *tscratch = trace_array_scratch(tr, NULL);
+
+	/*
+	 * Do not leak KASLR address. This only shows the KASLR address of
+	 * the last boot. When the ring buffer is started, the LAST_BOOT
+	 * flag gets cleared, and this should only report "current".
+	 * Otherwise it shows the KASLR address from the previous boot which
+	 * should not be the same as the current boot.
+	 */
+	if (tscratch && (tr->flags & TRACE_ARRAY_FL_LAST_BOOT))
+		seq_printf(m, "%lx\t[kernel]\n", tscratch->text_addr);
+	else
+		seq_puts(m, "# Current\n");
+}
+
+static int l_show(struct seq_file *m, void *v)
+{
+	struct trace_array *tr = m->private;
+	struct trace_mod_entry *entry = v;
+
+	if (v == LAST_BOOT_HEADER) {
+		show_last_boot_header(m, tr);
+		return 0;
+	}
+
+	seq_printf(m, "%lx\t%s\n", entry->mod_addr, entry->mod_name);
+	return 0;
+}
+
+static const struct seq_operations last_boot_seq_ops = {
+	.start		= l_start,
+	.next		= l_next,
+	.stop		= l_stop,
+	.show		= l_show,
+};
+
+static int tracing_last_boot_open(struct inode *inode, struct file *file)
+{
+	struct trace_array *tr = inode->i_private;
+	struct seq_file *m;
+	int ret;
+
+	ret = tracing_check_open_get_tr(tr);
+	if (ret)
+		return ret;
+
+	ret = seq_open(file, &last_boot_seq_ops);
+	if (ret) {
+		trace_array_put(tr);
+		return ret;
+	}
+
+	m = file->private_data;
+	m->private = tr;
+
+	return 0;
 }
 
 static int tracing_buffer_meta_open(struct inode *inode, struct file *filp)
@@ -7228,6 +7310,7 @@ static int tracing_clock_show(struct seq_file *m, void *v)
 
 int tracing_set_clock(struct trace_array *tr, const char *clockstr)
 {
+	struct trace_scratch *tscratch = trace_array_scratch(tr, NULL);
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(trace_clocks); i++) {
@@ -7254,6 +7337,9 @@ int tracing_set_clock(struct trace_array *tr, const char *clockstr)
 		ring_buffer_set_clock(tr->max_buffer.buffer, trace_clocks[i].func);
 	tracing_reset_online_cpus(&tr->max_buffer);
 #endif
+
+	if (tscratch && !(tr->flags & TRACE_ARRAY_FL_LAST_BOOT))
+		tscratch->clock_id = i;
 
 	mutex_unlock(&trace_types_lock);
 
@@ -7349,25 +7435,19 @@ u64 tracing_event_time_stamp(struct trace_buffer *buffer, struct ring_buffer_eve
  */
 int tracing_set_filter_buffering(struct trace_array *tr, bool set)
 {
-	int ret = 0;
-
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 
 	if (set && tr->no_filter_buffering_ref++)
-		goto out;
+		return 0;
 
 	if (!set) {
-		if (WARN_ON_ONCE(!tr->no_filter_buffering_ref)) {
-			ret = -EINVAL;
-			goto out;
-		}
+		if (WARN_ON_ONCE(!tr->no_filter_buffering_ref))
+			return -EINVAL;
 
 		--tr->no_filter_buffering_ref;
 	}
- out:
-	mutex_unlock(&trace_types_lock);
 
-	return ret;
+	return 0;
 }
 
 struct ftrace_buffer_info {
@@ -7443,12 +7523,10 @@ tracing_snapshot_write(struct file *filp, const char __user *ubuf, size_t cnt,
 	if (ret)
 		return ret;
 
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&trace_types_lock);
 
-	if (tr->current_trace->use_max_tr) {
-		ret = -EBUSY;
-		goto out;
-	}
+	if (tr->current_trace->use_max_tr)
+		return -EBUSY;
 
 	local_irq_disable();
 	arch_spin_lock(&tr->max_lock);
@@ -7457,24 +7535,20 @@ tracing_snapshot_write(struct file *filp, const char __user *ubuf, size_t cnt,
 	arch_spin_unlock(&tr->max_lock);
 	local_irq_enable();
 	if (ret)
-		goto out;
+		return ret;
 
 	switch (val) {
 	case 0:
-		if (iter->cpu_file != RING_BUFFER_ALL_CPUS) {
-			ret = -EINVAL;
-			break;
-		}
+		if (iter->cpu_file != RING_BUFFER_ALL_CPUS)
+			return -EINVAL;
 		if (tr->allocated_snapshot)
 			free_snapshot(tr);
 		break;
 	case 1:
 /* Only allow per-cpu swap if the ring buffer supports it */
 #ifndef CONFIG_RING_BUFFER_ALLOW_SWAP
-		if (iter->cpu_file != RING_BUFFER_ALL_CPUS) {
-			ret = -EINVAL;
-			break;
-		}
+		if (iter->cpu_file != RING_BUFFER_ALL_CPUS)
+			return -EINVAL;
 #endif
 		if (tr->allocated_snapshot)
 			ret = resize_buffer_duplicate_size(&tr->max_buffer,
@@ -7482,7 +7556,7 @@ tracing_snapshot_write(struct file *filp, const char __user *ubuf, size_t cnt,
 
 		ret = tracing_arm_snapshot_locked(tr);
 		if (ret)
-			break;
+			return ret;
 
 		/* Now, we're going to swap */
 		if (iter->cpu_file == RING_BUFFER_ALL_CPUS) {
@@ -7509,8 +7583,7 @@ tracing_snapshot_write(struct file *filp, const char __user *ubuf, size_t cnt,
 		*ppos += cnt;
 		ret = cnt;
 	}
-out:
-	mutex_unlock(&trace_types_lock);
+
 	return ret;
 }
 
@@ -7654,10 +7727,10 @@ static const struct file_operations trace_time_stamp_mode_fops = {
 };
 
 static const struct file_operations last_boot_fops = {
-	.open		= tracing_open_generic_tr,
-	.read		= tracing_last_boot_read,
-	.llseek		= generic_file_llseek,
-	.release	= tracing_release_generic_tr,
+	.open		= tracing_last_boot_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= tracing_seq_release,
 };
 
 #ifdef CONFIG_TRACER_SNAPSHOT
@@ -7896,12 +7969,11 @@ void tracing_log_err(struct trace_array *tr,
 
 	len += sizeof(CMD_PREFIX) + 2 * sizeof("\n") + strlen(cmd) + 1;
 
-	mutex_lock(&tracing_err_log_lock);
+	guard(mutex)(&tracing_err_log_lock);
+
 	err = get_tracing_log_err(tr, len);
-	if (PTR_ERR(err) == -ENOMEM) {
-		mutex_unlock(&tracing_err_log_lock);
+	if (PTR_ERR(err) == -ENOMEM)
 		return;
-	}
 
 	snprintf(err->loc, TRACING_LOG_LOC_MAX, "%s: error: ", loc);
 	snprintf(err->cmd, len, "\n" CMD_PREFIX "%s\n", cmd);
@@ -7912,7 +7984,6 @@ void tracing_log_err(struct trace_array *tr,
 	err->info.ts = local_clock();
 
 	list_add_tail(&err->list, &tr->err_log);
-	mutex_unlock(&tracing_err_log_lock);
 }
 
 static void clear_tracing_err_log(struct trace_array *tr)
@@ -8145,6 +8216,9 @@ tracing_buffers_read(struct file *filp, char __user *ubuf,
 
 	if (ret < 0) {
 		if (trace_empty(iter) && !iter->closed) {
+			if (update_last_data_if_empty(iter->tr))
+				return 0;
+
 			if ((filp->f_flags & O_NONBLOCK))
 				return -EAGAIN;
 
@@ -8472,8 +8546,18 @@ static void tracing_buffers_mmap_close(struct vm_area_struct *vma)
 	put_snapshot_map(iter->tr);
 }
 
+static int tracing_buffers_may_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	/*
+	 * Trace buffer mappings require the complete buffer including
+	 * the meta page. Partial mappings are not supported.
+	 */
+	return -EINVAL;
+}
+
 static const struct vm_operations_struct tracing_buffers_vmops = {
 	.close		= tracing_buffers_mmap_close,
+	.may_split      = tracing_buffers_may_split,
 };
 
 static int tracing_buffers_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -8481,6 +8565,10 @@ static int tracing_buffers_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct ftrace_buffer_info *info = filp->private_data;
 	struct trace_iterator *iter = &info->iter;
 	int ret = 0;
+
+	/* A memmap'ed and backup buffers are not supported for user space mmap */
+	if (iter->tr->flags & (TRACE_ARRAY_FL_MEMMAP | TRACE_ARRAY_FL_VMALLOC))
+		return -ENODEV;
 
 	ret = get_snapshot_map(iter->tr);
 	if (ret)
@@ -8751,12 +8839,12 @@ ftrace_trace_snapshot_callback(struct trace_array *tr, struct ftrace_hash *hash,
  out_reg:
 	ret = tracing_arm_snapshot(tr);
 	if (ret < 0)
-		goto out;
+		return ret;
 
 	ret = register_ftrace_function_probe(glob, tr, ops, count);
 	if (ret < 0)
 		tracing_disarm_snapshot(tr);
- out:
+
 	return ret < 0 ? ret : 0;
 }
 
@@ -9307,6 +9395,7 @@ static ssize_t
 buffer_subbuf_size_write(struct file *filp, const char __user *ubuf,
 			 size_t cnt, loff_t *ppos)
 {
+	unsigned int nr_subpages = __PAGE_SIZE / PAGE_SIZE;
 	struct trace_array *tr = filp->private_data;
 	unsigned long val;
 	int old_order;
@@ -9320,11 +9409,12 @@ buffer_subbuf_size_write(struct file *filp, const char __user *ubuf,
 
 	val *= 1024; /* value passed in is in KB */
 
-	pages = DIV_ROUND_UP(val, PAGE_SIZE);
+	pages = DIV_ROUND_UP(val, __PAGE_SIZE);
+	pages *= nr_subpages;
 	order = fls(pages - 1);
 
 	/* limit between 1 and 128 system pages */
-	if (order < 0 || order > 7)
+	if (order < 0 || order > 7 + get_order(nr_subpages))
 		return -EINVAL;
 
 	/* Do not allow tracing while changing the order of the ring buffer */
@@ -9388,22 +9478,131 @@ static struct dentry *trace_instance_dir;
 static void
 init_tracer_tracefs(struct trace_array *tr, struct dentry *d_tracer);
 
+#ifdef CONFIG_MODULES
+static int make_mod_delta(struct module *mod, void *data)
+{
+	struct trace_module_delta *module_delta;
+	struct trace_scratch *tscratch;
+	struct trace_mod_entry *entry;
+	struct trace_array *tr = data;
+	int i;
+
+	tscratch = trace_array_scratch(tr, NULL);
+	module_delta = trace_array_get_module_delta(tr);
+	for (i = 0; i < tscratch->nr_entries; i++) {
+		entry = &tscratch->entries[i];
+		if (strcmp(mod->name, entry->mod_name))
+			continue;
+		if (mod->state == MODULE_STATE_GOING)
+			module_delta->delta[i] = 0;
+		else
+			module_delta->delta[i] = (unsigned long)mod->mem[MOD_TEXT].base
+						 - entry->mod_addr;
+		break;
+	}
+	return 0;
+}
+#else
+static int make_mod_delta(struct module *mod, void *data)
+{
+	return 0;
+}
+#endif
+
+static int mod_addr_comp(const void *a, const void *b, const void *data)
+{
+	const struct trace_mod_entry *e1 = a;
+	const struct trace_mod_entry *e2 = b;
+
+	return e1->mod_addr > e2->mod_addr ? 1 : -1;
+}
+
+static void setup_trace_scratch(struct trace_array *tr,
+				struct trace_scratch *tscratch, unsigned int size)
+{
+	struct trace_module_delta *module_delta;
+	struct trace_mod_entry *entry;
+	int i, nr_entries;
+
+	if (!tscratch)
+		return;
+
+	if (tscratch->text_addr)
+		tr->text_delta = (unsigned long)_text - tscratch->text_addr;
+
+	if (struct_size(tscratch, entries, tscratch->nr_entries) > size)
+		goto reset;
+
+	/* Check if each module name is a valid string */
+	for (i = 0; i < tscratch->nr_entries; i++) {
+		int n;
+
+		entry = &tscratch->entries[i];
+
+		for (n = 0; n < MODULE_NAME_LEN; n++) {
+			if (entry->mod_name[n] == '\0')
+				break;
+			if (!isprint(entry->mod_name[n]))
+				goto reset;
+		}
+		if (n == MODULE_NAME_LEN)
+			goto reset;
+	}
+
+	/* Sort the entries so that we can find appropriate module from address. */
+	nr_entries = tscratch->nr_entries;
+	sort_r(tscratch->entries, nr_entries, sizeof(struct trace_mod_entry),
+	       mod_addr_comp, NULL, NULL);
+
+	if (IS_ENABLED(CONFIG_MODULES)) {
+		module_delta = kzalloc(struct_size(module_delta, delta, nr_entries), GFP_KERNEL);
+		if (!module_delta) {
+			pr_info("module_delta allocation failed. Not able to decode module address.");
+			goto reset;
+		}
+		init_rcu_head(&module_delta->rcu);
+	} else
+		module_delta = NULL;
+	trace_array_set_module_delta(tr, module_delta);
+
+	/* Scan modules to make text delta for modules. */
+	module_for_each_mod(make_mod_delta, tr);
+
+	/* Set trace_clock as the same of the previous boot. */
+	if (tscratch->clock_id != tr->clock_id) {
+		if (tscratch->clock_id >= ARRAY_SIZE(trace_clocks) ||
+		    tracing_set_clock(tr, trace_clocks[tscratch->clock_id].name) < 0) {
+			pr_info("the previous trace_clock info is not valid.");
+			goto reset;
+		}
+	}
+	return;
+ reset:
+	/* Invalid trace modules */
+	memset(tscratch, 0, size);
+}
+
 static int
 allocate_trace_buffer(struct trace_array *tr, struct array_buffer *buf, int size)
 {
 	enum ring_buffer_flags rb_flags;
+	struct trace_scratch *tscratch;
+	unsigned int scratch_size = 0;
 
 	rb_flags = tr->trace_flags & TRACE_ITER_OVERWRITE ? RB_FL_OVERWRITE : 0;
 
 	buf->tr = tr;
 
 	if (tr->range_addr_start && tr->range_addr_size) {
-		buf->buffer = ring_buffer_alloc_range(size, rb_flags, 0,
+		/* Add scratch buffer to handle 128 modules */
+		buf->buffer = ring_buffer_alloc_range(size, rb_flags, get_order(__PAGE_SIZE),
 						      tr->range_addr_start,
-						      tr->range_addr_size);
+						      tr->range_addr_size,
+						      struct_size(tscratch, entries, 128));
 
-		ring_buffer_last_boot_delta(buf->buffer,
-					    &tr->text_delta, &tr->data_delta);
+		tscratch = ring_buffer_meta_scratch(buf->buffer, &scratch_size);
+		setup_trace_scratch(tr, tscratch, scratch_size);
+
 		/*
 		 * This is basically the same as a mapped buffer,
 		 * with the same restrictions.
@@ -9468,10 +9667,15 @@ static int allocate_trace_buffers(struct trace_array *tr, int size)
 
 static void free_trace_buffers(struct trace_array *tr)
 {
+	struct trace_module_delta *module_delta;
+
 	if (!tr)
 		return;
 
+	module_delta = trace_array_get_module_delta(tr);
+
 	free_trace_buffer(&tr->array_buffer);
+	kfree(module_delta);
 
 #ifdef CONFIG_TRACER_MAX_TRACE
 	free_trace_buffer(&tr->max_buffer);
@@ -9649,46 +9853,41 @@ static int instance_mkdir(const char *name)
 	struct trace_array *tr;
 	int ret;
 
-	mutex_lock(&event_mutex);
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&event_mutex);
+	guard(mutex)(&trace_types_lock);
 
 	ret = -EEXIST;
 	if (trace_array_find(name))
-		goto out_unlock;
+		return -EEXIST;
 
 	tr = trace_array_create(name);
 
 	ret = PTR_ERR_OR_ZERO(tr);
 
-out_unlock:
-	mutex_unlock(&trace_types_lock);
-	mutex_unlock(&event_mutex);
 	return ret;
 }
 
-static u64 map_pages(u64 start, u64 size)
+static u64 map_pages(unsigned long start, unsigned long size)
 {
-	struct page **pages;
-	phys_addr_t page_start;
-	unsigned int page_count;
-	unsigned int i;
-	void *vaddr;
+	unsigned long vmap_start, vmap_end;
+	struct vm_struct *area;
+	int ret;
 
-	page_count = DIV_ROUND_UP(size, PAGE_SIZE);
-
-	page_start = start;
-	pages = kmalloc_array(page_count, sizeof(struct page *), GFP_KERNEL);
-	if (!pages)
+	area = get_vm_area(size, VM_IOREMAP);
+	if (!area)
 		return 0;
 
-	for (i = 0; i < page_count; i++) {
-		phys_addr_t addr = page_start + i * PAGE_SIZE;
-		pages[i] = pfn_to_page(addr >> PAGE_SHIFT);
-	}
-	vaddr = vmap(pages, page_count, VM_MAP, PAGE_KERNEL);
-	kfree(pages);
+	vmap_start = (unsigned long) area->addr;
+	vmap_end = vmap_start + size;
 
-	return (u64)(unsigned long)vaddr;
+	ret = vmap_page_range(vmap_start, vmap_end,
+			      start, pgprot_nx(PAGE_KERNEL));
+	if (ret < 0) {
+		free_vm_area(area);
+		return 0;
+	}
+
+	return (u64)vmap_start;
 }
 
 /**
@@ -9712,24 +9911,23 @@ struct trace_array *trace_array_get_by_name(const char *name, const char *system
 {
 	struct trace_array *tr;
 
-	mutex_lock(&event_mutex);
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&event_mutex);
+	guard(mutex)(&trace_types_lock);
 
 	list_for_each_entry(tr, &ftrace_trace_arrays, list) {
-		if (tr->name && strcmp(tr->name, name) == 0)
-			goto out_unlock;
+		if (tr->name && strcmp(tr->name, name) == 0) {
+			tr->ref++;
+			return tr;
+		}
 	}
 
 	tr = trace_array_create_systems(name, systems, 0, 0);
 
 	if (IS_ERR(tr))
 		tr = NULL;
-out_unlock:
-	if (tr)
+	else
 		tr->ref++;
 
-	mutex_unlock(&trace_types_lock);
-	mutex_unlock(&event_mutex);
 	return tr;
 }
 EXPORT_SYMBOL_GPL(trace_array_get_by_name);
@@ -9763,6 +9961,14 @@ static int __remove_instance(struct trace_array *tr)
 	free_trace_buffers(tr);
 	clear_tracing_err_log(tr);
 
+	if (tr->range_addr_start) {
+		const char *range_name = reserve_mem_find_name(tr->range_addr_start);
+
+		reserve_mem_release_by_name(range_name);
+	}
+	if (tr->flags & TRACE_ARRAY_FL_VMALLOC)
+		vfree((void *)tr->range_addr_start);
+
 	for (i = 0; i < tr->nr_topts; i++) {
 		kfree(tr->topts[i].topts);
 	}
@@ -9780,48 +9986,36 @@ static int __remove_instance(struct trace_array *tr)
 int trace_array_destroy(struct trace_array *this_tr)
 {
 	struct trace_array *tr;
-	int ret;
 
 	if (!this_tr)
 		return -EINVAL;
 
-	mutex_lock(&event_mutex);
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&event_mutex);
+	guard(mutex)(&trace_types_lock);
 
-	ret = -ENODEV;
 
 	/* Making sure trace array exists before destroying it. */
 	list_for_each_entry(tr, &ftrace_trace_arrays, list) {
-		if (tr == this_tr) {
-			ret = __remove_instance(tr);
-			break;
-		}
+		if (tr == this_tr)
+			return __remove_instance(tr);
 	}
 
-	mutex_unlock(&trace_types_lock);
-	mutex_unlock(&event_mutex);
-
-	return ret;
+	return -ENODEV;
 }
 EXPORT_SYMBOL_GPL(trace_array_destroy);
 
 static int instance_rmdir(const char *name)
 {
 	struct trace_array *tr;
-	int ret;
 
-	mutex_lock(&event_mutex);
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&event_mutex);
+	guard(mutex)(&trace_types_lock);
 
-	ret = -ENODEV;
 	tr = trace_array_find(name);
-	if (tr)
-		ret = __remove_instance(tr);
+	if (!tr)
+		return -ENODEV;
 
-	mutex_unlock(&trace_types_lock);
-	mutex_unlock(&event_mutex);
-
-	return ret;
+	return __remove_instance(tr);
 }
 
 static __init void create_trace_instances(struct dentry *d_tracer)
@@ -9834,19 +10028,16 @@ static __init void create_trace_instances(struct dentry *d_tracer)
 	if (MEM_FAIL(!trace_instance_dir, "Failed to create instances directory\n"))
 		return;
 
-	mutex_lock(&event_mutex);
-	mutex_lock(&trace_types_lock);
+	guard(mutex)(&event_mutex);
+	guard(mutex)(&trace_types_lock);
 
 	list_for_each_entry(tr, &ftrace_trace_arrays, list) {
 		if (!tr->name)
 			continue;
 		if (MEM_FAIL(trace_array_create_dir(tr) < 0,
 			     "Failed to create instance directory\n"))
-			break;
+			return;
 	}
-
-	mutex_unlock(&trace_types_lock);
-	mutex_unlock(&event_mutex);
 }
 
 static void
@@ -10060,7 +10251,7 @@ static void trace_module_remove_evals(struct module *mod)
 	if (!mod->num_trace_evals)
 		return;
 
-	mutex_lock(&trace_eval_mutex);
+	guard(mutex)(&trace_eval_mutex);
 
 	map = trace_eval_maps;
 
@@ -10072,16 +10263,32 @@ static void trace_module_remove_evals(struct module *mod)
 		map = map->tail.next;
 	}
 	if (!map)
-		goto out;
+		return;
 
 	*last = trace_eval_jmp_to_tail(map)->tail.next;
 	kfree(map);
- out:
-	mutex_unlock(&trace_eval_mutex);
 }
 #else
 static inline void trace_module_remove_evals(struct module *mod) { }
 #endif /* CONFIG_TRACE_EVAL_MAP_FILE */
+
+static void trace_module_record(struct module *mod, bool add)
+{
+	struct trace_array *tr;
+	unsigned long flags;
+
+	list_for_each_entry(tr, &ftrace_trace_arrays, list) {
+		flags = tr->flags & (TRACE_ARRAY_FL_BOOT | TRACE_ARRAY_FL_LAST_BOOT);
+		/* Update any persistent trace array that has already been started */
+		if (flags == TRACE_ARRAY_FL_BOOT && add) {
+			guard(mutex)(&scratch_mutex);
+			save_mod(mod, tr);
+		} else if (flags & TRACE_ARRAY_FL_LAST_BOOT) {
+			/* Update delta if the module loaded in previous boot */
+			make_mod_delta(mod, tr);
+		}
+	}
+}
 
 static int trace_module_notify(struct notifier_block *self,
 			       unsigned long val, void *data)
@@ -10091,9 +10298,11 @@ static int trace_module_notify(struct notifier_block *self,
 	switch (val) {
 	case MODULE_STATE_COMING:
 		trace_module_add_evals(mod);
+		trace_module_record(mod, true);
 		break;
 	case MODULE_STATE_GOING:
 		trace_module_remove_evals(mod);
+		trace_module_record(mod, false);
 		break;
 	}
 
@@ -10191,7 +10400,11 @@ static struct notifier_block trace_die_notifier = {
 static int trace_die_panic_handler(struct notifier_block *self,
 				unsigned long ev, void *unused)
 {
-	if (!ftrace_dump_on_oops_enabled())
+	bool ftrace_check = false;
+
+	trace_android_vh_ftrace_oops_enter(&ftrace_check);
+
+	if (!ftrace_dump_on_oops_enabled() || ftrace_check)
 		return NOTIFY_DONE;
 
 	/* The die notifier requires DIE_OOPS to trigger */
@@ -10200,6 +10413,7 @@ static int trace_die_panic_handler(struct notifier_block *self,
 
 	ftrace_dump(DUMP_PARAM);
 
+	trace_android_vh_ftrace_oops_exit(&ftrace_check);
 	return NOTIFY_DONE;
 }
 
@@ -10219,6 +10433,8 @@ static int trace_die_panic_handler(struct notifier_block *self,
 void
 trace_printk_seq(struct trace_seq *s)
 {
+	bool dump_printk = true;
+
 	/* Probably should print a warning here. */
 	if (s->seq.len >= TRACE_MAX_PRINT)
 		s->seq.len = TRACE_MAX_PRINT;
@@ -10234,7 +10450,9 @@ trace_printk_seq(struct trace_seq *s)
 	/* should be zero ended, but we are paranoid. */
 	s->buffer[s->seq.len] = 0;
 
-	printk(KERN_TRACE "%s", s->buffer);
+	trace_android_vh_ftrace_dump_buffer(s, &dump_printk);
+	if (dump_printk)
+		printk(KERN_TRACE "%s", s->buffer);
 
 	trace_seq_init(s);
 }
@@ -10276,6 +10494,9 @@ static void ftrace_dump_one(struct trace_array *tr, enum ftrace_dump_mode dump_m
 	unsigned int old_userobj;
 	unsigned long flags;
 	int cnt = 0, cpu;
+	bool ftrace_check = true;
+	bool ftrace_size_check = false;
+	unsigned long size;
 
 	/*
 	 * Always turn off tracing when we dump.
@@ -10294,12 +10515,17 @@ static void ftrace_dump_one(struct trace_array *tr, enum ftrace_dump_mode dump_m
 
 	for_each_tracing_cpu(cpu) {
 		atomic_inc(&per_cpu_ptr(iter.array_buffer->data, cpu)->disabled);
+		size = ring_buffer_size(iter.array_buffer->buffer, cpu);
+		trace_android_vh_ftrace_size_check(size, &ftrace_size_check);
 	}
 
 	old_userobj = tr->trace_flags & TRACE_ITER_SYM_USEROBJ;
 
 	/* don't look at user memory in panic mode */
 	tr->trace_flags &= ~TRACE_ITER_SYM_USEROBJ;
+
+	if (ftrace_size_check)
+		goto out_enable;
 
 	if (dump_mode == DUMP_ORIG)
 		iter.cpu_file = raw_smp_processor_id();
@@ -10318,6 +10544,14 @@ static void ftrace_dump_one(struct trace_array *tr, enum ftrace_dump_mode dump_m
 	}
 
 	/*
+	 * Ftrace timestmap support two types:
+	 * - ftrace_check = 1, latency format, start with 0 from a specific time.
+	 * - ftrace_check = 0, absolute time format, consistent with kernel time.
+	 * With this vendor hook, we can choose the format from different requirement.
+	 */
+	trace_android_vh_ftrace_format_check(&ftrace_check);
+
+	/*
 	 * We need to stop all tracing on all CPUS to read
 	 * the next buffer. This is a bit expensive, but is
 	 * not done often. We fill all what we can read,
@@ -10325,14 +10559,14 @@ static void ftrace_dump_one(struct trace_array *tr, enum ftrace_dump_mode dump_m
 	 */
 
 	while (!trace_empty(&iter)) {
-
 		if (!cnt)
 			printk(KERN_TRACE "---------------------------------\n");
 
 		cnt++;
 
 		trace_iterator_reset(&iter);
-		iter.iter_flags |= TRACE_FILE_LAT_FMT;
+		if (ftrace_check)
+			iter.iter_flags |= TRACE_FILE_LAT_FMT;
 
 		if (trace_find_next_entry_inc(&iter) != NULL) {
 			int ret;
@@ -10340,10 +10574,10 @@ static void ftrace_dump_one(struct trace_array *tr, enum ftrace_dump_mode dump_m
 			ret = print_trace_line(&iter);
 			if (ret != TRACE_TYPE_NO_CONSUME)
 				trace_consume(&iter);
+
+			trace_printk_seq(&iter.seq);
 		}
 		touch_nmi_watchdog();
-
-		trace_printk_seq(&iter.seq);
 	}
 
 	if (!cnt)
@@ -10351,6 +10585,7 @@ static void ftrace_dump_one(struct trace_array *tr, enum ftrace_dump_mode dump_m
 	else
 		printk(KERN_TRACE "---------------------------------\n");
 
+out_enable:
 	tr->trace_flags |= old_userobj;
 
 	for_each_tracing_cpu(cpu) {
@@ -10539,9 +10774,46 @@ __init static void do_allocate_snapshot(const char *name)
 static inline void do_allocate_snapshot(const char *name) { }
 #endif
 
+__init static int backup_instance_area(const char *backup,
+				       unsigned long *addr, phys_addr_t *size)
+{
+	struct trace_array *backup_tr;
+	void *allocated_vaddr = NULL;
+
+	backup_tr = trace_array_get_by_name(backup, NULL);
+	if (!backup_tr) {
+		pr_warn("Tracing: Instance %s is not found.\n", backup);
+		return -ENOENT;
+	}
+
+	if (!(backup_tr->flags & TRACE_ARRAY_FL_BOOT)) {
+		pr_warn("Tracing: Instance %s is not boot mapped.\n", backup);
+		trace_array_put(backup_tr);
+		return -EINVAL;
+	}
+
+	*size = backup_tr->range_addr_size;
+
+	allocated_vaddr = vzalloc(*size);
+	if (!allocated_vaddr) {
+		pr_warn("Tracing: Failed to allocate memory for copying instance %s (size 0x%lx)\n",
+			backup, (unsigned long)*size);
+		trace_array_put(backup_tr);
+		return -ENOMEM;
+	}
+
+	memcpy(allocated_vaddr,
+		(void *)backup_tr->range_addr_start, (size_t)*size);
+	*addr = (unsigned long)allocated_vaddr;
+
+	trace_array_put(backup_tr);
+	return 0;
+}
+
 __init static void enable_instances(void)
 {
 	struct trace_array *tr;
+	bool memmap_area = false;
 	char *curr_str;
 	char *name;
 	char *str;
@@ -10559,11 +10831,16 @@ __init static void enable_instances(void)
 		bool traceoff = false;
 		char *flag_delim;
 		char *addr_delim;
+		char *rname __free(kfree) = NULL;
+		char *backup;
 
 		tok = strsep(&curr_str, ",");
 
-		flag_delim = strchr(tok, '^');
-		addr_delim = strchr(tok, '@');
+		name = strsep(&tok, "=");
+		backup = tok;
+
+		flag_delim = strchr(name, '^');
+		addr_delim = strchr(name, '@');
 
 		if (addr_delim)
 			*addr_delim++ = '\0';
@@ -10571,7 +10848,10 @@ __init static void enable_instances(void)
 		if (flag_delim)
 			*flag_delim++ = '\0';
 
-		name = tok;
+		if (backup) {
+			if (backup_instance_area(backup, &addr, &size) < 0)
+				continue;
+		}
 
 		if (flag_delim) {
 			char *flag;
@@ -10609,16 +10889,31 @@ __init static void enable_instances(void)
 					name);
 				continue;
 			}
+			memmap_area = true;
 		} else if (tok) {
 			if (!reserve_mem_find_by_name(tok, &start, &size)) {
 				start = 0;
 				pr_warn("Failed to map boot instance %s to %s\n", name, tok);
 				continue;
 			}
+			rname = kstrdup(tok, GFP_KERNEL);
 		}
 
 		if (start) {
-			addr = map_pages(start, size);
+			/* Start and size must be page aligned */
+			if (start & ~PAGE_MASK) {
+				pr_warn("Tracing: mapping start addr %pa is not page aligned\n", &start);
+				continue;
+			}
+			if (size & ~PAGE_MASK) {
+				pr_warn("Tracing: mapping size %pa is not page aligned\n", &size);
+				continue;
+			}
+
+			if (memmap_area)
+				addr = map_pages(start, size);
+			else
+				addr = (unsigned long)phys_to_virt(start);
 			if (addr) {
 				pr_info("Tracing: mapped boot instance %s at physical memory %pa of size 0x%lx\n",
 					name, &start, (unsigned long)size);
@@ -10645,14 +10940,21 @@ __init static void enable_instances(void)
 			update_printk_trace(tr);
 
 		/*
-		 * If start is set, then this is a mapped buffer, and
-		 * cannot be deleted by user space, so keep the reference
-		 * to it.
+		 * memmap'd buffers can not be freed.
 		 */
-		if (start) {
-			tr->flags |= TRACE_ARRAY_FL_BOOT;
+		if (memmap_area) {
+			tr->flags |= TRACE_ARRAY_FL_MEMMAP;
 			tr->ref++;
 		}
+
+		/*
+		 * Backup buffers can be freed but need vfree().
+		 */
+		if (backup)
+			tr->flags |= TRACE_ARRAY_FL_VMALLOC;
+
+		if (start || backup)
+			tr->flags |= TRACE_ARRAY_FL_BOOT | TRACE_ARRAY_FL_LAST_BOOT;
 
 		while ((tok = strsep(&curr_str, ","))) {
 			early_enable_events(tr, tok, true);
@@ -10678,7 +10980,7 @@ __init static int tracer_alloc_buffers(void)
 	BUILD_BUG_ON(TRACE_ITER_LAST_BIT > TRACE_FLAGS_MAX_SIZE);
 
 	if (!alloc_cpumask_var(&tracing_buffer_mask, GFP_KERNEL))
-		goto out;
+		return -ENOMEM;
 
 	if (!alloc_cpumask_var(&global_trace.tracing_cpumask, GFP_KERNEL))
 		goto out_free_buffer_mask;
@@ -10777,8 +11079,6 @@ __init static int tracer_alloc_buffers(void)
 
 	register_snapshot_cmd();
 
-	test_can_verify();
-
 	return 0;
 
 out_free_pipe_cpumask:
@@ -10793,9 +11093,16 @@ out_free_cpumask:
 	free_cpumask_var(global_trace.tracing_cpumask);
 out_free_buffer_mask:
 	free_cpumask_var(tracing_buffer_mask);
-out:
 	return ret;
 }
+
+#ifdef CONFIG_FUNCTION_TRACER
+/* Used to set module cached ftrace filtering at boot up */
+__init struct trace_array *trace_get_global_array(void)
+{
+	return &global_trace;
+}
+#endif
 
 void __init ftrace_boot_snapshot(void)
 {

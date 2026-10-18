@@ -24,6 +24,7 @@
 #include <linux/sched/sysctl.h>
 
 #include <trace/events/sched.h>
+#include <trace/hooks/hung_task.h>
 
 /*
  * The number of tasks checked:
@@ -88,6 +89,43 @@ static struct notifier_block panic_block = {
 	.notifier_call = hung_task_panic,
 };
 
+
+#ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
+static void debug_show_blocker(struct task_struct *task)
+{
+	struct task_struct *g, *t;
+	unsigned long owner;
+	struct mutex *lock;
+
+	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "No rcu lock held");
+
+	lock = READ_ONCE(task->blocker_mutex);
+	if (!lock)
+		return;
+
+	owner = mutex_get_owner(lock);
+	if (unlikely(!owner)) {
+		pr_err("INFO: task %s:%d is blocked on a mutex, but the owner is not found.\n",
+			task->comm, task->pid);
+		return;
+	}
+
+	/* Ensure the owner information is correct. */
+	for_each_process_thread(g, t) {
+		if ((unsigned long)t == owner) {
+			pr_err("INFO: task %s:%d is blocked on a mutex likely owned by task %s:%d.\n",
+				task->comm, task->pid, t->comm, t->pid);
+			sched_show_task(t);
+			return;
+		}
+	}
+}
+#else
+static inline void debug_show_blocker(struct task_struct *task)
+{
+}
+#endif
+
 static void check_hung_task(struct task_struct *t, unsigned long timeout)
 {
 	unsigned long switch_count = t->nvcsw + t->nivcsw;
@@ -139,6 +177,7 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 		pr_err("\"echo 0 > /proc/sys/kernel/hung_task_timeout_secs\""
 			" disables this message.\n");
 		sched_show_task(t);
+		debug_show_blocker(t);
 		hung_task_show_lock = true;
 
 		if (sysctl_hung_task_all_cpu_backtrace)
@@ -183,6 +222,7 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
 	int max_count = sysctl_hung_task_check_count;
 	unsigned long last_break = jiffies;
 	struct task_struct *g, *t;
+	bool need_check = true;
 
 	/*
 	 * If the system crashed already then all bets are off,
@@ -207,12 +247,16 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
 		 * skip the TASK_KILLABLE tasks -- these can be killed
 		 * skip the TASK_IDLE tasks -- those are genuinely idle
 		 */
-		state = READ_ONCE(t->__state);
-		if ((state & TASK_UNINTERRUPTIBLE) &&
-		    !(state & TASK_WAKEKILL) &&
-		    !(state & TASK_NOLOAD))
-			check_hung_task(t, timeout);
+		trace_android_vh_check_uninterruptible_tasks(t, timeout, &need_check);
+		if (need_check) {
+			state = READ_ONCE(t->__state);
+			if ((state & TASK_UNINTERRUPTIBLE) &&
+			    !(state & TASK_WAKEKILL) &&
+			    !(state & TASK_NOLOAD))
+				check_hung_task(t, timeout);
+		}
 	}
+	trace_android_vh_check_uninterruptible_tasks_dn(NULL);
  unlock:
 	rcu_read_unlock();
 	if (hung_task_show_lock)

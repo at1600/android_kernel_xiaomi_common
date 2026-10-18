@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/filter.h>
+#include <linux/page_size_compat_defs.h>
 #include <linux/perf_event.h>
 #include <uapi/linux/btf.h>
 #include <linux/rcupdate_trace.h>
@@ -121,7 +122,7 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 		 */
 		if (attr->map_flags & BPF_F_MMAPABLE) {
 			array_size = PAGE_ALIGN(array_size);
-			array_size += PAGE_ALIGN((u64) max_entries * elem_size);
+			array_size += __PAGE_ALIGN((u64) max_entries * elem_size);
 		} else {
 			array_size += (u64) max_entries * elem_size;
 		}
@@ -566,7 +567,7 @@ static int array_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
 		return -EINVAL;
 
 	if (vma->vm_pgoff * PAGE_SIZE + (vma->vm_end - vma->vm_start) >
-	    PAGE_ALIGN((u64)array->map.max_entries * array->elem_size))
+	    __PAGE_ALIGN((u64)array->map.max_entries * array->elem_size))
 		return -EINVAL;
 
 	return remap_vmalloc_range(vma, array_map_vmalloc_addr(array),
@@ -775,7 +776,7 @@ static u64 array_map_mem_usage(const struct bpf_map *map)
 	} else {
 		if (map->map_flags & BPF_F_MMAPABLE) {
 			usage = PAGE_ALIGN(usage);
-			usage += PAGE_ALIGN(entries * elem_size);
+			usage += __PAGE_ALIGN(entries * elem_size);
 		} else {
 			usage += entries * elem_size;
 		}
@@ -947,13 +948,30 @@ static void *prog_fd_array_get_ptr(struct bpf_map *map,
 				   struct file *map_file, int fd)
 {
 	struct bpf_prog *prog = bpf_prog_get(fd);
+	bool is_extended;
 
 	if (IS_ERR(prog))
 		return prog;
 
-	if (!bpf_prog_map_compatible(map, prog)) {
+	if (prog->type == BPF_PROG_TYPE_EXT ||
+	    !bpf_prog_map_compatible(map, prog)) {
 		bpf_prog_put(prog);
 		return ERR_PTR(-EINVAL);
+	}
+
+	mutex_lock(&prog->aux->ext_mutex);
+	is_extended = prog->aux->is_extended;
+	if (!is_extended)
+		prog->aux->prog_array_member_cnt++;
+	mutex_unlock(&prog->aux->ext_mutex);
+	if (is_extended) {
+		/* Extended prog can not be tail callee. It's to prevent a
+		 * potential infinite loop like:
+		 * tail callee prog entry -> tail callee prog subprog ->
+		 * freplace prog entry --tailcall-> tail callee prog entry.
+		 */
+		bpf_prog_put(prog);
+		return ERR_PTR(-EBUSY);
 	}
 
 	return prog;
@@ -961,8 +979,13 @@ static void *prog_fd_array_get_ptr(struct bpf_map *map,
 
 static void prog_fd_array_put_ptr(struct bpf_map *map, void *ptr, bool need_defer)
 {
+	struct bpf_prog *prog = ptr;
+
+	mutex_lock(&prog->aux->ext_mutex);
+	prog->aux->prog_array_member_cnt--;
+	mutex_unlock(&prog->aux->ext_mutex);
 	/* bpf_prog is freed after one RCU or tasks trace grace period */
-	bpf_prog_put(ptr);
+	bpf_prog_put(prog);
 }
 
 static u32 prog_fd_array_sys_lookup_elem(void *ptr)

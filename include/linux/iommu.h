@@ -7,6 +7,7 @@
 #ifndef __LINUX_IOMMU_H
 #define __LINUX_IOMMU_H
 
+#include <linux/android_kabi.h>
 #include <linux/scatterlist.h>
 #include <linux/device.h>
 #include <linux/types.h>
@@ -348,6 +349,8 @@ struct iommu_iotlb_gather {
 	size_t			pgsize;
 	struct list_head	freelist;
 	bool			queued;
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
 };
 
 /**
@@ -423,9 +426,9 @@ static inline int __iommu_copy_struct_from_user(
 	void *dst_data, const struct iommu_user_data *src_data,
 	unsigned int data_type, size_t data_len, size_t min_len)
 {
-	if (src_data->type != data_type)
-		return -EINVAL;
 	if (WARN_ON(!dst_data || !src_data))
+		return -EINVAL;
+	if (src_data->type != data_type)
 		return -EINVAL;
 	if (src_data->len < min_len || data_len < src_data->len)
 		return -EINVAL;
@@ -439,8 +442,8 @@ static inline int __iommu_copy_struct_from_user(
  *        include/uapi/linux/iommufd.h
  * @user_data: Pointer to a struct iommu_user_data for user space data info
  * @data_type: The data type of the @kdst. Must match with @user_data->type
- * @min_last: The last memember of the data structure @kdst points in the
- *            initial version.
+ * @min_last: The last member of the data structure @kdst points in the initial
+ *            version.
  * Return 0 for success, otherwise -error.
  */
 #define iommu_copy_struct_from_user(kdst, user_data, data_type, min_last) \
@@ -599,6 +602,18 @@ struct iommu_ops {
 	struct iommu_domain *release_domain;
 	struct iommu_domain *default_domain;
 	u8 user_pasid_table:1;
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
+};
+
+/**
+ * struct iommu_map_cookie_sg - Cookie for a deferred map sg
+ * @domain: Domain for the sg lit
+ */
+struct iommu_map_cookie_sg {
+	struct iommu_domain *domain;
 };
 
 /**
@@ -638,6 +653,11 @@ struct iommu_ops {
  * @enable_nesting: Enable nesting
  * @set_pgtable_quirks: Set io page table quirks (IO_PGTABLE_QUIRK_*)
  * @free: Release the domain after use.
+ * @alloc_cookie_sg: Allocate a cookie that would be used to create
+ *		     a sg list, filled from the next functions
+ * @add_deferred_map_sg: Add a mapping to a cookie of a sg list.
+ * @consume_deferred_map_sg: Consume the sg list as now all mappings are added,
+ *			     it should also release the cookie as it's not used.
  */
 struct iommu_domain_ops {
 	int (*attach_dev)(struct iommu_domain *domain, struct device *dev);
@@ -668,6 +688,16 @@ struct iommu_domain_ops {
 				  unsigned long quirks);
 
 	void (*free)(struct iommu_domain *domain);
+
+	struct iommu_map_cookie_sg *(*alloc_cookie_sg)(unsigned long iova, int prot,
+						       unsigned int nents, gfp_t gfp);
+	int (*add_deferred_map_sg)(struct iommu_map_cookie_sg *cookie,
+				   phys_addr_t paddr, size_t pgsize, size_t pgcount);
+	size_t (*consume_deferred_map_sg)(struct iommu_map_cookie_sg *cookie);
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 /**
@@ -799,6 +829,10 @@ extern struct iommu_domain *iommu_get_domain_for_dev(struct device *dev);
 extern struct iommu_domain *iommu_get_dma_domain(struct device *dev);
 extern int iommu_map(struct iommu_domain *domain, unsigned long iova,
 		     phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+int iommu_map_nosync(struct iommu_domain *domain, unsigned long iova,
+		phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+int iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
+		size_t size);
 extern size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova,
 			  size_t size);
 extern size_t iommu_unmap_fast(struct iommu_domain *domain,
@@ -911,6 +945,18 @@ static inline void iommu_iotlb_gather_add_range(struct iommu_iotlb_gather *gathe
 		gather->end = end;
 }
 
+/*
+ * If the new page is disjoint from the current range or is mapped at
+ * a different granularity, then sync the TLB so that the gather
+ * structure can be rewritten.
+ */
+#define _iommu_iotlb_add_page(domain, gather, iova, size, sync)		\
+	if (((gather)->pgsize && (gather)->pgsize != (size)) ||		\
+	    iommu_iotlb_gather_is_disjoint((gather), (iova), (size)))	\
+		sync((domain), (gather));				\
+	(gather)->pgsize = (size);					\
+	iommu_iotlb_gather_add_range((gather), (iova), (size))
+
 /**
  * iommu_iotlb_gather_add_page - Gather for page-based TLB invalidation
  * @domain: IOMMU domain to be invalidated
@@ -926,17 +972,7 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
 					       struct iommu_iotlb_gather *gather,
 					       unsigned long iova, size_t size)
 {
-	/*
-	 * If the new page is disjoint from the current range or is mapped at
-	 * a different granularity, then sync the TLB so that the gather
-	 * structure can be rewritten.
-	 */
-	if ((gather->pgsize && gather->pgsize != size) ||
-	    iommu_iotlb_gather_is_disjoint(gather, iova, size))
-		iommu_iotlb_sync(domain, gather);
-
-	gather->pgsize = size;
-	iommu_iotlb_gather_add_range(gather, iova, size);
+	_iommu_iotlb_add_page(domain, gather, iova, size, iommu_iotlb_sync);
 }
 
 static inline bool iommu_iotlb_gather_queued(struct iommu_iotlb_gather *gather)
