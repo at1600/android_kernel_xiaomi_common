@@ -18,3 +18,7 @@ obj-$(CONFIG_ARM_TEGRA_DEVFREQ)		+= tegra30-devfreq.o
 
 # DEVFREQ Event Drivers
 obj-$(CONFIG_PM_DEVFREQ_EVENT)		+= event/
+
+obj-$(CONFIG_DEVFREQ_GOV_QCOM_GPUBW_MON)	+= governor_gpubw_mon.o
+obj-$(CONFIG_DEVFREQ_GOV_QCOM_ADRENO_TZ)	+= governor_msm_adreno_tz.c
+obj-$(CONFIG_DEVFREQ_GOV_QCOM_ADRENO_RO)	+= governor_msm_adreno_ro.c
