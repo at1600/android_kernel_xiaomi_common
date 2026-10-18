@@ -70,6 +70,7 @@ void set_user_nice(struct task_struct *p, long nice)
 	bool queued, running;
 	struct rq *rq;
 	int old_prio;
+	bool allowed = true;
 
 	trace_android_rvh_set_user_nice(p, &nice);
 	if (task_nice(p) == nice || nice < MIN_NICE || nice > MAX_NICE)
@@ -82,6 +83,10 @@ void set_user_nice(struct task_struct *p, long nice)
 	rq = rq_guard.rq;
 
 	update_rq_clock(rq);
+
+	trace_android_rvh_set_user_nice_locked(p, &nice, &allowed);
+	if (!allowed)
+		return;
 
 	/*
 	 * The RT priorities are set via sched_setscheduler(), but we still
@@ -178,7 +183,7 @@ SYSCALL_DEFINE1(nice, int, increment)
 	return 0;
 }
 
-#endif /* __ARCH_WANT_SYS_NICE */
+#endif
 
 /**
  * task_prio - return the priority value of a given task.
@@ -205,7 +210,20 @@ int task_prio(const struct task_struct *p)
  */
 int idle_cpu(int cpu)
 {
-	return idle_rq(cpu_rq(cpu));
+	struct rq *rq = cpu_rq(cpu);
+
+	if (rq->curr != rq->idle)
+		return 0;
+
+	if (rq->nr_running)
+		return 0;
+
+#ifdef CONFIG_SMP
+	if (rq->ttwu_pending)
+		return 0;
+#endif
+
+	return 1;
 }
 
 /**
@@ -247,7 +265,8 @@ int sched_core_idle_cpu(int cpu)
 
 	return idle_cpu(cpu);
 }
-#endif /* CONFIG_SCHED_CORE */
+
+#endif
 
 /**
  * find_process_by_pid - find a process with a matching PID value.
@@ -291,10 +310,20 @@ static void __setscheduler_params(struct task_struct *p,
 
 	p->policy = policy;
 
-	if (dl_policy(policy))
+	if (dl_policy(policy)) {
 		__setparam_dl(p, attr);
-	else if (fair_policy(policy))
-		__setparam_fair(p, attr);
+	} else if (fair_policy(policy)) {
+		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+		if (attr->sched_runtime) {
+			p->se.custom_slice = 1;
+			p->se.slice = clamp_t(u64, attr->sched_runtime,
+					      NSEC_PER_MSEC/10,   /* HZ=1000 * 10 */
+					      NSEC_PER_MSEC*100); /* HZ=100  / 10 */
+		} else {
+			p->se.custom_slice = 0;
+			p->se.slice = sysctl_sched_base_slice;
+		}
+	}
 
 	/* rt-policy tasks do not have a timerslack */
 	if (rt_or_dl_task_policy(p)) {
@@ -365,7 +394,8 @@ static int uclamp_validate(struct task_struct *p,
 	 * blocking operation which obviously cannot be done while holding
 	 * scheduler locks.
 	 */
-	sched_uclamp_enable();
+	if (!uclamp_is_used())
+		static_branch_enable(&sched_uclamp_used);
 
 	return 0;
 }
@@ -447,7 +477,7 @@ static inline int uclamp_validate(struct task_struct *p,
 }
 static void __setscheduler_uclamp(struct task_struct *p,
 				  const struct sched_attr *attr) { }
-#endif /* !CONFIG_UCLAMP_TASK */
+#endif
 
 /*
  * Allow unprivileged RT tasks to decrease priority.
@@ -639,14 +669,14 @@ change:
 		 * Do not allow real-time tasks into groups that have no runtime
 		 * assigned.
 		 */
-		if (rt_group_sched_enabled() &&
-				rt_bandwidth_enabled() && rt_policy(policy) &&
+		if (rt_bandwidth_enabled() && rt_policy(policy) &&
 				task_group(p)->rt_bandwidth.rt_runtime == 0 &&
 				!task_group_is_autogroup(task_group(p))) {
 			retval = -EPERM;
 			goto unlock;
 		}
-#endif /* CONFIG_RT_GROUP_SCHED */
+#endif
+#ifdef CONFIG_SMP
 		if (dl_bandwidth_enabled() && dl_policy(policy) &&
 				!(attr->sched_flags & SCHED_FLAG_SUGOV)) {
 			cpumask_t *span = rq->rd->span;
@@ -662,6 +692,7 @@ change:
 				goto unlock;
 			}
 		}
+#endif
 	}
 
 	/* Re-check policy now with rq lock held: */
@@ -696,7 +727,7 @@ change:
 		 * itself.
 		 */
 		newprio = rt_effective_prio(p, newprio);
-		if (newprio == oldprio && !dl_prio(newprio))
+		if (newprio == oldprio)
 			queue_flags &= ~DEQUEUE_MOVE;
 	}
 
@@ -885,7 +916,7 @@ do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
 {
 	struct sched_param lparam;
 
-	if (unlikely(!param || pid < 0))
+	if (!param || pid < 0)
 		return -EINVAL;
 	if (copy_from_user(&lparam, param, sizeof(struct sched_param)))
 		return -EFAULT;
@@ -994,7 +1025,7 @@ SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
 	struct sched_attr attr;
 	int retval;
 
-	if (unlikely(!uattr || pid < 0 || flags))
+	if (!uattr || pid < 0 || flags)
 		return -EINVAL;
 
 	retval = sched_copy_attr(uattr, &attr);
@@ -1059,7 +1090,7 @@ SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
 	struct task_struct *p;
 	int retval;
 
-	if (unlikely(!param || pid < 0))
+	if (!param || pid < 0)
 		return -EINVAL;
 
 	scoped_guard (rcu) {
@@ -1081,6 +1112,45 @@ SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
 	return copy_to_user(param, &lp, sizeof(*param)) ? -EFAULT : 0;
 }
 
+/*
+ * Copy the kernel size attribute structure (which might be larger
+ * than what user-space knows about) to user-space.
+ *
+ * Note that all cases are valid: user-space buffer can be larger or
+ * smaller than the kernel-space buffer. The usual case is that both
+ * have the same size.
+ */
+static int
+sched_attr_copy_to_user(struct sched_attr __user *uattr,
+			struct sched_attr *kattr,
+			unsigned int usize)
+{
+	unsigned int ksize = sizeof(*kattr);
+
+	if (!access_ok(uattr, usize))
+		return -EFAULT;
+
+	/*
+	 * sched_getattr() ABI forwards and backwards compatibility:
+	 *
+	 * If usize == ksize then we just copy everything to user-space and all is good.
+	 *
+	 * If usize < ksize then we only copy as much as user-space has space for,
+	 * this keeps ABI compatibility as well. We skip the rest.
+	 *
+	 * If usize > ksize then user-space is using a newer version of the ABI,
+	 * which part the kernel doesn't know about. Just ignore it - tooling can
+	 * detect the kernel's knowledge of attributes from the attr->size value
+	 * which is set to ksize in this case.
+	 */
+	kattr->size = min(usize, ksize);
+
+	if (copy_to_user(uattr, kattr, kattr->size))
+		return -EFAULT;
+
+	return 0;
+}
+
 /**
  * sys_sched_getattr - similar to sched_getparam, but with sched_attr
  * @pid: the pid in question.
@@ -1095,8 +1165,8 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
 	struct task_struct *p;
 	int retval;
 
-	if (unlikely(!uattr || pid < 0 || usize > PAGE_SIZE ||
-		      usize < SCHED_ATTR_SIZE_VER0 || flags))
+	if (!uattr || pid < 0 || usize > PAGE_SIZE ||
+	    usize < SCHED_ATTR_SIZE_VER0 || flags)
 		return -EINVAL;
 
 	scoped_guard (rcu) {
@@ -1125,10 +1195,10 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
 #endif
 	}
 
-	kattr.size = min(usize, sizeof(kattr));
-	return copy_struct_to_user(uattr, usize, &kattr, sizeof(kattr), NULL);
+	return sched_attr_copy_to_user(uattr, &kattr, usize);
 }
 
+#ifdef CONFIG_SMP
 int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 {
 	/*
@@ -1136,13 +1206,6 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 	 * disabled then we don't care about affinity changes.
 	 */
 	if (!task_has_dl_policy(p) || !dl_bandwidth_enabled())
-		return 0;
-
-	/*
-	 * The special/sugov task isn't part of regular bandwidth/admission
-	 * control so let userspace change affinities.
-	 */
-	if (dl_entity_is_special(&p->dl))
 		return 0;
 
 	/*
@@ -1157,6 +1220,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 
 	return 0;
 }
+#endif /* CONFIG_SMP */
 
 int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 {
@@ -1253,7 +1317,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	user_mask = alloc_user_cpus_ptr(NUMA_NO_NODE);
 	if (user_mask) {
 		cpumask_copy(user_mask, in_mask);
-	} else {
+	} else if (IS_ENABLED(CONFIG_SMP)) {
 		return -ENOMEM;
 	}
 
@@ -1264,6 +1328,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	};
 
 	retval = __sched_setaffinity(p, &ac);
+	trace_android_rvh_sched_setaffinity(p, in_mask, &retval);
 	kfree(ac.user_mask);
 
 	return retval;
