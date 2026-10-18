@@ -272,7 +272,6 @@ long hugetlb_change_protection(struct vm_area_struct *vma,
 bool is_hugetlb_entry_migration(pte_t pte);
 bool is_hugetlb_entry_hwpoisoned(pte_t pte);
 void hugetlb_unshare_all_pmds(struct vm_area_struct *vma);
-void hugetlb_split(struct vm_area_struct *vma, unsigned long addr);
 
 #else /* !CONFIG_HUGETLB_PAGE */
 
@@ -465,8 +464,6 @@ static inline vm_fault_t hugetlb_fault(struct mm_struct *mm,
 }
 
 static inline void hugetlb_unshare_all_pmds(struct vm_area_struct *vma) { }
-
-static inline void hugetlb_split(struct vm_area_struct *vma, unsigned long addr) {}
 
 #endif /* !CONFIG_HUGETLB_PAGE */
 
@@ -690,7 +687,6 @@ struct huge_bootmem_page {
 };
 
 int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list);
-void wait_for_freed_hugetlb_folios(void);
 struct folio *alloc_hugetlb_folio(struct vm_area_struct *vma,
 				unsigned long addr, int avoid_reserve);
 struct folio *alloc_hugetlb_folio_nodemask(struct hstate *h, int preferred_nid,
@@ -1013,9 +1009,7 @@ static inline void hugetlb_count_sub(long l, struct mm_struct *mm)
 static inline pte_t huge_ptep_modify_prot_start(struct vm_area_struct *vma,
 						unsigned long addr, pte_t *ptep)
 {
-	unsigned long psize = huge_page_size(hstate_vma(vma));
-
-	return huge_ptep_get_and_clear(vma->vm_mm, addr, ptep, psize);
+	return huge_ptep_get_and_clear(vma->vm_mm, addr, ptep);
 }
 #endif
 
@@ -1059,10 +1053,6 @@ static inline int isolate_or_dissolve_huge_page(struct page *page,
 						struct list_head *list)
 {
 	return -ENOMEM;
-}
-
-static inline void wait_for_freed_hugetlb_folios(void)
-{
 }
 
 static inline struct folio *alloc_hugetlb_folio(struct vm_area_struct *vma,

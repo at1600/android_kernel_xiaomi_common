@@ -33,9 +33,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/lock.h>
 
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/dtask.h>
-
 #ifndef CONFIG_PREEMPT_RT
 #include "mutex.h"
 
@@ -55,10 +52,34 @@ __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
 	osq_lock_init(&lock->osq);
 #endif
 
-	trace_android_vh_mutex_init(lock);
 	debug_mutex_init(lock, name, key);
 }
 EXPORT_SYMBOL(__mutex_init);
+
+/*
+ * @owner: contains: 'struct task_struct *' to the current lock owner,
+ * NULL means not owned. Since task_struct pointers are aligned at
+ * at least L1_CACHE_BYTES, we have low bits to store extra state.
+ *
+ * Bit0 indicates a non-empty waiter list; unlock must issue a wakeup.
+ * Bit1 indicates unlock needs to hand the lock to the top-waiter
+ * Bit2 indicates handoff has been done and we're waiting for pickup.
+ */
+#define MUTEX_FLAG_WAITERS	0x01
+#define MUTEX_FLAG_HANDOFF	0x02
+#define MUTEX_FLAG_PICKUP	0x04
+
+#define MUTEX_FLAGS		0x07
+
+/*
+ * Internal helper function; C doesn't allow us to hide it :/
+ *
+ * DO NOT USE (outside of mutex code).
+ */
+static inline struct task_struct *__mutex_owner(struct mutex *lock)
+{
+	return (struct task_struct *)(atomic_long_read(&lock->owner) & ~MUTEX_FLAGS);
+}
 
 static inline struct task_struct *__owner_task(unsigned long owner)
 {
@@ -74,14 +95,6 @@ EXPORT_SYMBOL(mutex_is_locked);
 static inline unsigned long __owner_flags(unsigned long owner)
 {
 	return owner & MUTEX_FLAGS;
-}
-
-/* Do not use the return value as a pointer directly. */
-unsigned long mutex_get_owner(struct mutex *lock)
-{
-	unsigned long owner = atomic_long_read(&lock->owner);
-
-	return (unsigned long)__owner_task(owner);
 }
 
 /*
@@ -155,10 +168,8 @@ static __always_inline bool __mutex_trylock_fast(struct mutex *lock)
 	unsigned long curr = (unsigned long)current;
 	unsigned long zero = 0UL;
 
-	if (atomic_long_try_cmpxchg_acquire(&lock->owner, &zero, curr)) {
-		trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
+	if (atomic_long_try_cmpxchg_acquire(&lock->owner, &zero, curr))
 		return true;
-	}
 
 	return false;
 }
@@ -194,16 +205,9 @@ static void
 __mutex_add_waiter(struct mutex *lock, struct mutex_waiter *waiter,
 		   struct list_head *list)
 {
-	bool already_on_list = false;
-
-#ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
-	WRITE_ONCE(current->blocker_mutex, lock);
-#endif
 	debug_mutex_add_waiter(lock, waiter, current);
 
-	trace_android_vh_alter_mutex_list_add(lock, waiter, list, &already_on_list);
-	if (!already_on_list)
-		list_add_tail(&waiter->list, list);
+	list_add_tail(&waiter->list, list);
 	if (__mutex_waiter_is_first(lock, waiter))
 		__mutex_set_flag(lock, MUTEX_FLAG_WAITERS);
 }
@@ -216,9 +220,6 @@ __mutex_remove_waiter(struct mutex *lock, struct mutex_waiter *waiter)
 		__mutex_clear_flag(lock, MUTEX_FLAGS);
 
 	debug_mutex_remove_waiter(lock, waiter, current);
-#ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
-	WRITE_ONCE(current->blocker_mutex, NULL);
-#endif
 }
 
 /*
@@ -352,17 +353,10 @@ bool mutex_spin_on_owner(struct mutex *lock, struct task_struct *owner,
 			 struct ww_acquire_ctx *ww_ctx, struct mutex_waiter *waiter)
 {
 	bool ret = true;
-	int cnt = 0;
-	bool time_out = false;
 
 	lockdep_assert_preemption_disabled();
 
 	while (__mutex_owner(lock) == owner) {
-		trace_android_vh_mutex_opt_spin_start(lock, &time_out, &cnt);
-		if (time_out) {
-			ret = false;
-			break;
-		}
 		/*
 		 * Ensure we emit the owner->on_cpu, dereference _after_
 		 * checking lock->owner still matches owner. And we already
@@ -413,7 +407,6 @@ static inline int mutex_can_spin_on_owner(struct mutex *lock)
 	owner = __mutex_owner(lock);
 	if (owner)
 		retval = owner_on_cpu(owner);
-	trace_android_vh_mutex_can_spin_on_owner(lock, &retval);
 
 	/*
 	 * If lock->owner is not set, the mutex has been released. Return true
@@ -495,7 +488,6 @@ mutex_optimistic_spin(struct mutex *lock, struct ww_acquire_ctx *ww_ctx,
 	if (!waiter)
 		osq_unlock(&lock->osq);
 
-	trace_android_vh_mutex_opt_spin_finish(lock, true);
 	return true;
 
 
@@ -504,7 +496,6 @@ fail_unlock:
 		osq_unlock(&lock->osq);
 
 fail:
-	trace_android_vh_mutex_opt_spin_finish(lock, false);
 	/*
 	 * If we fell out of the spin path because of need_resched(),
 	 * reschedule now, before we try-lock the mutex. This avoids getting
@@ -551,13 +542,10 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 void __sched mutex_unlock(struct mutex *lock)
 {
 #ifndef CONFIG_DEBUG_LOCK_ALLOC
-	if (__mutex_unlock_fast(lock)) {
-		trace_android_vh_record_mutex_lock_starttime(lock, 0);
+	if (__mutex_unlock_fast(lock))
 		return;
-	}
 #endif
 	__mutex_unlock_slowpath(lock, _RET_IP_);
-	trace_android_vh_record_mutex_lock_starttime(lock, 0);
 }
 EXPORT_SYMBOL(mutex_unlock);
 
@@ -587,10 +575,8 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		    struct lockdep_map *nest_lock, unsigned long ip,
 		    struct ww_acquire_ctx *ww_ctx, const bool use_ww_ctx)
 {
-	DEFINE_WAKE_Q(wake_q);
 	struct mutex_waiter waiter;
 	struct ww_mutex *ww;
-	unsigned long flags;
 	int ret;
 
 	if (!use_ww_ctx)
@@ -629,19 +615,17 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		if (ww_ctx)
 			ww_mutex_set_context_fastpath(ww, ww_ctx);
 		trace_contention_end(lock, 0);
-		trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
 		preempt_enable();
 		return 0;
 	}
 
-	raw_spin_lock_irqsave(&lock->wait_lock, flags);
-	raw_spin_lock(&current->blocked_lock);
+	raw_spin_lock(&lock->wait_lock);
 	/*
 	 * After waiting to acquire the wait_lock, try again.
 	 */
 	if (__mutex_trylock(lock)) {
 		if (ww_ctx)
-			__ww_mutex_check_waiters(lock, ww_ctx, &wake_q);
+			__ww_mutex_check_waiters(lock, ww_ctx);
 
 		goto skip_wait;
 	}
@@ -661,13 +645,11 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		 * Add in stamp order, waking up waiters that must kill
 		 * themselves.
 		 */
-		ret = __ww_mutex_add_waiter(&waiter, lock, ww_ctx, &wake_q);
+		ret = __ww_mutex_add_waiter(&waiter, lock, ww_ctx);
 		if (ret)
 			goto err_early_kill;
 	}
 
-	trace_android_vh_mutex_wait_start(lock);
-	__set_task_blocked_on(current, lock);
 	set_current_state(state);
 	trace_contention_begin(lock, LCB_F_MUTEX);
 	for (;;) {
@@ -680,7 +662,7 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		 * the handoff.
 		 */
 		if (__mutex_trylock(lock))
-			break; /* acquired */;
+			goto acquired;
 
 		/*
 		 * Check for signals and kill conditions while holding
@@ -698,23 +680,11 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 				goto err;
 		}
 
-		raw_spin_unlock(&current->blocked_lock);
-		raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
-		/* Make sure we do wakeups before calling schedule */
-		wake_up_q(&wake_q);
-		wake_q_init(&wake_q);
-
+		raw_spin_unlock(&lock->wait_lock);
 		schedule_preempt_disabled();
 
 		first = __mutex_waiter_is_first(lock, &waiter);
 
-		raw_spin_lock_irqsave(&lock->wait_lock, flags);
-		raw_spin_lock(&current->blocked_lock);
-
-		/*
-		 * Re-set blocked_on_state as unlock path set it to WAKING/RUNNABLE
-		 */
-		current->blocked_on_state = BO_BLOCKED;
 		set_current_state(state);
 		/*
 		 * Here we order against unlock; we must either see it change
@@ -725,32 +695,17 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 			break;
 
 		if (first) {
-			bool opt_acquired;
-
-			/*
-			 * mutex_optimistic_spin() can call schedule(), so
-			 * we need to release these locks before calling it,
-			 * and clear blocked on so we don't become unselectable
-			 * to run.
-			 */
-			current->blocked_on_state = BO_RUNNABLE;
-			raw_spin_unlock(&current->blocked_lock);
-			raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 			trace_contention_begin(lock, LCB_F_MUTEX | LCB_F_SPIN);
-			opt_acquired = mutex_optimistic_spin(lock, ww_ctx, &waiter);
-			raw_spin_lock_irqsave(&lock->wait_lock, flags);
-			raw_spin_lock(&current->blocked_lock);
-			current->blocked_on_state = BO_BLOCKED;
-			set_current_state(state);
-
-			if (opt_acquired)
+			if (mutex_optimistic_spin(lock, ww_ctx, &waiter))
 				break;
 			trace_contention_begin(lock, LCB_F_MUTEX);
 		}
+
+		raw_spin_lock(&lock->wait_lock);
 	}
-	__clear_task_blocked_on(current, lock);
+	raw_spin_lock(&lock->wait_lock);
+acquired:
 	__set_current_state(TASK_RUNNING);
-	trace_android_vh_mutex_wait_finish(lock);
 
 	if (ww_ctx) {
 		/*
@@ -759,7 +714,7 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		 */
 		if (!ww_ctx->is_wait_die &&
 		    !__mutex_waiter_is_first(lock, &waiter))
-			__ww_mutex_check_waiters(lock, ww_ctx, &wake_q);
+			__ww_mutex_check_waiters(lock, ww_ctx);
 	}
 
 	__mutex_remove_waiter(lock, &waiter);
@@ -774,26 +729,18 @@ skip_wait:
 	if (ww_ctx)
 		ww_mutex_lock_acquired(ww, ww_ctx);
 
-	raw_spin_unlock(&current->blocked_lock);
-	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
-	wake_up_q(&wake_q);
-	trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
+	raw_spin_unlock(&lock->wait_lock);
 	preempt_enable();
 	return 0;
 
 err:
-	__clear_task_blocked_on(current, lock);
 	__set_current_state(TASK_RUNNING);
-	trace_android_vh_mutex_wait_finish(lock);
 	__mutex_remove_waiter(lock, &waiter);
 err_early_kill:
-	WARN_ON(__get_task_blocked_on(current));
 	trace_contention_end(lock, ret);
-	raw_spin_unlock(&current->blocked_lock);
-	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+	raw_spin_unlock(&lock->wait_lock);
 	debug_mutex_free_waiter(&waiter);
 	mutex_release(&lock->dep_map, ip);
-	wake_up_q(&wake_q);
 	preempt_enable();
 	return ret;
 }
@@ -958,10 +905,9 @@ EXPORT_SYMBOL_GPL(ww_mutex_lock_interruptible);
  */
 static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigned long ip)
 {
-	struct task_struct *donor, *next = NULL;
+	struct task_struct *next = NULL;
 	DEFINE_WAKE_Q(wake_q);
 	unsigned long owner;
-	unsigned long flags;
 
 	mutex_release(&lock->dep_map, ip);
 
@@ -977,12 +923,6 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 		MUTEX_WARN_ON(__owner_task(owner) != current);
 		MUTEX_WARN_ON(owner & MUTEX_FLAG_PICKUP);
 
-		if (sched_proxy_exec() && current->blocked_donor) {
-			/* force handoff if we have a blocked_donor */
-			owner = MUTEX_FLAG_HANDOFF;
-			break;
-		}
-
 		if (owner & MUTEX_FLAG_HANDOFF)
 			break;
 
@@ -994,36 +934,9 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 		}
 	}
 
-	raw_spin_lock_irqsave(&lock->wait_lock, flags);
+	raw_spin_lock(&lock->wait_lock);
 	debug_mutex_unlock(lock);
-
-	if (sched_proxy_exec()) {
-		raw_spin_lock(&current->blocked_lock);
-		/*
-		 * If we have a task boosting current, and that task was boosting
-		 * current through this lock, hand the lock to that task, as that
-		 * is the highest waiter, as selected by the scheduling function.
-		 */
-		donor = current->blocked_donor;
-		if (donor) {
-			struct mutex *next_lock;
-
-			raw_spin_lock_nested(&donor->blocked_lock, SINGLE_DEPTH_NESTING);
-			next_lock = __get_task_blocked_on(donor);
-			if (next_lock == lock) {
-				next = donor;
-				__set_blocked_on_waking(donor);
-				wake_q_add(&wake_q, donor);
-				current->blocked_donor = NULL;
-			}
-			raw_spin_unlock(&donor->blocked_lock);
-		}
-	}
-
-	/*
-	 * Failing that, pick any on the wait list.
-	 */
-	if (!next && !list_empty(&lock->wait_list)) {
+	if (!list_empty(&lock->wait_list)) {
 		/* get the first entry from the wait-list: */
 		struct mutex_waiter *waiter =
 			list_first_entry(&lock->wait_list,
@@ -1031,25 +944,16 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 
 		next = waiter->task;
 
-		raw_spin_lock_nested(&next->blocked_lock, SINGLE_DEPTH_NESTING);
 		debug_mutex_wake_waiter(lock, waiter);
-		WARN_ON_ONCE(__get_task_blocked_on(next) != lock);
-		__set_blocked_on_waking(next);
-		raw_spin_unlock(&next->blocked_lock);
 		wake_q_add(&wake_q, next);
 	}
 
 	if (owner & MUTEX_FLAG_HANDOFF)
 		__mutex_handoff(lock, next);
 
-	if (sched_proxy_exec())
-		raw_spin_unlock(&current->blocked_lock);
-	trace_android_vh_mutex_unlock_slowpath_before_wakeq(lock);
-	preempt_disable();
-	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+	raw_spin_unlock(&lock->wait_lock);
+
 	wake_up_q(&wake_q);
-	preempt_enable();
-	trace_android_vh_mutex_unlock_slowpath(lock);
 }
 
 #ifndef CONFIG_DEBUG_LOCK_ALLOC
@@ -1186,10 +1090,8 @@ int __sched mutex_trylock(struct mutex *lock)
 	MUTEX_WARN_ON(lock->magic != lock);
 
 	locked = __mutex_trylock(lock);
-	if (locked) {
-		trace_android_vh_record_mutex_lock_starttime(lock, jiffies);
+	if (locked)
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
-	}
 
 	return locked;
 }

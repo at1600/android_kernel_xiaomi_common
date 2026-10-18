@@ -170,12 +170,6 @@ struct hw_perf_event {
 		};
 		struct { /* aux / Intel-PT */
 			u64		aux_config;
-			/*
-			 * For AUX area events, aux_paused cannot be a state
-			 * flag because it can be updated asynchronously to
-			 * state.
-			 */
-			unsigned int	aux_paused;
 		};
 		struct { /* software */
 			struct hrtimer	hrtimer;
@@ -300,8 +294,6 @@ struct perf_event_pmu_context;
 #define PERF_PMU_CAP_NO_EXCLUDE			0x0040
 #define PERF_PMU_CAP_AUX_OUTPUT			0x0080
 #define PERF_PMU_CAP_EXTENDED_HW_TYPE		0x0100
-#define PERF_PMU_CAP_AUX_PAUSE			0x0200
-#define PERF_PMU_CAP_AUX_PREFER_LARGE		0x0400
 
 /**
  * pmu::scope
@@ -392,8 +384,6 @@ struct pmu {
 #define PERF_EF_START	0x01		/* start the counter when adding    */
 #define PERF_EF_RELOAD	0x02		/* reload the counter when starting */
 #define PERF_EF_UPDATE	0x04		/* update the counter when stopping */
-#define PERF_EF_PAUSE	0x08		/* AUX area event, pause tracing */
-#define PERF_EF_RESUME	0x10		/* AUX area event, resume tracing */
 
 	/*
 	 * Adds/Removes a counter to/from the PMU, can be done inside a
@@ -433,18 +423,6 @@ struct pmu {
 	 *
 	 * ->start() with PERF_EF_RELOAD will reprogram the counter
 	 *  value, must be preceded by a ->stop() with PERF_EF_UPDATE.
-	 *
-	 * ->stop() with PERF_EF_PAUSE will stop as simply as possible. Will not
-	 * overlap another ->stop() with PERF_EF_PAUSE nor ->start() with
-	 * PERF_EF_RESUME.
-	 *
-	 * ->start() with PERF_EF_RESUME will start as simply as possible but
-	 * only if the counter is not otherwise stopped. Will not overlap
-	 * another ->start() with PERF_EF_RESUME nor ->stop() with
-	 * PERF_EF_PAUSE.
-	 *
-	 * Notably, PERF_EF_PAUSE/PERF_EF_RESUME *can* be concurrent with other
-	 * ->stop()/->start() invocations, just not itself.
 	 */
 	void (*start)			(struct perf_event *event, int flags);
 	void (*stop)			(struct perf_event *event, int flags);
@@ -674,15 +652,13 @@ struct swevent_hlist {
 	struct rcu_head			rcu_head;
 };
 
-#define PERF_ATTACH_CONTEXT	0x0001
-#define PERF_ATTACH_GROUP	0x0002
-#define PERF_ATTACH_TASK	0x0004
-#define PERF_ATTACH_TASK_DATA	0x0008
-#define PERF_ATTACH_ITRACE	0x0010
-#define PERF_ATTACH_SCHED_CB	0x0020
-#define PERF_ATTACH_CHILD	0x0040
-#define PERF_ATTACH_EXCLUSIVE	0x0080
-#define PERF_ATTACH_CALLCHAIN	0x0100
+#define PERF_ATTACH_CONTEXT	0x01
+#define PERF_ATTACH_GROUP	0x02
+#define PERF_ATTACH_TASK	0x04
+#define PERF_ATTACH_TASK_DATA	0x08
+#define PERF_ATTACH_ITRACE	0x10
+#define PERF_ATTACH_SCHED_CB	0x20
+#define PERF_ATTACH_CHILD	0x40
 
 struct bpf_prog;
 struct perf_cgroup;
@@ -834,6 +810,7 @@ struct perf_event {
 	struct irq_work			pending_disable_irq;
 	struct callback_head		pending_task;
 	unsigned int			pending_work;
+	struct rcuwait			pending_work_wait;
 
 	atomic_t			event_limit;
 
@@ -1064,13 +1041,7 @@ struct perf_output_handle {
 	struct perf_buffer		*rb;
 	unsigned long			wakeup;
 	unsigned long			size;
-	union {
-		u64			flags;		/* perf_output*() */
-		u64			aux_flags;	/* perf_aux_output*() */
-		struct {
-			u64		skip_read : 1;
-		};
-	};
+	u64				aux_flags;
 	union {
 		void			*addr;
 		unsigned long		head;
@@ -1295,17 +1266,11 @@ static inline void perf_sample_save_callchain(struct perf_sample_data *data,
 }
 
 static inline void perf_sample_save_raw_data(struct perf_sample_data *data,
-					     struct perf_event *event,
 					     struct perf_raw_record *raw)
 {
 	struct perf_raw_frag *frag = &raw->frag;
 	u32 sum = 0;
 	int size;
-
-	if (!(event->attr.sample_type & PERF_SAMPLE_RAW))
-		return;
-	if (WARN_ON_ONCE(data->sample_flags & PERF_SAMPLE_RAW))
-		return;
 
 	do {
 		sum += frag->size;
@@ -1564,40 +1529,22 @@ extern void perf_event_bpf_event(struct bpf_prog *prog,
 
 #ifdef CONFIG_GUEST_PERF_EVENTS
 extern struct perf_guest_info_callbacks __rcu *perf_guest_cbs;
-static inline struct perf_guest_info_callbacks *perf_get_guest_cbs(void)
-{
-	/*
-	 * Callbacks are RCU-protected and must be READ_ONCE to avoid reloading
-	 * the callbacks between a !NULL check and dereferences, to ensure
-	 * pending stores/changes to the callback pointers are visible before a
-	 * non-NULL perf_guest_cbs is visible to readers, and to prevent a
-	 * module from unloading callbacks while readers are active.
-	 */
-	return rcu_dereference(perf_guest_cbs);
-}
+
+DECLARE_STATIC_CALL(__perf_guest_state, *perf_guest_cbs->state);
+DECLARE_STATIC_CALL(__perf_guest_get_ip, *perf_guest_cbs->get_ip);
+DECLARE_STATIC_CALL(__perf_guest_handle_intel_pt_intr, *perf_guest_cbs->handle_intel_pt_intr);
+
 static inline unsigned int perf_guest_state(void)
 {
-	struct perf_guest_info_callbacks *guest_cbs = perf_get_guest_cbs();
-
-	return guest_cbs ? guest_cbs->state() : 0;
+	return static_call(__perf_guest_state)();
 }
 static inline unsigned long perf_guest_get_ip(void)
 {
-	struct perf_guest_info_callbacks *guest_cbs = perf_get_guest_cbs();
-
-	/*
-	 * Arbitrarily return '0' in the unlikely scenario that the callbacks
-	 * are unregistered between checking guest state and getting the IP.
-	 */
-	return guest_cbs ? guest_cbs->get_ip() : 0;
+	return static_call(__perf_guest_get_ip)();
 }
 static inline unsigned int perf_guest_handle_intel_pt_intr(void)
 {
-	struct perf_guest_info_callbacks *guest_cbs = perf_get_guest_cbs();
-
-	if (guest_cbs && guest_cbs->handle_intel_pt_intr)
-		return guest_cbs->handle_intel_pt_intr();
-	return 0;
+	return static_call(__perf_guest_handle_intel_pt_intr)();
 }
 extern void perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *cbs);
 extern void perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *cbs);
@@ -1621,7 +1568,7 @@ DECLARE_PER_CPU(struct perf_callchain_entry, perf_callchain_entry);
 extern void perf_callchain_user(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs);
 extern void perf_callchain_kernel(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs);
 extern struct perf_callchain_entry *
-get_perf_callchain(struct pt_regs *regs, bool kernel, bool user,
+get_perf_callchain(struct pt_regs *regs, u32 init_nr, bool kernel, bool user,
 		   u32 max_stack, bool crosstask, bool add_mark);
 extern int get_callchain_buffers(int max_stack);
 extern void put_callchain_buffers(void);
@@ -1730,13 +1677,6 @@ static inline bool needs_branch_stack(struct perf_event *event)
 static inline bool has_aux(struct perf_event *event)
 {
 	return event->pmu->setup_aux;
-}
-
-static inline bool has_aux_action(struct perf_event *event)
-{
-	return event->attr.aux_sample_size ||
-	       event->attr.aux_pause ||
-	       event->attr.aux_resume;
 }
 
 static inline bool is_write_backward(struct perf_event *event)

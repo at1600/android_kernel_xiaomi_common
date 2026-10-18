@@ -323,11 +323,13 @@ static void cgroup_rstat_flush_locked(struct cgroup *cgrp)
 			rcu_read_unlock();
 		}
 
-		/* play nice and avoid disabling interrupts for a long time */
-		__cgroup_rstat_unlock(cgrp, cpu);
-		if (!cond_resched())
-			cpu_relax();
-		__cgroup_rstat_lock(cgrp, cpu);
+		/* play nice and yield if necessary */
+		if (need_resched() || spin_needbreak(&cgroup_rstat_lock)) {
+			__cgroup_rstat_unlock(cgrp, cpu);
+			if (!cond_resched())
+				cpu_relax();
+			__cgroup_rstat_lock(cgrp, cpu);
+		}
 	}
 }
 
@@ -442,7 +444,6 @@ static void cgroup_base_stat_add(struct cgroup_base_stat *dst_bstat,
 #ifdef CONFIG_SCHED_CORE
 	dst_bstat->forceidle_sum += src_bstat->forceidle_sum;
 #endif
-	dst_bstat->ntime += src_bstat->ntime;
 }
 
 static void cgroup_base_stat_sub(struct cgroup_base_stat *dst_bstat,
@@ -454,7 +455,6 @@ static void cgroup_base_stat_sub(struct cgroup_base_stat *dst_bstat,
 #ifdef CONFIG_SCHED_CORE
 	dst_bstat->forceidle_sum -= src_bstat->forceidle_sum;
 #endif
-	dst_bstat->ntime -= src_bstat->ntime;
 }
 
 static void cgroup_base_stat_flush(struct cgroup *cgrp, int cpu)
@@ -534,10 +534,8 @@ void __cgroup_account_cputime_field(struct cgroup *cgrp,
 	rstatc = cgroup_base_stat_cputime_account_begin(cgrp, &flags);
 
 	switch (index) {
-	case CPUTIME_NICE:
-		rstatc->bstat.ntime += delta_exec;
-		fallthrough;
 	case CPUTIME_USER:
+	case CPUTIME_NICE:
 		rstatc->bstat.cputime.utime += delta_exec;
 		break;
 	case CPUTIME_SYSTEM:
@@ -588,11 +586,11 @@ static void root_cgroup_cputime(struct cgroup_base_stat *bstat)
 
 		cputime->sum_exec_runtime += user;
 		cputime->sum_exec_runtime += sys;
+		cputime->sum_exec_runtime += cpustat[CPUTIME_STEAL];
 
 #ifdef CONFIG_SCHED_CORE
 		bstat->forceidle_sum += cpustat[CPUTIME_FORCEIDLE];
 #endif
-		bstat->ntime += cpustat[CPUTIME_NICE];
 	}
 }
 
@@ -610,33 +608,32 @@ static void cgroup_force_idle_show(struct seq_file *seq, struct cgroup_base_stat
 void cgroup_base_stat_cputime_show(struct seq_file *seq)
 {
 	struct cgroup *cgrp = seq_css(seq)->cgroup;
-	struct cgroup_base_stat bstat;
+	u64 usage, utime, stime;
 
 	if (cgroup_parent(cgrp)) {
 		cgroup_rstat_flush_hold(cgrp);
-		bstat = cgrp->bstat;
+		usage = cgrp->bstat.cputime.sum_exec_runtime;
 		cputime_adjust(&cgrp->bstat.cputime, &cgrp->prev_cputime,
-			       &bstat.cputime.utime, &bstat.cputime.stime);
+			       &utime, &stime);
 		cgroup_rstat_flush_release(cgrp);
 	} else {
-		root_cgroup_cputime(&bstat);
+		/* cgrp->bstat of root is not actually used, reuse it */
+		root_cgroup_cputime(&cgrp->bstat);
+		usage = cgrp->bstat.cputime.sum_exec_runtime;
+		utime = cgrp->bstat.cputime.utime;
+		stime = cgrp->bstat.cputime.stime;
 	}
 
-	do_div(bstat.cputime.sum_exec_runtime, NSEC_PER_USEC);
-	do_div(bstat.cputime.utime, NSEC_PER_USEC);
-	do_div(bstat.cputime.stime, NSEC_PER_USEC);
-	do_div(bstat.ntime, NSEC_PER_USEC);
+	do_div(usage, NSEC_PER_USEC);
+	do_div(utime, NSEC_PER_USEC);
+	do_div(stime, NSEC_PER_USEC);
 
 	seq_printf(seq, "usage_usec %llu\n"
-			"user_usec %llu\n"
-			"system_usec %llu\n"
-			"nice_usec %llu\n",
-			bstat.cputime.sum_exec_runtime,
-			bstat.cputime.utime,
-			bstat.cputime.stime,
-			bstat.ntime);
+		   "user_usec %llu\n"
+		   "system_usec %llu\n",
+		   usage, utime, stime);
 
-	cgroup_force_idle_show(seq, &bstat);
+	cgroup_force_idle_show(seq, &cgrp->bstat);
 }
 
 /* Add bpf kfuncs for cgroup_rstat_updated() and cgroup_rstat_flush() */

@@ -10,7 +10,6 @@
 #include <linux/xattr.h>
 #include <linux/fs_parser.h>
 #include <linux/userfaultfd_k.h>
-#include <linux/android_vendor.h>
 
 /* inode in-kernel data */
 
@@ -41,8 +40,6 @@ struct shmem_inode_info {
 	struct dquot __rcu	*i_dquot[MAXQUOTAS];
 #endif
 	struct inode		vfs_inode;
-
-	ANDROID_VENDOR_DATA(1);
 };
 
 #define SHMEM_FL_USER_VISIBLE		FS_FL_USER_VISIBLE

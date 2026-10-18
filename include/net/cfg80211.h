@@ -23,7 +23,6 @@
 #include <linux/ieee80211.h>
 #include <linux/net.h>
 #include <linux/rfkill.h>
-#include <linux/android_kabi.h>
 #include <net/regulatory.h>
 
 /**
@@ -128,8 +127,6 @@ struct wiphy;
  *	even if it is otherwise disabled.
  * @IEEE80211_CHAN_ALLOW_6GHZ_VLP_AP: Allow using this channel for AP operation
  *	with very low power (VLP), even if otherwise set to NO_IR.
- * @IEEE80211_CHAN_ALLOW_20MHZ_ACTIVITY: Allow activity on a 20 MHz channel,
- *	even if otherwise set to NO_IR.
  */
 enum ieee80211_channel_flags {
 	IEEE80211_CHAN_DISABLED			= BIT(0),
@@ -158,7 +155,6 @@ enum ieee80211_channel_flags {
 	IEEE80211_CHAN_NO_6GHZ_AFC_CLIENT	= BIT(23),
 	IEEE80211_CHAN_CAN_MONITOR		= BIT(24),
 	IEEE80211_CHAN_ALLOW_6GHZ_VLP_AP	= BIT(25),
-	IEEE80211_CHAN_ALLOW_20MHZ_ACTIVITY     = BIT(26),
 };
 
 #define IEEE80211_CHAN_NO_HT40 \
@@ -634,7 +630,7 @@ ieee80211_get_sband_iftype_data(const struct ieee80211_supported_band *sband,
 	const struct ieee80211_sband_iftype_data *data;
 	int i;
 
-	if (WARN_ON(iftype >= NUM_NL80211_IFTYPES))
+	if (WARN_ON(iftype >= NL80211_IFTYPE_MAX))
 		return NULL;
 
 	if (iftype == NL80211_IFTYPE_AP_VLAN)
@@ -1284,8 +1280,6 @@ struct cfg80211_crypto_settings {
 	const u8 *sae_pwd;
 	u8 sae_pwd_len;
 	enum nl80211_sae_pwe_mechanism sae_pwe;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -1391,8 +1385,6 @@ struct cfg80211_beacon_data {
 	size_t civicloc_len;
 	struct cfg80211_he_bss_color he_bss_color;
 	bool he_bss_color_valid;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 struct mac_address {
@@ -1527,8 +1519,6 @@ struct cfg80211_ap_settings {
 	struct cfg80211_fils_discovery fils_discovery;
 	struct cfg80211_unsol_bcast_probe_resp unsol_bcast_probe_resp;
 	struct cfg80211_mbssid_config mbssid_config;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 
@@ -1545,8 +1535,6 @@ struct cfg80211_ap_update {
 	struct cfg80211_beacon_data beacon;
 	struct cfg80211_fils_discovery fils_discovery;
 	struct cfg80211_unsol_bcast_probe_resp unsol_bcast_probe_resp;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -1579,8 +1567,6 @@ struct cfg80211_csa_settings {
 	bool block_tx;
 	u8 count;
 	u8 link_id;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -1708,8 +1694,6 @@ struct link_station_parameters {
 	const struct ieee80211_he_6ghz_capa *he_6ghz_capa;
 	const struct ieee80211_eht_cap_elem *eht_capa;
 	u8 eht_capa_len;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -2200,8 +2184,6 @@ struct station_info {
 	u8 mld_addr[ETH_ALEN] __aligned(2);
 	const u8 *assoc_resp_ies;
 	size_t assoc_resp_ies_len;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -2509,8 +2491,6 @@ struct mesh_config {
 	u16 dot11MeshAwakeWindowDuration;
 	u32 plink_timeout;
 	bool dot11MeshNolearn;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -2560,8 +2540,6 @@ struct mesh_setup {
 	struct cfg80211_bitrate_mask beacon_rate;
 	bool userspace_handles_dfs;
 	bool control_port_over_nl80211;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -2728,10 +2706,8 @@ struct cfg80211_scan_request {
 	struct cfg80211_scan_6ghz_params *scan_6ghz_params;
 	s8 tsf_report_link_id;
 
-	ANDROID_KABI_RESERVE(1);
-
 	/* keep last */
-	struct ieee80211_channel *channels[];
+	struct ieee80211_channel *channels[] __counted_by(n_channels);
 };
 
 static inline void get_random_mask_addr(u8 *buf, const u8 *addr, const u8 *mask)
@@ -2865,8 +2841,6 @@ struct cfg80211_sched_scan_request {
 	u32 owner_nlportid;
 	bool nl_owner_dead;
 	struct list_head list;
-
-	ANDROID_KABI_RESERVE(1);
 
 	/* keep last */
 	struct ieee80211_channel *channels[] __counted_by(n_channels);
@@ -3011,7 +2985,6 @@ struct cfg80211_bss {
 
 	u8 use_for;
 	u8 cannot_use_reasons;
-	ANDROID_KABI_RESERVE(1);
 
 	u8 priv[] __aligned(sizeof(void *));
 };
@@ -3050,10 +3023,6 @@ static inline const u8 *ieee80211_bss_get_ie(struct cfg80211_bss *bss, u8 id)
  *
  * @bss: The BSS to authenticate with, the callee must obtain a reference
  *	to it if it needs to keep it.
- * @supported_selectors: List of selectors that should be assumed to be
- *	supported by the station.
- *	SAE_H2E must be assumed supported if set to %NULL.
- * @supported_selectors_len: Length of supported_selectors in octets.
  * @auth_type: Authentication type (algorithm)
  * @ie: Extra IEs to add to Authentication frame or %NULL
  * @ie_len: Length of ie buffer in octets
@@ -3076,8 +3045,6 @@ struct cfg80211_auth_request {
 	struct cfg80211_bss *bss;
 	const u8 *ie;
 	size_t ie_len;
-	const u8 *supported_selectors;
-	u8 supported_selectors_len;
 	enum nl80211_auth_type auth_type;
 	const u8 *key;
 	u8 key_len;
@@ -3157,10 +3124,6 @@ enum cfg80211_assoc_req_flags {
  *	included in the Current AP address field of the Reassociation Request
  *	frame.
  * @flags:  See &enum cfg80211_assoc_req_flags
- * @supported_selectors: supported selectors in IEEE 802.11 format
- *	(or %NULL for no change).
- *	If %NULL, then support for SAE_H2E should be assumed.
- * @supported_selectors_len: Length of supported_selectors in octets.
  * @ht_capa:  HT Capabilities over-rides.  Values set in ht_capa_mask
  *	will be used in ht_capa.  Un-supported values will be ignored.
  * @ht_capa_mask:  The bits of ht_capa which are to be used.
@@ -3187,8 +3150,6 @@ struct cfg80211_assoc_request {
 	struct cfg80211_crypto_settings crypto;
 	bool use_mfp;
 	u32 flags;
-	const u8 *supported_selectors;
-	u8 supported_selectors_len;
 	struct ieee80211_ht_cap ht_capa;
 	struct ieee80211_ht_cap ht_capa_mask;
 	struct ieee80211_vht_cap vht_capa, vht_capa_mask;
@@ -3199,8 +3160,6 @@ struct cfg80211_assoc_request {
 	struct cfg80211_assoc_link links[IEEE80211_MLD_MAX_NUM_LINKS];
 	const u8 *ap_mld_addr;
 	s8 link_id;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -3299,8 +3258,6 @@ struct cfg80211_ibss_params {
 	struct ieee80211_ht_cap ht_capa_mask;
 	struct key_params *wep_keys;
 	int wep_tx_key;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -3415,8 +3372,6 @@ struct cfg80211_connect_params {
 	size_t fils_erp_rrk_len;
 	bool want_1x;
 	struct ieee80211_edmg edmg;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -3881,8 +3836,6 @@ struct cfg80211_nan_func {
 	u8 num_rx_filters;
 	u8 instance_id;
 	u64 cookie;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -4055,8 +4008,6 @@ struct cfg80211_pmsr_ftm_result {
 	    dist_avg_valid:1,
 	    dist_variance_valid:1,
 	    dist_spread_valid:1;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -4633,15 +4584,6 @@ struct mgmt_frame_regs {
  * @set_ttlm: set the TID to link mapping.
  * @get_radio_mask: get bitmask of radios in use.
  *	(invoked with the wiphy mutex held)
- * @assoc_ml_reconf: Request a non-AP MLO connection to perform ML
- *	reconfiguration, i.e., add and/or remove links to/from the
- *	association using ML reconfiguration action frames. Successfully added
- *	links will be added to the set of valid links. Successfully removed
- *	links will be removed from the set of valid links. The driver must
- *	indicate removed links by calling cfg80211_links_removed() and added
- *	links by calling cfg80211_mlo_reconf_add_done(). When calling
- *	cfg80211_mlo_reconf_add_done() the bss pointer must be given for each
- *	link for which MLO reconfiguration 'add' operation was requested.
  */
 struct cfg80211_ops {
 	int	(*suspend)(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
@@ -5004,14 +4946,6 @@ struct cfg80211_ops {
 	int	(*set_ttlm)(struct wiphy *wiphy, struct net_device *dev,
 			    struct cfg80211_ttlm_params *params);
 	u32	(*get_radio_mask)(struct wiphy *wiphy, struct net_device *dev);
-	int     (*assoc_ml_reconf)(struct wiphy *wiphy, struct net_device *dev,
-				   struct cfg80211_assoc_link *add_links,
-				   u16 rem_links);
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 /*
@@ -5389,8 +5323,6 @@ struct wiphy_vendor_command {
 		      unsigned long *storage);
 	const struct nla_policy *policy;
 	unsigned int maxattr;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -5886,7 +5818,6 @@ struct wiphy {
 
 	int n_radio;
 	const struct wiphy_radio *radio;
-	ANDROID_KABI_RESERVE(1);
 
 	char priv[] __aligned(NETDEV_ALIGN);
 };
@@ -6171,11 +6102,6 @@ static inline void wiphy_delayed_work_init(struct wiphy_delayed_work *dwork,
  * after wiphy_lock() was called. Therefore, wiphy_cancel_work() can
  * use just cancel_work() instead of cancel_work_sync(), it requires
  * being in a section protected by wiphy_lock().
- *
- * Note that these are scheduled with a timer where the accuracy
- * becomes less the longer in the future the scheduled timer is. Use
- * wiphy_hrtimer_work_queue() if the timer must be not be late by more
- * than approximately 10 percent.
  */
 void wiphy_delayed_work_queue(struct wiphy *wiphy,
 			      struct wiphy_delayed_work *dwork,
@@ -6246,79 +6172,6 @@ void wiphy_delayed_work_flush(struct wiphy *wiphy,
  */
 bool wiphy_delayed_work_pending(struct wiphy *wiphy,
 				struct wiphy_delayed_work *dwork);
-
-struct wiphy_hrtimer_work {
-	struct wiphy_work work;
-	struct wiphy *wiphy;
-	struct hrtimer timer;
-};
-
-enum hrtimer_restart wiphy_hrtimer_work_timer(struct hrtimer *t);
-
-static inline void wiphy_hrtimer_work_init(struct wiphy_hrtimer_work *hrwork,
-					   wiphy_work_func_t func)
-{
-	hrtimer_init(&hrwork->timer, CLOCK_BOOTTIME, HRTIMER_MODE_REL);
-	hrwork->timer.function = wiphy_hrtimer_work_timer;
-	wiphy_work_init(&hrwork->work, func);
-}
-
-/**
- * wiphy_hrtimer_work_queue - queue hrtimer work for the wiphy
- * @wiphy: the wiphy to queue for
- * @hrwork: the high resolution timer worker
- * @delay: the delay given as a ktime_t
- *
- * Please refer to wiphy_delayed_work_queue(). The difference is that
- * the hrtimer work uses a high resolution timer for scheduling. This
- * may be needed if timeouts might be scheduled further in the future
- * and the accuracy of the normal timer is not sufficient.
- *
- * Expect a delay of a few milliseconds as the timer is scheduled
- * with some slack and some more time may pass between queueing the
- * work and its start.
- */
-void wiphy_hrtimer_work_queue(struct wiphy *wiphy,
-			      struct wiphy_hrtimer_work *hrwork,
-			      ktime_t delay);
-
-/**
- * wiphy_hrtimer_work_cancel - cancel previously queued hrtimer work
- * @wiphy: the wiphy, for debug purposes
- * @hrtimer: the hrtimer work to cancel
- *
- * Cancel the work *without* waiting for it, this assumes being
- * called under the wiphy mutex acquired by wiphy_lock().
- */
-void wiphy_hrtimer_work_cancel(struct wiphy *wiphy,
-			       struct wiphy_hrtimer_work *hrtimer);
-
-/**
- * wiphy_hrtimer_work_flush - flush previously queued hrtimer work
- * @wiphy: the wiphy, for debug purposes
- * @hrwork: the hrtimer work to flush
- *
- * Flush the work (i.e. run it if pending). This must be called
- * under the wiphy mutex acquired by wiphy_lock().
- */
-void wiphy_hrtimer_work_flush(struct wiphy *wiphy,
-			      struct wiphy_hrtimer_work *hrwork);
-
-/**
- * wiphy_hrtimer_work_pending - Find out whether a wiphy hrtimer
- * work item is currently pending.
- *
- * @wiphy: the wiphy, for debug purposes
- * @hrwork: the hrtimer work in question
- *
- * Return: true if timer is pending, false otherwise
- *
- * Please refer to the wiphy_delayed_work_pending() documentation as
- * this is the equivalent function for hrtimer based delayed work
- * items.
- */
-bool wiphy_hrtimer_work_pending(struct wiphy *wiphy,
-				struct wiphy_hrtimer_work *hrwork);
 
 /**
  * enum ieee80211_ap_reg_power - regulatory power for an Access Point
@@ -6414,7 +6267,6 @@ enum ieee80211_ap_reg_power {
  *	entered.
  * @links.cac_time_ms: CAC time in ms
  * @valid_links: bitmap describing what elements of @links are valid
- * @radio_mask: Bitmask of radios that this interface is allowed to operate on.
  */
 struct wireless_dev {
 	struct wiphy *wiphy;
@@ -6527,10 +6379,6 @@ struct wireless_dev {
 		unsigned int cac_time_ms;
 	} links[IEEE80211_MLD_MAX_NUM_LINKS];
 	u16 valid_links;
-
-	u32 radio_mask;
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
 };
 
 static inline const u8 *wdev_address(struct wireless_dev *wdev)
@@ -6715,17 +6563,6 @@ static inline bool cfg80211_channel_is_psc(struct ieee80211_channel *chan)
  */
 bool cfg80211_radio_chandef_valid(const struct wiphy_radio *radio,
 				  const struct cfg80211_chan_def *chandef);
-
-/**
- * cfg80211_wdev_channel_allowed - Check if the wdev may use the channel
- *
- * @wdev: the wireless device
- * @chan: channel to check
- *
- * Return: whether or not the wdev may use the channel
- */
-bool cfg80211_wdev_channel_allowed(struct wireless_dev *wdev,
-				   struct ieee80211_channel *chan);
 
 /**
  * ieee80211_get_response_rate - get basic rate for a given rate
@@ -9291,7 +9128,9 @@ int cfg80211_register_netdevice(struct net_device *dev);
  */
 static inline void cfg80211_unregister_netdevice(struct net_device *dev)
 {
+#if IS_ENABLED(CONFIG_CFG80211)
 	cfg80211_unregister_wdev(dev->ieee80211_ptr);
+#endif
 }
 
 /**
@@ -9841,46 +9680,6 @@ static inline int cfg80211_color_change_notify(struct net_device *dev,
  * Also note that the wdev mutex must be held.
  */
 void cfg80211_links_removed(struct net_device *dev, u16 link_mask);
-
-/**
- * struct cfg80211_mlo_reconf_done_data - MLO reconfiguration data
- * @buf: MLO Reconfiguration Response frame (header + body)
- * @len: length of the frame data
- * @driver_initiated: Indicates whether the add links request is initiated by
- *	driver. This is set to true when the link reconfiguration request
- *	initiated by driver due to AP link recommendation requests
- *	(Ex: BTM (BSS Transition Management) request) handling offloaded to
- *	driver.
- * @added_links: BIT mask of links successfully added to the association
- * @links: per-link information indexed by link ID
- * @links.bss: the BSS that MLO reconfiguration was requested for, ownership of
- *      the pointer moves to cfg80211 in the call to
- *      cfg80211_mlo_reconf_add_done().
- *
- * The BSS pointer must be set for each link for which 'add' operation was
- * requested in the assoc_ml_reconf callback.
- */
-struct cfg80211_mlo_reconf_done_data {
-	const u8 *buf;
-	size_t len;
-	bool driver_initiated;
-	u16 added_links;
-	struct {
-		struct cfg80211_bss *bss;
-		u8 *addr;
-	} links[IEEE80211_MLD_MAX_NUM_LINKS];
-};
-
-/**
- * cfg80211_mlo_reconf_add_done - Notify about MLO reconfiguration result
- * @dev: network device.
- * @data: MLO reconfiguration done data, &struct cfg80211_mlo_reconf_done_data
- *
- * Inform cfg80211 and the userspace that processing of ML reconfiguration
- * request to add links to the association is done.
- */
-void cfg80211_mlo_reconf_add_done(struct net_device *dev,
-				  struct cfg80211_mlo_reconf_done_data *data);
 
 /**
  * cfg80211_schedule_channels_check - schedule regulatory check if needed

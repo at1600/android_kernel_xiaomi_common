@@ -77,8 +77,6 @@
 
 #include "uid16.h"
 
-#include <trace/hooks/sys.h>
-
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif
@@ -429,8 +427,6 @@ long __sys_setregid(gid_t rgid, gid_t egid)
 	if (retval < 0)
 		goto error;
 
-	trace_android_vh_security_audit_log_setid(4, old->gid.val, new->gid.val);
-
 	return commit_creds(new);
 
 error:
@@ -476,8 +472,6 @@ long __sys_setgid(gid_t gid)
 	retval = security_task_fix_setgid(new, old, LSM_SETID_ID);
 	if (retval < 0)
 		goto error;
-
-	trace_android_vh_security_audit_log_setid(3, old->gid.val, gid);
 
 	return commit_creds(new);
 
@@ -598,8 +592,6 @@ long __sys_setreuid(uid_t ruid, uid_t euid)
 	if (retval < 0)
 		goto error;
 
-	trace_android_vh_security_audit_log_setid(1, old->uid.val, new->uid.val);
-
 	flag_nproc_exceeded(new);
 	return commit_creds(new);
 
@@ -662,8 +654,6 @@ long __sys_setuid(uid_t uid)
 	retval = set_cred_ucounts(new);
 	if (retval < 0)
 		goto error;
-
-	trace_android_vh_security_audit_log_setid(0, old->uid.val, uid);
 
 	flag_nproc_exceeded(new);
 	return commit_creds(new);
@@ -749,8 +739,6 @@ long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 	retval = set_cred_ucounts(new);
 	if (retval < 0)
 		goto error;
-
-	trace_android_vh_security_audit_log_setid(2, old->uid.val, new->uid.val);
 
 	flag_nproc_exceeded(new);
 	return commit_creds(new);
@@ -841,8 +829,6 @@ long __sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid)
 	retval = security_task_fix_setgid(new, old, LSM_SETID_RES);
 	if (retval < 0)
 		goto error;
-
-	trace_android_vh_security_audit_log_setid(5, old->gid.val, new->gid.val);
 
 	return commit_creds(new);
 
@@ -1712,7 +1698,6 @@ SYSCALL_DEFINE4(prlimit64, pid_t, pid, unsigned int, resource,
 	struct rlimit old, new;
 	struct task_struct *tsk;
 	unsigned int checkflags = 0;
-	bool need_tasklist;
 	int ret;
 
 	if (old_rlim)
@@ -1739,25 +1724,8 @@ SYSCALL_DEFINE4(prlimit64, pid_t, pid, unsigned int, resource,
 	get_task_struct(tsk);
 	rcu_read_unlock();
 
-	need_tasklist = !same_thread_group(tsk, current);
-	if (need_tasklist) {
-		/*
-		 * Ensure we can't race with group exit or de_thread(),
-		 * so tsk->group_leader can't be freed or changed until
-		 * read_unlock(tasklist_lock) below.
-		 */
-		read_lock(&tasklist_lock);
-		if (!pid_alive(tsk))
-			ret = -ESRCH;
-	}
-
-	if (!ret) {
-		ret = do_prlimit(tsk, resource, new_rlim ? &new : NULL,
-				old_rlim ? &old : NULL);
-	}
-
-	if (need_tasklist)
-		read_unlock(&tasklist_lock);
+	ret = do_prlimit(tsk, resource, new_rlim ? &new : NULL,
+			old_rlim ? &old : NULL);
 
 	if (!ret && old_rlim) {
 		rlim_to_rlim64(&old, &old64);
@@ -2376,7 +2344,6 @@ static int prctl_set_vma(unsigned long opt, unsigned long addr,
 	struct mm_struct *mm = current->mm;
 	const char __user *uname;
 	struct anon_vma_name *anon_name = NULL;
-	bool bypass = false;
 	int error;
 
 	switch (opt) {
@@ -2403,10 +2370,6 @@ static int prctl_set_vma(unsigned long opt, unsigned long addr,
 
 		}
 
-		trace_android_rvh_pr_set_vma_name_bypass(mm, addr, size, anon_name,
-			      &error, &bypass);
-		if (bypass)
-			return error;
 		mmap_write_lock(mm);
 		error = madvise_set_anon_name(mm, addr, size, anon_name);
 		mmap_write_unlock(mm);
@@ -2825,7 +2788,6 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = -EINVAL;
 		break;
 	}
-	trace_android_vh_syscall_prctl_finished(option, me);
 	return error;
 }
 

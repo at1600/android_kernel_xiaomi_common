@@ -6,7 +6,6 @@
 #include <linux/freezer.h>
 
 #include "futex.h"
-#include <trace/hooks/futex.h>
 
 /*
  * READ this before attempting to hack on futexes!
@@ -160,7 +159,6 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	union futex_key key = FUTEX_KEY_INIT;
 	DEFINE_WAKE_Q(wake_q);
 	int ret;
-	int target_nr;
 
 	if (!bitset)
 		return -EINVAL;
@@ -180,7 +178,6 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 
 	spin_lock(&hb->lock);
 
-	trace_android_vh_futex_wake_traverse_plist(&hb->chain, &target_nr, key, bitset);
 	plist_for_each_entry_safe(this, next, &hb->chain, list) {
 		if (futex_match (&this->key, &key)) {
 			if (this->pi_state || this->rt_waiter) {
@@ -192,7 +189,6 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 			if (!(this->bitset & bitset))
 				continue;
 
-			trace_android_vh_futex_wake_this(ret, nr_wake, target_nr, this->task);
 			this->wake(&wake_q, this);
 			if (++ret >= nr_wake)
 				break;
@@ -201,7 +197,6 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 
 	spin_unlock(&hb->lock);
 	wake_up_q(&wake_q);
-	trace_android_vh_futex_wake_up_q_finish(nr_wake, target_nr);
 	return ret;
 }
 
@@ -355,7 +350,7 @@ void futex_wait_queue(struct futex_hash_bucket *hb, struct futex_q *q,
 	 * access to the hash list and forcing another memory barrier.
 	 */
 	set_current_state(TASK_INTERRUPTIBLE|TASK_FREEZABLE);
-	futex_queue(q, hb, current);
+	futex_queue(q, hb);
 
 	/* Arm the timer */
 	if (timeout)
@@ -371,10 +366,8 @@ void futex_wait_queue(struct futex_hash_bucket *hb, struct futex_q *q,
 		 * flagged for rescheduling. Only call schedule if there
 		 * is no timeout, or if it has yet to expire.
 		 */
-		if (!timeout || timeout->task) {
-			trace_android_vh_futex_sleep_start(current);
+		if (!timeout || timeout->task)
 			schedule();
-		}
 	}
 	__set_current_state(TASK_RUNNING);
 }
@@ -468,7 +461,7 @@ retry:
 			 * next futex. Queue each futex at this moment so hb can
 			 * be unlocked.
 			 */
-			futex_queue(q, hb, current);
+			futex_queue(q, hb);
 			continue;
 		}
 
@@ -672,7 +665,6 @@ retry:
 	if (ret)
 		return ret;
 
-	trace_android_vh_futex_wait_queue_start(uaddr, flags, bitset);
 	/* futex_queue and wait for wakeup, timeout, or a signal. */
 	futex_wait_queue(hb, &q, to);
 
@@ -699,17 +691,14 @@ int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val, ktime_t *abs_time
 	struct restart_block *restart;
 	int ret;
 
-	trace_android_vh_futex_wait_start(flags, bitset);
 	to = futex_setup_timer(abs_time, &timeout, flags,
 			       current->timer_slack_ns);
 
 	ret = __futex_wait(uaddr, flags, val, to, bitset);
 
 	/* No timeout, nothing to clean up. */
-	if (!to) {
-		trace_android_vh_futex_wait_end(flags, bitset);
+	if (!to)
 		return ret;
-	}
 
 	hrtimer_cancel(&to->timer);
 	destroy_hrtimer_on_stack(&to->timer);
@@ -722,11 +711,9 @@ int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val, ktime_t *abs_time
 		restart->futex.bitset = bitset;
 		restart->futex.flags = flags | FLAGS_HAS_TIMEOUT;
 
-		trace_android_vh_futex_wait_end(flags, bitset);
 		return set_restart_fn(restart, futex_wait_restart);
 	}
 
-	trace_android_vh_futex_wait_end(flags, bitset);
 	return ret;
 }
 

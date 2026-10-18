@@ -24,7 +24,6 @@
 #include <linux/user_namespace.h>
 #include <linux/refcount.h>
 #include <linux/kernel_stat.h>
-#include <linux/android_kabi.h>
 
 #include <linux/cgroup-defs.h>
 
@@ -65,8 +64,6 @@ struct css_task_iter {
 	struct css_set			*cur_dcset;
 	struct task_struct		*cur_task;
 	struct list_head		iters_node;	/* css_set->task_iters */
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 extern struct file_system_type cgroup_fs_type;
@@ -346,7 +343,7 @@ static inline u64 cgroup_id(const struct cgroup *cgrp)
  */
 static inline bool css_is_dying(struct cgroup_subsys_state *css)
 {
-	return css->flags & CSS_DYING;
+	return !(css->flags & CSS_NO_REF) && percpu_ref_is_dying(&css->refcnt);
 }
 
 static inline void cgroup_get(struct cgroup *cgrp)
@@ -634,7 +631,6 @@ static inline void cgroup_kthread_ready(void)
 }
 
 void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen);
-struct cgroup *__cgroup_get_from_id(u64 id);
 struct cgroup *cgroup_get_from_id(u64 id);
 #else /* !CONFIG_CGROUPS */
 

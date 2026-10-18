@@ -19,8 +19,6 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
-#include <linux/types.h>
-#include <linux/android_kabi.h>
 
 #include <asm/mmu.h>
 
@@ -447,7 +445,6 @@ FOLIO_MATCH(compound_head, _head_2a);
  * @pt_index:         Used for s390 gmap.
  * @pt_mm:            Used for x86 pgds.
  * @pt_frag_refcount: For fragmented page table tracking. Powerpc only.
- * @pt_share_count:   Used for HugeTLB PMD page table share count.
  * @_pt_pad_2:        Padding to ensure proper alignment.
  * @ptl:              Lock for the page table.
  * @__page_type:      Same as page->page_type. Unused for page tables.
@@ -474,9 +471,6 @@ struct ptdesc {
 		pgoff_t pt_index;
 		struct mm_struct *pt_mm;
 		atomic_t pt_frag_refcount;
-#ifdef CONFIG_HUGETLB_PMD_PAGE_TABLE_SHARING
-		atomic_t pt_share_count;
-#endif
 	};
 
 	union {
@@ -522,32 +516,6 @@ static_assert(sizeof(struct ptdesc) <= sizeof(struct page));
 	const struct page *:		(const struct ptdesc *)(p),	\
 	struct page *:			(struct ptdesc *)(p)))
 
-#ifdef CONFIG_HUGETLB_PMD_PAGE_TABLE_SHARING
-static inline void ptdesc_pmd_pts_init(struct ptdesc *ptdesc)
-{
-	atomic_set(&ptdesc->pt_share_count, 0);
-}
-
-static inline void ptdesc_pmd_pts_inc(struct ptdesc *ptdesc)
-{
-	atomic_inc(&ptdesc->pt_share_count);
-}
-
-static inline void ptdesc_pmd_pts_dec(struct ptdesc *ptdesc)
-{
-	atomic_dec(&ptdesc->pt_share_count);
-}
-
-static inline int ptdesc_pmd_pts_count(struct ptdesc *ptdesc)
-{
-	return atomic_read(&ptdesc->pt_share_count);
-}
-#else
-static inline void ptdesc_pmd_pts_init(struct ptdesc *ptdesc)
-{
-}
-#endif
-
 /*
  * Used for sizing the vmemmap region on some architectures
  */
@@ -590,12 +558,6 @@ struct page_frag_cache {
 };
 
 typedef unsigned long vm_flags_t;
-
-/*
- * freeptr_t represents a SLUB freelist pointer, which might be encoded
- * and not dereferenceable if CONFIG_SLAB_FREELIST_HARDENED is enabled.
- */
-typedef struct { unsigned long v; } freeptr_t;
 
 /*
  * A region containing a mapping of a non-memory backed file under NOMMU
@@ -653,8 +615,9 @@ static inline struct anon_vma_name *anon_vma_name_alloc(const char *name)
 }
 #endif
 
-#define VMA_LOCK_OFFSET	0x40000000
-#define VMA_REF_LIMIT	(VMA_LOCK_OFFSET - 1)
+struct vma_lock {
+	struct rw_semaphore lock;
+};
 
 struct vma_numab_state {
 	/*
@@ -700,9 +663,6 @@ struct vma_numab_state {
  *
  * Only explicitly marked struct members may be accessed by RCU readers before
  * getting a stable reference.
- *
- * WARNING: when adding new members, please update vm_area_init_from() to copy
- * them during vm_area_struct content duplication.
  */
 struct vm_area_struct {
 	/* The first cache line has the info for VMA tree walking. */
@@ -713,7 +673,9 @@ struct vm_area_struct {
 			unsigned long vm_start;
 			unsigned long vm_end;
 		};
-		freeptr_t vm_freeptr; /* Pointer used by SLAB_TYPESAFE_BY_RCU */
+#ifdef CONFIG_PER_VMA_LOCK
+		struct rcu_head vm_rcu;	/* Used for deferred freeing. */
+#endif
 	};
 
 	/*
@@ -734,12 +696,18 @@ struct vm_area_struct {
 
 #ifdef CONFIG_PER_VMA_LOCK
 	/*
+	 * Flag to indicate areas detached from the mm->mm_mt tree.
+	 * Unstable RCU readers are allowed to read this.
+	 */
+	bool detached;
+
+	/*
 	 * Can only be written (using WRITE_ONCE()) while holding both:
 	 *  - mmap_lock (in write mode)
-	 *  - vm_refcnt bit at VMA_LOCK_OFFSET is set
+	 *  - vm_lock->lock (in write mode)
 	 * Can be read reliably while holding one of:
 	 *  - mmap_lock (in read or write mode)
-	 *  - vm_refcnt bit at VMA_LOCK_OFFSET is set or vm_refcnt > 1
+	 *  - vm_lock->lock (in read or write mode)
 	 * Can be read unreliably (using READ_ONCE()) for pessimistic bailout
 	 * while holding nothing (except RCU to keep the VMA struct allocated).
 	 *
@@ -747,8 +715,21 @@ struct vm_area_struct {
 	 * counter reuse can only lead to occasional unnecessary use of the
 	 * slowpath.
 	 */
-	unsigned int vm_lock_seq;
+	int vm_lock_seq;
+	/* Unstable RCU readers are allowed to read this. */
+	struct vma_lock *vm_lock;
 #endif
+
+	/*
+	 * For areas with an address space and backing store,
+	 * linkage into the address_space->i_mmap interval tree.
+	 *
+	 */
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+
 	/*
 	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
 	 * list, after a COW of one of the file pages.	A MAP_SHARED vma
@@ -768,6 +749,14 @@ struct vm_area_struct {
 	struct file * vm_file;		/* File we map to (can be NULL). */
 	void * vm_private_data;		/* was vm_pte (shared mem) */
 
+#ifdef CONFIG_ANON_VMA_NAME
+	/*
+	 * For private and shared anonymous mappings, a pointer to a null
+	 * terminated string containing the name given to the vma, or NULL if
+	 * unnamed. Serialized by mmap_lock. Use anon_vma_name to access.
+	 */
+	struct anon_vma_name *anon_name;
+#endif
 #ifdef CONFIG_SWAP
 	atomic_long_t swap_readahead_info;
 #endif
@@ -780,36 +769,7 @@ struct vm_area_struct {
 #ifdef CONFIG_NUMA_BALANCING
 	struct vma_numab_state *numab_state;	/* NUMA Balancing state */
 #endif
-#ifdef CONFIG_PER_VMA_LOCK
-	/* Unstable RCU readers are allowed to read this. */
-	refcount_t vm_refcnt ____cacheline_aligned_in_smp;
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-	struct lockdep_map vmlock_dep_map;
-#endif
-#endif
-	/*
-	 * For areas with an address space and backing store,
-	 * linkage into the address_space->i_mmap interval tree.
-	 *
-	 */
-	struct {
-		struct rb_node rb;
-		unsigned long rb_subtree_last;
-	} shared;
-#ifdef CONFIG_ANON_VMA_NAME
-	/*
-	 * For private and shared anonymous mappings, a pointer to a null
-	 * terminated string containing the name given to the vma, or NULL if
-	 * unnamed. Serialized by mmap_lock. Use anon_vma_name to access.
-	 */
-	struct anon_vma_name *anon_name;
-#endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 } __randomize_layout;
 
 #ifdef CONFIG_NUMA
@@ -921,16 +881,12 @@ struct mm_struct {
 					  * by mmlist_lock
 					  */
 #ifdef CONFIG_PER_VMA_LOCK
-		struct rcuwait vma_writer_wait;
 		/*
 		 * This field has lock-like semantics, meaning it is sometimes
 		 * accessed with ACQUIRE/RELEASE semantics.
 		 * Roughly speaking, incrementing the sequence number is
 		 * equivalent to releasing locks on VMAs; reading the sequence
 		 * number can be part of taking a read lock on a VMA.
-		 * Incremented every time mmap_lock is write-locked/unlocked.
-		 * Initialized to 0, therefore odd values indicate mmap_lock
-		 * is write-locked and even values that it's released.
 		 *
 		 * Can be modified under write mmap_lock using RELEASE
 		 * semantics.
@@ -939,7 +895,7 @@ struct mm_struct {
 		 * Can be read with ACQUIRE semantics if not holding write
 		 * mmap_lock.
 		 */
-		seqcount_t mm_lock_seq;
+		int mm_lock_seq;
 #endif
 
 
@@ -1074,8 +1030,6 @@ struct mm_struct {
 #endif
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN_WALKS_MMU */
-
-		ANDROID_KABI_USE(1, struct task_dma_buf_info *dmabuf_info);
 	} __randomize_layout;
 
 	/*

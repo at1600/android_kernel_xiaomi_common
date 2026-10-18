@@ -89,11 +89,6 @@ void hibernate_release(void)
 	atomic_inc(&hibernate_atomic);
 }
 
-bool hibernation_in_progress(void)
-{
-	return !atomic_read(&hibernate_atomic);
-}
-
 bool hibernation_available(void)
 {
 	return nohibernate == 0 &&
@@ -613,11 +608,7 @@ int hibernation_platform_enter(void)
 
 	local_irq_disable();
 	system_state = SYSTEM_SUSPEND;
-
-	error = syscore_suspend();
-	if (error)
-		goto Enable_irqs;
-
+	syscore_suspend();
 	if (pm_wakeup_pending()) {
 		error = -EAGAIN;
 		goto Power_up;
@@ -629,7 +620,6 @@ int hibernation_platform_enter(void)
 
  Power_up:
 	syscore_resume();
- Enable_irqs:
 	system_state = SYSTEM_RUNNING;
 	local_irq_enable();
 
@@ -778,9 +768,7 @@ int hibernate(void)
 	if (error)
 		goto Restore;
 
-	error = pm_sleep_fs_sync();
-	if (error)
-		goto Exit;
+	ksys_sync_helper();
 
 	error = freeze_processes();
 	if (error)
@@ -1450,10 +1438,10 @@ static const char * const comp_alg_enabled[] = {
 static int hibernate_compressor_param_set(const char *compressor,
 		const struct kernel_param *kp)
 {
+	unsigned int sleep_flags;
 	int index, ret;
 
-	if (!mutex_trylock(&system_transition_mutex))
-		return -EBUSY;
+	sleep_flags = lock_system_sleep();
 
 	index = sysfs_match_string(comp_alg_enabled, compressor);
 	if (index >= 0) {
@@ -1465,7 +1453,7 @@ static int hibernate_compressor_param_set(const char *compressor,
 		ret = index;
 	}
 
-	mutex_unlock(&system_transition_mutex);
+	unlock_system_sleep(sleep_flags);
 
 	if (ret)
 		pr_debug("Cannot set specified compressor %s\n",

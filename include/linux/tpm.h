@@ -26,9 +26,7 @@
 #include <crypto/aes.h>
 
 #define TPM_DIGEST_SIZE 20	/* Max TPM v1.2 PCR size */
-
-#define TPM2_MAX_DIGEST_SIZE	SHA512_DIGEST_SIZE
-#define TPM2_MAX_PCR_BANKS	8
+#define TPM_MAX_DIGEST_SIZE SHA512_DIGEST_SIZE
 
 struct tpm_chip;
 struct trusted_key_payload;
@@ -70,7 +68,7 @@ enum tpm2_curves {
 
 struct tpm_digest {
 	u16 alg_id;
-	u8 digest[TPM2_MAX_DIGEST_SIZE];
+	u8 digest[TPM_MAX_DIGEST_SIZE];
 } __packed;
 
 struct tpm_bank_info {
@@ -190,7 +188,7 @@ struct tpm_chip {
 	unsigned int groups_cnt;
 
 	u32 nr_allocated_banks;
-	struct tpm_bank_info allocated_banks[TPM2_MAX_PCR_BANKS];
+	struct tpm_bank_info *allocated_banks;
 #ifdef CONFIG_ACPI
 	acpi_handle acpi_dev_handle;
 	char ppi_version[TPM_PPI_VERSION_LEN + 1];
@@ -226,7 +224,7 @@ enum tpm2_const {
 
 enum tpm2_timeouts {
 	TPM2_TIMEOUT_A          =    750,
-	TPM2_TIMEOUT_B          =   4000,
+	TPM2_TIMEOUT_B          =   2000,
 	TPM2_TIMEOUT_C          =    200,
 	TPM2_TIMEOUT_D          =     30,
 	TPM2_DURATION_SHORT     =     20,
@@ -259,7 +257,6 @@ enum tpm2_return_codes {
 	TPM2_RC_TESTING		= 0x090A, /* RC_WARN */
 	TPM2_RC_REFERENCE_H0	= 0x0910,
 	TPM2_RC_RETRY		= 0x0922,
-	TPM2_RC_SESSION_MEMORY	= 0x0903,
 };
 
 enum tpm2_command_codes {
@@ -338,7 +335,6 @@ enum tpm2_cc_attrs {
 #define TPM_VID_WINBOND  0x1050
 #define TPM_VID_STM      0x104A
 #define TPM_VID_ATML     0x1114
-#define TPM_VID_IFX      0x15D1
 
 enum tpm_chip_flags {
 	TPM_CHIP_FLAG_BOOTSTRAPPED		= BIT(0),
@@ -440,24 +436,6 @@ static inline u32 tpm2_rc_value(u32 rc)
 	return (rc & BIT(7)) ? rc & 0xbf : rc;
 }
 
-/*
- * Convert a return value from tpm_transmit_cmd() to POSIX error code.
- */
-static inline ssize_t tpm_ret_to_err(ssize_t ret)
-{
-	if (ret < 0)
-		return ret;
-
-	switch (tpm2_rc_value(ret)) {
-	case TPM2_RC_SUCCESS:
-		return 0;
-	case TPM2_RC_SESSION_MEMORY:
-		return -ENOMEM;
-	default:
-		return -EFAULT;
-	}
-}
-
 #if defined(CONFIG_TCG_TPM) || defined(CONFIG_TCG_TPM_MODULE)
 
 extern int tpm_is_tpm2(struct tpm_chip *chip);
@@ -523,8 +501,8 @@ static inline struct tpm2_auth *tpm2_chip_auth(struct tpm_chip *chip)
 #endif
 }
 
-int tpm_buf_append_name(struct tpm_chip *chip, struct tpm_buf *buf,
-			u32 handle, u8 *name);
+void tpm_buf_append_name(struct tpm_chip *chip, struct tpm_buf *buf,
+			 u32 handle, u8 *name);
 void tpm_buf_append_hmac_session(struct tpm_chip *chip, struct tpm_buf *buf,
 				 u8 attributes, u8 *passphrase,
 				 int passphraselen);
@@ -557,7 +535,7 @@ static inline void tpm_buf_append_hmac_session_opt(struct tpm_chip *chip,
 #ifdef CONFIG_TCG_TPM2_HMAC
 
 int tpm2_start_auth_session(struct tpm_chip *chip);
-int tpm_buf_fill_hmac_session(struct tpm_chip *chip, struct tpm_buf *buf);
+void tpm_buf_fill_hmac_session(struct tpm_chip *chip, struct tpm_buf *buf);
 int tpm_buf_check_hmac_response(struct tpm_chip *chip, struct tpm_buf *buf,
 				int rc);
 void tpm2_end_auth_session(struct tpm_chip *chip);
@@ -571,13 +549,10 @@ static inline int tpm2_start_auth_session(struct tpm_chip *chip)
 static inline void tpm2_end_auth_session(struct tpm_chip *chip)
 {
 }
-
-static inline int tpm_buf_fill_hmac_session(struct tpm_chip *chip,
-					    struct tpm_buf *buf)
+static inline void tpm_buf_fill_hmac_session(struct tpm_chip *chip,
+					     struct tpm_buf *buf)
 {
-	return 0;
 }
-
 static inline int tpm_buf_check_hmac_response(struct tpm_chip *chip,
 					      struct tpm_buf *buf,
 					      int rc)

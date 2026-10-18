@@ -6,9 +6,7 @@
 #include <linux/dma-direction.h>
 #include <linux/ptr_ring.h>
 #include <linux/types.h>
-#include <linux/xarray.h>
 #include <net/netmem.h>
-#include <linux/android_kabi.h>
 
 #define PP_FLAG_DMA_MAP		BIT(0) /* Should page_pool do the DMA
 					* map/unmap
@@ -34,9 +32,6 @@
 
 #define PP_FLAG_ALL		(PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV | \
 				 PP_FLAG_SYSTEM_POOL | PP_FLAG_ALLOW_UNREADABLE_NETMEM)
-
-/* Index limit to stay within PP_DMA_INDEX_BITS for DMA indices */
-#define PP_DMA_INDEX_LIMIT XA_LIMIT(1, BIT(PP_DMA_INDEX_BITS) - 1)
 
 /*
  * Fast allocation side cache array/stack
@@ -221,8 +216,6 @@ struct page_pool {
 
 	void *mp_priv;
 
-	struct xarray dma_mapped;
-
 #ifdef CONFIG_PAGE_POOL_STATS
 	/* recycle stats are per-cpu to avoid locking */
 	struct page_pool_recycle_stats __percpu *recycle_stats;
@@ -246,7 +239,6 @@ struct page_pool {
 		u32 napi_id;
 		u32 id;
 	} user;
-	ANDROID_KABI_RESERVE(1);
 };
 
 struct page *page_pool_alloc_pages(struct page_pool *pool, gfp_t gfp);

@@ -32,8 +32,6 @@
 
 #include <asm/irq_regs.h>
 
-#include <trace/hooks/softlockup.h>
-
 static DEFINE_MUTEX(watchdog_mutex);
 
 #if defined(CONFIG_HARDLOCKUP_DETECTOR) || defined(CONFIG_HARDLOCKUP_DETECTOR_SPARC64)
@@ -49,7 +47,6 @@ int __read_mostly watchdog_user_enabled = 1;
 static int __read_mostly watchdog_hardlockup_user_enabled = WATCHDOG_HARDLOCKUP_DEFAULT;
 static int __read_mostly watchdog_softlockup_user_enabled = 1;
 int __read_mostly watchdog_thresh = 10;
-static int __read_mostly watchdog_thresh_next;
 static int __read_mostly watchdog_hardlockup_available;
 
 struct cpumask watchdog_cpumask __read_mostly;
@@ -349,6 +346,8 @@ static int __init watchdog_thresh_setup(char *str)
 	return 1;
 }
 __setup("watchdog_thresh=", watchdog_thresh_setup);
+
+static void __lockup_detector_cleanup(void);
 
 #ifdef CONFIG_SOFTLOCKUP_DETECTOR_INTR_STORM
 enum stats_per_group {
@@ -768,7 +767,6 @@ static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
 				clear_bit_unlock(0, &soft_lockup_nmi_warn);
 		}
 
-		trace_android_vh_watchdog_timer_softlockup(duration, regs, !!softlockup_panic);
 		add_taint(TAINT_SOFTLOCKUP, LOCKDEP_STILL_OK);
 		if (softlockup_panic)
 			panic("softlockup: hung tasks");
@@ -867,20 +865,12 @@ int lockup_detector_offline_cpu(unsigned int cpu)
 	return 0;
 }
 
-static void __lockup_detector_reconfigure(bool thresh_changed)
+static void __lockup_detector_reconfigure(void)
 {
 	cpus_read_lock();
 	watchdog_hardlockup_stop();
 
 	softlockup_stop_all();
-	/*
-	 * To prevent watchdog_timer_fn from using the old interval and
-	 * the new watchdog_thresh at the same time, which could lead to
-	 * false softlockup reports, it is necessary to update the
-	 * watchdog_thresh after the softlockup is completed.
-	 */
-	if (thresh_changed)
-		watchdog_thresh = READ_ONCE(watchdog_thresh_next);
 	set_sample_period();
 	lockup_detector_update_enable();
 	if (watchdog_enabled && watchdog_thresh)
@@ -888,12 +878,17 @@ static void __lockup_detector_reconfigure(bool thresh_changed)
 
 	watchdog_hardlockup_start();
 	cpus_read_unlock();
+	/*
+	 * Must be called outside the cpus locked section to prevent
+	 * recursive locking in the perf code.
+	 */
+	__lockup_detector_cleanup();
 }
 
 void lockup_detector_reconfigure(void)
 {
 	mutex_lock(&watchdog_mutex);
-	__lockup_detector_reconfigure(false);
+	__lockup_detector_reconfigure();
 	mutex_unlock(&watchdog_mutex);
 }
 
@@ -913,31 +908,47 @@ static __init void lockup_detector_setup(void)
 		return;
 
 	mutex_lock(&watchdog_mutex);
-	__lockup_detector_reconfigure(false);
+	__lockup_detector_reconfigure();
 	softlockup_initialized = true;
 	mutex_unlock(&watchdog_mutex);
 }
 
 #else /* CONFIG_SOFTLOCKUP_DETECTOR */
-static void __lockup_detector_reconfigure(bool thresh_changed)
+static void __lockup_detector_reconfigure(void)
 {
 	cpus_read_lock();
 	watchdog_hardlockup_stop();
-	if (thresh_changed)
-		watchdog_thresh = READ_ONCE(watchdog_thresh_next);
 	lockup_detector_update_enable();
 	watchdog_hardlockup_start();
 	cpus_read_unlock();
 }
 void lockup_detector_reconfigure(void)
 {
-	__lockup_detector_reconfigure(false);
+	__lockup_detector_reconfigure();
 }
 static inline void lockup_detector_setup(void)
 {
-	__lockup_detector_reconfigure(false);
+	__lockup_detector_reconfigure();
 }
 #endif /* !CONFIG_SOFTLOCKUP_DETECTOR */
+
+static void __lockup_detector_cleanup(void)
+{
+	lockdep_assert_held(&watchdog_mutex);
+	hardlockup_detector_perf_cleanup();
+}
+
+/**
+ * lockup_detector_cleanup - Cleanup after cpu hotplug or sysctl changes
+ *
+ * Caller must not hold the cpu hotplug rwsem.
+ */
+void lockup_detector_cleanup(void)
+{
+	mutex_lock(&watchdog_mutex);
+	__lockup_detector_cleanup();
+	mutex_unlock(&watchdog_mutex);
+}
 
 /**
  * lockup_detector_soft_poweroff - Interface to stop lockup detector(s)
@@ -953,11 +964,11 @@ void lockup_detector_soft_poweroff(void)
 #ifdef CONFIG_SYSCTL
 
 /* Propagate any changes to the watchdog infrastructure */
-static void proc_watchdog_update(bool thresh_changed)
+static void proc_watchdog_update(void)
 {
 	/* Remove impossible cpus to keep sysctl output clean. */
 	cpumask_and(&watchdog_cpumask, &watchdog_cpumask, cpu_possible_mask);
-	__lockup_detector_reconfigure(thresh_changed);
+	__lockup_detector_reconfigure();
 }
 
 /*
@@ -990,7 +1001,7 @@ static int proc_watchdog_common(int which, const struct ctl_table *table, int wr
 		old = READ_ONCE(*param);
 		err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 		if (!err && old != READ_ONCE(*param))
-			proc_watchdog_update(false);
+			proc_watchdog_update();
 	}
 	mutex_unlock(&watchdog_mutex);
 	return err;
@@ -1041,13 +1052,11 @@ static int proc_watchdog_thresh(const struct ctl_table *table, int write,
 
 	mutex_lock(&watchdog_mutex);
 
-	watchdog_thresh_next = READ_ONCE(watchdog_thresh);
-
-	old = watchdog_thresh_next;
+	old = READ_ONCE(watchdog_thresh);
 	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 
-	if (!err && write && old != READ_ONCE(watchdog_thresh_next))
-		proc_watchdog_update(true);
+	if (!err && write && old != READ_ONCE(watchdog_thresh))
+		proc_watchdog_update();
 
 	mutex_unlock(&watchdog_mutex);
 	return err;
@@ -1068,7 +1077,7 @@ static int proc_watchdog_cpumask(const struct ctl_table *table, int write,
 
 	err = proc_do_large_bitmap(table, write, buffer, lenp, ppos);
 	if (!err && write)
-		proc_watchdog_update(false);
+		proc_watchdog_update();
 
 	mutex_unlock(&watchdog_mutex);
 	return err;
@@ -1088,7 +1097,7 @@ static struct ctl_table watchdog_sysctls[] = {
 	},
 	{
 		.procname	= "watchdog_thresh",
-		.data		= &watchdog_thresh_next,
+		.data		= &watchdog_thresh,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_watchdog_thresh,

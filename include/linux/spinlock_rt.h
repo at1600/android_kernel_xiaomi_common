@@ -16,25 +16,26 @@ static inline void __rt_spin_lock_init(spinlock_t *lock, const char *name,
 }
 #endif
 
-#define __spin_lock_init(slock, name, key, percpu)		\
-do {								\
-	rt_mutex_base_init(&(slock)->lock);			\
-	__rt_spin_lock_init(slock, name, key, percpu);		\
-} while (0)
-
-#define _spin_lock_init(slock, percpu)				\
+#define spin_lock_init(slock)					\
 do {								\
 	static struct lock_class_key __key;			\
-	__spin_lock_init(slock, #slock, &__key, percpu);	\
+								\
+	rt_mutex_base_init(&(slock)->lock);			\
+	__rt_spin_lock_init(slock, #slock, &__key, false);	\
 } while (0)
 
-#define spin_lock_init(slock)		_spin_lock_init(slock, false)
-#define local_spin_lock_init(slock)	_spin_lock_init(slock, true)
+#define local_spin_lock_init(slock)				\
+do {								\
+	static struct lock_class_key __key;			\
+								\
+	rt_mutex_base_init(&(slock)->lock);			\
+	__rt_spin_lock_init(slock, #slock, &__key, true);	\
+} while (0)
 
-extern void rt_spin_lock(spinlock_t *lock) __acquires(lock);
-extern void rt_spin_lock_nested(spinlock_t *lock, int subclass)	__acquires(lock);
-extern void rt_spin_lock_nest_lock(spinlock_t *lock, struct lockdep_map *nest_lock) __acquires(lock);
-extern void rt_spin_unlock(spinlock_t *lock)	__releases(lock);
+extern void rt_spin_lock(spinlock_t *lock);
+extern void rt_spin_lock_nested(spinlock_t *lock, int subclass);
+extern void rt_spin_lock_nest_lock(spinlock_t *lock, struct lockdep_map *nest_lock);
+extern void rt_spin_unlock(spinlock_t *lock);
 extern void rt_spin_lock_unlock(spinlock_t *lock);
 extern int rt_spin_trylock_bh(spinlock_t *lock);
 extern int rt_spin_trylock(spinlock_t *lock);

@@ -47,7 +47,6 @@
 #include <linux/cgroup.h>
 #include <linux/audit.h>
 #include <linux/sysctl.h>
-#include <linux/oom.h>
 #include <uapi/linux/pidfd.h>
 
 #define CREATE_TRACE_POINTS
@@ -60,13 +59,9 @@
 #include <asm/cacheflush.h>
 #include <asm/syscall.h>	/* for syscall_get_* */
 
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/signal.h>
 /*
  * SLAB caches for signal bits.
  */
-
-EXPORT_TRACEPOINT_SYMBOL_GPL(signal_generate);
 
 static struct kmem_cache *sigqueue_cachep;
 
@@ -1054,7 +1049,6 @@ static void complete_signal(int sig, struct task_struct *p, enum pid_type type)
 			signal->group_exit_code = sig;
 			signal->group_stop_count = 0;
 			__for_each_thread(signal, t) {
-				trace_android_vh_exit_signal(t);
 				task_clear_jobctl_pending(t, JOBCTL_PENDING_MASK);
 				sigaddset(&t->pending.signal, SIGKILL);
 				signal_wake_up(t, 1);
@@ -1301,7 +1295,7 @@ int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p
 {
 	unsigned long flags;
 	int ret = -ESRCH;
-	trace_android_vh_do_send_sig_info(sig, current, p);
+
 	if (lock_task_sighand(p, &flags)) {
 		ret = send_signal_locked(sig, info, p, type);
 		unlock_task_sighand(p, &flags);
@@ -1309,7 +1303,6 @@ int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(do_send_sig_info);
 
 enum sig_handler {
 	HANDLER_CURRENT, /* If reachable use the current handler */
@@ -1401,16 +1394,8 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 	rcu_read_lock();
 	for (;;) {
 		sighand = rcu_dereference(tsk->sighand);
-		if (unlikely(sighand == NULL)) {
-			/*
-			 * Pairs with the smp_store_release() in
-			 * __exit_signal().  It ensures that all state
-			 * modifications to the task preceeding the store are
-			 * visible to the callers of lock_task_sighand().
-			 */
-			smp_acquire__after_ctrl_dep();
+		if (unlikely(sighand == NULL))
 			break;
-		}
 
 		/*
 		 * This sighand can be already freed and even reused, but
@@ -1461,16 +1446,8 @@ int group_send_sig_info(int sig, struct kernel_siginfo *info,
 	ret = check_kill_permission(sig, info, p);
 	rcu_read_unlock();
 
-	if (!ret && sig) {
+	if (!ret && sig)
 		ret = do_send_sig_info(sig, info, p, type);
-		if (!ret && sig == SIGKILL) {
-			bool reap = false;
-
-			trace_android_vh_killed_process(current, p, &reap);
-			if (reap)
-				add_to_oom_reaper(p);
-		}
-	}
 
 	return ret;
 }
@@ -2009,15 +1986,14 @@ int send_sigqueue(struct sigqueue *q, struct pid *pid, enum pid_type type)
 	 * into t->pending).
 	 *
 	 * Where type is not PIDTYPE_PID, signals must be delivered to the
-	 * process. In this case, prefer to deliver to current if it is in the
-	 * same thread group as the target process and its sighand is stable,
-	 * which avoids unnecessarily waking up a potentially idle task.
+	 * process. In this case, prefer to deliver to current if it is in
+	 * the same thread group as the target process, which avoids
+	 * unnecessarily waking up a potentially idle task.
 	 */
 	t = pid_task(pid, type);
 	if (!t)
 		goto ret;
-	if (type != PIDTYPE_PID &&
-	    same_thread_group(t, current) && !current->exit_state)
+	if (type != PIDTYPE_PID && same_thread_group(t, current))
 		t = current;
 	if (!likely(lock_task_sighand(t, &flags)))
 		goto ret;
@@ -2086,7 +2062,8 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 	WARN_ON_ONCE(!tsk->ptrace &&
 	       (tsk->group_leader != tsk || !thread_group_empty(tsk)));
 	/*
-	 * Notify for thread-group leaders without subthreads.
+	 * tsk is a group leader and has no threads, wake up the
+	 * non-PIDFD_THREAD waiters.
 	 */
 	if (thread_group_empty(tsk))
 		do_notify_pidfd(tsk);
@@ -3914,47 +3891,6 @@ static struct pid *pidfd_to_pid(const struct file *file)
 	(PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | \
 	 PIDFD_SIGNAL_PROCESS_GROUP)
 
-static int do_pidfd_send_signal(struct pid *pid, int sig, enum pid_type type,
-				siginfo_t __user *info, unsigned int flags)
-{
-	kernel_siginfo_t kinfo;
-
-	switch (flags) {
-	case PIDFD_SIGNAL_THREAD:
-		type = PIDTYPE_PID;
-		break;
-	case PIDFD_SIGNAL_THREAD_GROUP:
-		type = PIDTYPE_TGID;
-		break;
-	case PIDFD_SIGNAL_PROCESS_GROUP:
-		type = PIDTYPE_PGID;
-		break;
-	}
-
-	if (info) {
-		int ret;
-
-		ret = copy_siginfo_from_user_any(&kinfo, info);
-		if (unlikely(ret))
-			return ret;
-
-		if (unlikely(sig != kinfo.si_signo))
-			return -EINVAL;
-
-		/* Only allow sending arbitrary signals to yourself. */
-		if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
-		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
-			return -EPERM;
-	} else {
-		prepare_kill_siginfo(sig, &kinfo, type);
-	}
-
-	if (type == PIDTYPE_PGID)
-		return kill_pgrp_info(sig, &kinfo, pid);
-
-	return kill_pid_info_type(sig, &kinfo, pid, type);
-}
-
 /**
  * sys_pidfd_send_signal - Signal a process through a pidfd
  * @pidfd:  file descriptor of the process
@@ -3975,6 +3911,7 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 	int ret;
 	struct fd f;
 	struct pid *pid;
+	kernel_siginfo_t kinfo;
 	enum pid_type type;
 
 	/* Enforce flags be set to 0 until we add an extension. */
@@ -3985,48 +3922,64 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 	if (hweight32(flags & PIDFD_SEND_SIGNAL_FLAGS) > 1)
 		return -EINVAL;
 
-	switch (pidfd) {
-	case PIDFD_SELF_THREAD:
-		pid = get_task_pid(current, PIDTYPE_PID);
-		type = PIDTYPE_PID;
-		break;
-	case PIDFD_SELF_THREAD_GROUP:
-		pid = get_task_pid(current, PIDTYPE_TGID);
-		type = PIDTYPE_TGID;
-		break;
-	default: {
-		f = fdget(pidfd);
-		if (!fd_file(f))
-			return -EBADF;
+	f = fdget(pidfd);
+	if (!fd_file(f))
+		return -EBADF;
 
-		/* Is this a pidfd? */
-		pid = pidfd_to_pid(fd_file(f));
-		if (IS_ERR(pid)) {
-			ret = PTR_ERR(pid);
-			goto err;
-		}
+	/* Is this a pidfd? */
+	pid = pidfd_to_pid(fd_file(f));
+	if (IS_ERR(pid)) {
+		ret = PTR_ERR(pid);
+		goto err;
+	}
 
-		if (!access_pidfd_pidns(pid)) {
-			ret = -EINVAL;
-			goto err;
-		}
+	ret = -EINVAL;
+	if (!access_pidfd_pidns(pid))
+		goto err;
 
+	switch (flags) {
+	case 0:
 		/* Infer scope from the type of pidfd. */
 		if (fd_file(f)->f_flags & PIDFD_THREAD)
 			type = PIDTYPE_PID;
 		else
 			type = PIDTYPE_TGID;
+		break;
+	case PIDFD_SIGNAL_THREAD:
+		type = PIDTYPE_PID;
+		break;
+	case PIDFD_SIGNAL_THREAD_GROUP:
+		type = PIDTYPE_TGID;
+		break;
+	case PIDFD_SIGNAL_PROCESS_GROUP:
+		type = PIDTYPE_PGID;
+		break;
+	}
 
-		ret = do_pidfd_send_signal(pid, sig, type, info, flags);
+	if (info) {
+		ret = copy_siginfo_from_user_any(&kinfo, info);
+		if (unlikely(ret))
+			goto err;
+
+		ret = -EINVAL;
+		if (unlikely(sig != kinfo.si_signo))
+			goto err;
+
+		/* Only allow sending arbitrary signals to yourself. */
+		ret = -EPERM;
+		if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
+		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
+			goto err;
+	} else {
+		prepare_kill_siginfo(sig, &kinfo, type);
+	}
+
+	if (type == PIDTYPE_PGID)
+		ret = kill_pgrp_info(sig, &kinfo, pid);
+	else
+		ret = kill_pid_info_type(sig, &kinfo, pid, type);
 err:
-		fdput(f);
-		return ret;
-	}
-	}
-
-	ret = do_pidfd_send_signal(pid, sig, type, info, flags);
-	put_pid(pid);
-
+	fdput(f);
 	return ret;
 }
 
@@ -4809,7 +4762,6 @@ __weak const char *arch_vma_name(struct vm_area_struct *vma)
 {
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(arch_vma_name);
 
 static inline void siginfo_buildtime_checks(void)
 {

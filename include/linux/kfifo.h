@@ -37,6 +37,7 @@
  */
 
 #include <linux/array_size.h>
+#include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 #include <linux/types.h>

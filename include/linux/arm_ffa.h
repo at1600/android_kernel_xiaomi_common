@@ -112,7 +112,6 @@
 	 FIELD_PREP(FFA_MINOR_VERSION_MASK, (minor)))
 #define FFA_VERSION_1_0		FFA_PACK_VERSION_INFO(1, 0)
 #define FFA_VERSION_1_1		FFA_PACK_VERSION_INFO(1, 1)
-#define FFA_VERSION_1_2		FFA_PACK_VERSION_INFO(1, 2)
 
 /**
  * FF-A specification mentions explicitly about '4K pages'. This should
@@ -128,7 +127,6 @@
 #define FFA_FEAT_RXTX_MIN_SZ_4K		0
 #define FFA_FEAT_RXTX_MIN_SZ_64K	1
 #define FFA_FEAT_RXTX_MIN_SZ_16K	2
-#define FFA_FEAT_RXTX_MIN_SZ_MASK	GENMASK(1, 0)
 
 /* FFA Bus/Device/Driver related */
 struct ffa_device {
@@ -168,12 +166,9 @@ static inline void *ffa_dev_get_drvdata(struct ffa_device *fdev)
 	return dev_get_drvdata(&fdev->dev);
 }
 
-struct ffa_partition_info;
-
 #if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
-struct ffa_device *
-ffa_device_register(const struct ffa_partition_info *part_info,
-		    const struct ffa_ops *ops);
+struct ffa_device *ffa_device_register(const uuid_t *uuid, int vm_id,
+				       const struct ffa_ops *ops);
 void ffa_device_unregister(struct ffa_device *ffa_dev);
 int ffa_driver_register(struct ffa_driver *driver, struct module *owner,
 			const char *mod_name);
@@ -181,9 +176,9 @@ void ffa_driver_unregister(struct ffa_driver *driver);
 bool ffa_device_is_valid(struct ffa_device *ffa_dev);
 
 #else
-static inline struct ffa_device *
-ffa_device_register(const struct ffa_partition_info *part_info,
-		    const struct ffa_ops *ops)
+static inline
+struct ffa_device *ffa_device_register(const uuid_t *uuid, int vm_id,
+				       const struct ffa_ops *ops)
 {
 	return NULL;
 }
@@ -225,9 +220,6 @@ extern const struct bus_type ffa_bus_type;
 /* The FF-A 1.0 partition structure lacks the uuid[4] */
 #define FFA_1_0_PARTITON_INFO_SZ	(8)
 
-/* Return the count of partitions deployed in the system */
-#define PARTITION_INFO_GET_RETURN_COUNT_ONLY	BIT(0)
-
 /* FFA transport related */
 struct ffa_partition_info {
 	u16 id;
@@ -240,18 +232,11 @@ struct ffa_partition_info {
 #define FFA_PARTITION_INDIRECT_MSG	BIT(2)
 /* partition can receive notifications */
 #define FFA_PARTITION_NOTIFICATION_RECV	BIT(3)
-/* partition must be informed about each VM that is created by the Hypervisor */
-#define FFA_PARTITION_HYP_CREATE_VM	BIT(6)
-/* partition must be informed about each VM that is destroyed by the Hypervisor */
-#define FFA_PARTITION_HYP_DESTROY_VM	BIT(7)
 /* partition runs in the AArch64 execution state. */
 #define FFA_PARTITION_AARCH64_EXEC	BIT(8)
 	u32 properties;
 	u32 uuid[4];
 };
-
-#define FFA_VM_CREATION_MSG	(BIT(31) | (BIT(2)))
-#define FFA_VM_DESTRUCTION_MSG  (FFA_VM_CREATION_MSG | BIT(1))
 
 static inline
 bool ffa_partition_check_property(struct ffa_device *dev, u32 property)
@@ -267,8 +252,6 @@ bool ffa_partition_check_property(struct ffa_device *dev, u32 property)
 
 #define ffa_partition_supports_direct_recv(dev)	\
 	ffa_partition_check_property(dev, FFA_PARTITION_DIRECT_RECV)
-
-#define FFA_SRC_ENDPOINT_MASK	GENMASK(31, 16)
 
 /* For use with FFA_MSG_SEND_DIRECT_{REQ,RESP} which pass data via registers */
 struct ffa_send_direct_data {
@@ -337,7 +320,6 @@ struct ffa_mem_region_attributes {
 	 * an `struct ffa_mem_region_addr_range`.
 	 */
 	u32 composite_off;
-	u8 impdef_val[16];
 	u64 reserved;
 };
 
@@ -417,41 +399,18 @@ struct ffa_mem_region {
 #define CONSTITUENTS_OFFSET(x)	\
 	(offsetof(struct ffa_composite_mem_region, constituents[x]))
 
-#define FFA_EMAD_HAS_IMPDEF_FIELD(version)	((version) >= FFA_VERSION_1_2)
-#define FFA_MEM_REGION_HAS_EP_MEM_OFFSET(version) ((version) > FFA_VERSION_1_0)
-
-/* The layout changed from FFA_VERSION_1_0 and the region includes an
- * ep_mem_offset.
- */
-#define FFA_MEM_REGION_SZ(version)		(!FFA_MEM_REGION_HAS_EP_MEM_OFFSET((version)) ?\
-						 offsetof(struct ffa_mem_region, ep_mem_offset) :\
-						 sizeof(struct ffa_mem_region))
-
-static inline u32 ffa_emad_size_get(u32 ffa_version)
-{
-	u32 sz;
-	struct ffa_mem_region_attributes *ep_mem_access;
-
-	if (FFA_EMAD_HAS_IMPDEF_FIELD(ffa_version))
-		sz = sizeof(*ep_mem_access);
-	else
-		sz = sizeof(*ep_mem_access) - sizeof(ep_mem_access->impdef_val);
-
-	return sz;
-}
-
 static inline u32
 ffa_mem_desc_offset(struct ffa_mem_region *buf, int count, u32 ffa_version)
 {
-	u32 offset = count * ffa_emad_size_get(ffa_version);
+	u32 offset = count * sizeof(struct ffa_mem_region_attributes);
 	/*
 	 * Earlier to v1.1, the endpoint memory descriptor array started at
 	 * offset 32(i.e. offset of ep_mem_offset in the current structure)
 	 */
-	if (!FFA_MEM_REGION_HAS_EP_MEM_OFFSET(ffa_version))
+	if (ffa_version <= FFA_VERSION_1_0)
 		offset += offsetof(struct ffa_mem_region, ep_mem_offset);
 	else
-		offset += buf->ep_mem_offset;
+		offset += sizeof(struct ffa_mem_region);
 
 	return offset;
 }
@@ -512,39 +471,5 @@ struct ffa_ops {
 	const struct ffa_cpu_ops *cpu_ops;
 	const struct ffa_notifier_ops *notifier_ops;
 };
-
-static const int ffa_linux_errmap[] = {
-	/* better than switch case as long as return value is continuous */
-	0,		/* FFA_RET_SUCCESS */
-	-EOPNOTSUPP,	/* FFA_RET_NOT_SUPPORTED */
-	-EINVAL,	/* FFA_RET_INVALID_PARAMETERS */
-	-ENOMEM,	/* FFA_RET_NO_MEMORY */
-	-EBUSY,		/* FFA_RET_BUSY */
-	-EINTR,		/* FFA_RET_INTERRUPTED */
-	-EACCES,	/* FFA_RET_DENIED */
-	-EAGAIN,	/* FFA_RET_RETRY */
-	-ECANCELED,	/* FFA_RET_ABORTED */
-	-ENODATA,	/* FFA_RET_NO_DATA */
-	-EAGAIN,	/* FFA_RET_NOT_READY */
-};
-
-static inline int ffa_to_linux_errno(int errno)
-{
-	int err_idx = -errno;
-
-	if (err_idx >= 0 && err_idx < ARRAY_SIZE(ffa_linux_errmap))
-		return ffa_linux_errmap[err_idx];
-	return -EINVAL;
-}
-
-static inline int linux_errno_to_ffa(int errno)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(ffa_linux_errmap); i++)
-		if (ffa_linux_errmap[i] == errno)
-			return -i;
-	return FFA_RET_NOT_SUPPORTED;
-}
 
 #endif /* _LINUX_ARM_FFA_H */

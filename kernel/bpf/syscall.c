@@ -40,8 +40,6 @@
 #include <net/netkit.h>
 #include <net/tcx.h>
 
-#include <trace/hooks/syscall_check.h>
-
 #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
 			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
 			  (map)->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
@@ -938,7 +936,7 @@ static const struct vm_operations_struct bpf_map_default_vmops = {
 static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct bpf_map *map = filp->private_data;
-	int err = 0;
+	int err;
 
 	if (!map->ops->map_mmap || !IS_ERR_OR_NULL(map->record))
 		return -ENOTSUPP;
@@ -962,33 +960,24 @@ static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
 			err = -EACCES;
 			goto out;
 		}
-		bpf_map_write_active_inc(map);
 	}
-out:
-	mutex_unlock(&map->freeze_mutex);
-	if (err)
-		return err;
 
 	/* set default open/close callbacks */
 	vma->vm_ops = &bpf_map_default_vmops;
 	vma->vm_private_data = map;
 	vm_flags_clear(vma, VM_MAYEXEC);
-	/* If mapping is read-only, then disallow potentially re-mapping with
-	 * PROT_WRITE by dropping VM_MAYWRITE flag. This VM_MAYWRITE clearing
-	 * means that as far as BPF map's memory-mapped VMAs are concerned,
-	 * VM_WRITE and VM_MAYWRITE and equivalent, if one of them is set,
-	 * both should be set, so we can forget about VM_MAYWRITE and always
-	 * check just VM_WRITE
-	 */
 	if (!(vma->vm_flags & VM_WRITE))
+		/* disallow re-mapping with PROT_WRITE */
 		vm_flags_clear(vma, VM_MAYWRITE);
 
 	err = map->ops->map_mmap(map, vma);
-	if (err) {
-		if (vma->vm_flags & VM_WRITE)
-			bpf_map_write_active_dec(map);
-	}
+	if (err)
+		goto out;
 
+	if (vma->vm_flags & VM_MAYWRITE)
+		bpf_map_write_active_inc(map);
+out:
+	mutex_unlock(&map->freeze_mutex);
 	return err;
 }
 
@@ -1459,7 +1448,7 @@ struct bpf_map *bpf_map_get(u32 ufd)
 
 	return map;
 }
-EXPORT_SYMBOL_NS(bpf_map_get, BPF_INTERNAL);
+EXPORT_SYMBOL(bpf_map_get);
 
 struct bpf_map *bpf_map_get_with_uref(u32 ufd)
 {
@@ -1874,6 +1863,8 @@ int generic_map_update_batch(struct bpf_map *map, struct file *map_file,
 	return err;
 }
 
+#define MAP_LOOKUP_RETRIES 3
+
 int generic_map_lookup_batch(struct bpf_map *map,
 				    const union bpf_attr *attr,
 				    union bpf_attr __user *uattr)
@@ -1883,8 +1874,8 @@ int generic_map_lookup_batch(struct bpf_map *map,
 	void __user *values = u64_to_user_ptr(attr->batch.values);
 	void __user *keys = u64_to_user_ptr(attr->batch.keys);
 	void *buf, *buf_prevkey, *prev_key, *key, *value;
+	int err, retry = MAP_LOOKUP_RETRIES;
 	u32 value_size, cp, max_count;
-	int err;
 
 	if (attr->batch.elem_flags & ~BPF_F_LOCK)
 		return -EINVAL;
@@ -1930,8 +1921,14 @@ int generic_map_lookup_batch(struct bpf_map *map,
 		err = bpf_map_copy_value(map, key, value,
 					 attr->batch.elem_flags);
 
-		if (err == -ENOENT)
-			goto next_key;
+		if (err == -ENOENT) {
+			if (retry) {
+				retry--;
+				continue;
+			}
+			err = -EINTR;
+			break;
+		}
 
 		if (err)
 			goto free_buf;
@@ -1946,12 +1943,12 @@ int generic_map_lookup_batch(struct bpf_map *map,
 			goto free_buf;
 		}
 
-		cp++;
-next_key:
 		if (!prev_key)
 			prev_key = buf_prevkey;
 
 		swap(prev_key, key);
+		retry = MAP_LOOKUP_RETRIES;
+		cp++;
 		cond_resched();
 	}
 
@@ -2275,9 +2272,6 @@ void notrace bpf_prog_inc_misses_counter(struct bpf_prog *prog)
 {
 	struct bpf_prog_stats *stats;
 	unsigned int flags;
-
-	if (unlikely(!prog->stats))
-		return;
 
 	stats = this_cpu_ptr(prog->stats);
 	flags = u64_stats_update_begin_irqsave(&stats->syncp);
@@ -2982,24 +2976,12 @@ void bpf_link_inc(struct bpf_link *link)
 	atomic64_inc(&link->refcnt);
 }
 
-static void bpf_link_dealloc(struct bpf_link *link)
-{
-	/* now that we know that bpf_link itself can't be reached, put underlying BPF program */
-	if (link->prog)
-		bpf_prog_put(link->prog);
-
-	/* free bpf_link and its containing memory */
-	if (link->ops->dealloc_deferred)
-		link->ops->dealloc_deferred(link);
-	else
-		link->ops->dealloc(link);
-}
-
 static void bpf_link_defer_dealloc_rcu_gp(struct rcu_head *rcu)
 {
 	struct bpf_link *link = container_of(rcu, struct bpf_link, rcu);
 
-	bpf_link_dealloc(link);
+	/* free bpf_link and its containing memory */
+	link->ops->dealloc_deferred(link);
 }
 
 static void bpf_link_defer_dealloc_mult_rcu_gp(struct rcu_head *rcu)
@@ -3021,6 +3003,7 @@ static void bpf_link_free(struct bpf_link *link)
 		sleepable = link->prog->sleepable;
 		/* detach BPF program, clean up used resources */
 		ops->release(link);
+		bpf_prog_put(link->prog);
 	}
 	if (ops->dealloc_deferred) {
 		/* schedule BPF link deallocation; if underlying BPF program
@@ -3031,9 +3014,8 @@ static void bpf_link_free(struct bpf_link *link)
 			call_rcu_tasks_trace(&link->rcu, bpf_link_defer_dealloc_mult_rcu_gp);
 		else
 			call_rcu(&link->rcu, bpf_link_defer_dealloc_rcu_gp);
-	} else if (ops->dealloc) {
-		bpf_link_dealloc(link);
-	}
+	} else if (ops->dealloc)
+		ops->dealloc(link);
 }
 
 static void bpf_link_put_deferred(struct work_struct *work)
@@ -3228,7 +3210,7 @@ struct bpf_link *bpf_link_get_from_fd(u32 ufd)
 	bpf_link_inc(link);
 	return link;
 }
-EXPORT_SYMBOL_NS(bpf_link_get_from_fd, BPF_INTERNAL);
+EXPORT_SYMBOL(bpf_link_get_from_fd);
 
 static void bpf_tracing_link_release(struct bpf_link *link)
 {
@@ -3236,8 +3218,7 @@ static void bpf_tracing_link_release(struct bpf_link *link)
 		container_of(link, struct bpf_tracing_link, link.link);
 
 	WARN_ON_ONCE(bpf_trampoline_unlink_prog(&tr_link->link,
-						tr_link->trampoline,
-						tr_link->tgt_prog));
+						tr_link->trampoline));
 
 	bpf_trampoline_put(tr_link->trampoline);
 
@@ -3377,7 +3358,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 	 *   in prog->aux
 	 *
 	 * - if prog->aux->dst_trampoline is NULL, the program has already been
-	 *   attached to a target and its initial target was cleared (below)
+         *   attached to a target and its initial target was cleared (below)
 	 *
 	 * - if tgt_prog != NULL, the caller specified tgt_prog_fd +
 	 *   target_btf_id using the link_create API.
@@ -3452,7 +3433,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 	if (err)
 		goto out_unlock;
 
-	err = bpf_trampoline_link_prog(&link->link, tr, tgt_prog);
+	err = bpf_trampoline_link_prog(&link->link, tr);
 	if (err) {
 		bpf_link_cleanup(&link_primer);
 		link = NULL;
@@ -4047,8 +4028,7 @@ static int bpf_prog_attach_check_attach_type(const struct bpf_prog *prog,
 #define BPF_F_ATTACH_MASK_BASE	\
 	(BPF_F_ALLOW_OVERRIDE |	\
 	 BPF_F_ALLOW_MULTI |	\
-	 BPF_F_REPLACE |	\
-	 BPF_F_PREORDER)
+	 BPF_F_REPLACE)
 
 #define BPF_F_ATTACH_MASK_MPROG	\
 	(BPF_F_REPLACE |	\
@@ -4612,8 +4592,6 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	info.recursion_misses = stats.misses;
 
 	info.verified_insns = prog->aux->verified_insns;
-	if (prog->aux->btf)
-		info.btf_id = btf_obj_id(prog->aux->btf);
 
 	if (!bpf_capable()) {
 		info.jited_prog_len = 0;
@@ -4760,6 +4738,8 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 		}
 	}
 
+	if (prog->aux->btf)
+		info.btf_id = btf_obj_id(prog->aux->btf);
 	info.attach_btf_id = prog->aux->attach_btf_id;
 	if (attach_btf)
 		info.attach_btf_obj_id = btf_obj_id(attach_btf);
@@ -5646,8 +5626,6 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 	if (copy_from_bpfptr(&attr, uattr, size) != 0)
 		return -EFAULT;
 
-	trace_android_vh_check_bpf_syscall(cmd, &attr, size);
-
 	err = security_bpf(cmd, &attr, size);
 	if (err < 0)
 		return err;
@@ -5861,7 +5839,7 @@ int kern_sys_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 		return ____bpf_sys_bpf(cmd, attr, size);
 	}
 }
-EXPORT_SYMBOL_NS(kern_sys_bpf, BPF_INTERNAL);
+EXPORT_SYMBOL(kern_sys_bpf);
 
 static const struct bpf_func_proto bpf_sys_bpf_proto = {
 	.func		= bpf_sys_bpf,

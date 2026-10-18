@@ -21,9 +21,7 @@
 #include <linux/completion.h>	/* for struct completion */
 #include <linux/sched.h>	/* for current && schedule_timeout */
 #include <linux/mutex.h>	/* for struct mutex */
-#include <linux/spinlock.h>	/* for spinlock_t */
 #include <linux/pm_runtime.h>	/* for runtime PM */
-#include <linux/android_kabi.h>
 
 struct usb_device;
 struct usb_driver;
@@ -270,11 +268,6 @@ struct usb_interface {
 	struct device dev;		/* interface specific device info */
 	struct device *usb_dev;
 	struct work_struct reset_ws;	/* for resets in atomic context */
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 #define to_usb_interface(__dev)	container_of_const(__dev, struct usb_interface, dev)
@@ -436,11 +429,6 @@ struct usb_host_bos {
 	struct usb_ssp_cap_descriptor	*ssp_cap;
 	struct usb_ss_container_id_descriptor	*ss_id;
 	struct usb_ptm_cap_descriptor	*ptm_cap;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 int __usb_get_extra_descriptor(char *buffer, unsigned size,
@@ -499,11 +487,6 @@ struct usb_bus {
 	struct mon_bus *mon_bus;	/* non-null when associated */
 	int monitored;			/* non-zero when monitored */
 #endif
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 struct usb_dev_state;
@@ -629,7 +612,6 @@ struct usb3_lpm_parameters {
  *	FIXME -- complete doc
  * @authenticated: Crypto authentication passed
  * @tunnel_mode: Connection native or tunneled over USB4
- * @usb4_link: device link to the USB4 host interface
  * @lpm_capable: device supports LPM
  * @lpm_devinit_allow: Allow USB3 device initiated LPM, exit latency is in range
  * @usb2_hw_lpm_capable: device can perform USB2 hardware LPM
@@ -651,10 +633,6 @@ struct usb3_lpm_parameters {
  * @do_remote_wakeup:  remote wakeup should be enabled
  * @reset_resume: needs reset instead of resume
  * @port_is_suspended: the upstream port is suspended (L2 or U3)
- * @offload_at_suspend: Deprecated, kept for KABI compatibility.
- * @offload_pm_locked: prevents offload_usage changes during PM transitions.
- * @offload_usage: number of offload activities happening on this usb device.
- * @offload_lock: protects offload_usage and offload_pm_locked
  * @slot_id: Slot ID assigned by xHCI
  * @l1_params: best effor service latency for USB2 L1 LPM state, and L1 timeout.
  * @u1_params: exit latencies for USB3 U1 LPM state, and hub-initiated timeout.
@@ -744,7 +722,6 @@ struct usb_device {
 	unsigned reset_resume:1;
 	unsigned port_is_suspended:1;
 	enum usb_link_tunnel_mode tunnel_mode;
-	struct device_link *usb4_link;
 
 	int slot_id;
 	struct usb2_lpm_parameters l1_params;
@@ -754,26 +731,7 @@ struct usb_device {
 
 	u16 hub_delay;
 	unsigned use_generic_driver:1;
-
-	ANDROID_KABI_USE(1, struct {
-		unsigned offload_at_suspend:1;
-		unsigned offload_pm_locked:1;
-	});
-	ANDROID_KABI_USE(2, int offload_usage);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
-
-struct usb_device_ext {
-	struct usb_device udev;
-	spinlock_t offload_lock;
-};
-
-static inline spinlock_t *usb_get_offload_lock(struct usb_device *udev)
-{
-	struct usb_device_ext *ext = container_of(udev, struct usb_device_ext, udev);
-	return &ext->offload_lock;
-}
 
 #define to_usb_device(__dev)	container_of_const(__dev, struct usb_device, dev)
 
@@ -876,23 +834,6 @@ static inline void usb_autopm_put_interface_no_suspend(
 		struct usb_interface *intf)
 { }
 static inline void usb_mark_last_busy(struct usb_device *udev)
-{ }
-#endif
-
-#if IS_ENABLED(CONFIG_USB_XHCI_SIDEBAND)
-int usb_offload_get(struct usb_device *udev);
-int usb_offload_put(struct usb_device *udev);
-bool usb_offload_check(struct usb_device *udev);
-void usb_offload_set_pm_locked(struct usb_device *udev, bool locked);
-#else
-
-static inline int usb_offload_get(struct usb_device *udev)
-{ return 0; }
-static inline int usb_offload_put(struct usb_device *udev)
-{ return 0; }
-static inline bool usb_offload_check(struct usb_device *udev)
-{ return false; }
-static inline void usb_offload_set_pm_locked(struct usb_device *udev, bool locked)
 { }
 #endif
 
@@ -1301,11 +1242,6 @@ struct usb_driver {
 	unsigned int supports_autosuspend:1;
 	unsigned int disable_hub_initiated_lpm:1;
 	unsigned int soft_unbind:1;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 #define	to_usb_driver(d) container_of(d, struct usb_driver, driver)
 
@@ -1695,12 +1631,6 @@ struct urb {
 	int error_count;		/* (return) number of ISO errors */
 	void *context;			/* (in) context for completion */
 	usb_complete_t complete;	/* (in) completion routine */
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
-
 	struct usb_iso_packet_descriptor iso_frame_desc[];
 					/* (in) ISO ONLY */
 };

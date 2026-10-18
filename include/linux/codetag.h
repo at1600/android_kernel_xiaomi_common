@@ -13,9 +13,6 @@ struct codetag_module;
 struct seq_buf;
 struct module;
 
-#define CODETAG_SECTION_START_PREFIX	"__start_"
-#define CODETAG_SECTION_STOP_PREFIX	"__stop_"
-
 /*
  * An instance of this structure is created in a special ELF section at every
  * code location being tagged.  At runtime, the special section is treated as
@@ -38,15 +35,8 @@ struct codetag_type_desc {
 	size_t tag_size;
 	void (*module_load)(struct codetag_type *cttype,
 			    struct codetag_module *cmod);
-	void (*module_unload)(struct codetag_type *cttype,
+	bool (*module_unload)(struct codetag_type *cttype,
 			      struct codetag_module *cmod);
-#ifdef CONFIG_MODULES
-	void (*module_replaced)(struct module *mod, struct module *new_mod);
-	bool (*needs_section_mem)(struct module *mod, unsigned long size);
-	void *(*alloc_section_mem)(struct module *mod, unsigned long size,
-				   unsigned int prepend, unsigned long align);
-	void (*free_section_mem)(struct module *mod, bool used);
-#endif
 };
 
 struct codetag_iterator {
@@ -81,31 +71,11 @@ struct codetag_type *
 codetag_register_type(const struct codetag_type_desc *desc);
 
 #if defined(CONFIG_CODE_TAGGING) && defined(CONFIG_MODULES)
-
-bool codetag_needs_module_section(struct module *mod, const char *name,
-				  unsigned long size);
-void *codetag_alloc_module_section(struct module *mod, const char *name,
-				   unsigned long size, unsigned int prepend,
-				   unsigned long align);
-void codetag_free_module_sections(struct module *mod);
-void codetag_module_replaced(struct module *mod, struct module *new_mod);
 void codetag_load_module(struct module *mod);
-void codetag_unload_module(struct module *mod);
-
-#else /* defined(CONFIG_CODE_TAGGING) && defined(CONFIG_MODULES) */
-
-static inline bool
-codetag_needs_module_section(struct module *mod, const char *name,
-			     unsigned long size) { return false; }
-static inline void *
-codetag_alloc_module_section(struct module *mod, const char *name,
-			     unsigned long size, unsigned int prepend,
-			     unsigned long align) { return NULL; }
-static inline void codetag_free_module_sections(struct module *mod) {}
-static inline void codetag_module_replaced(struct module *mod, struct module *new_mod) {}
+bool codetag_unload_module(struct module *mod);
+#else
 static inline void codetag_load_module(struct module *mod) {}
-static inline void codetag_unload_module(struct module *mod) {}
-
-#endif /* defined(CONFIG_CODE_TAGGING) && defined(CONFIG_MODULES) */
+static inline bool codetag_unload_module(struct module *mod) { return true; }
+#endif
 
 #endif /* _LINUX_CODETAG_H */

@@ -71,30 +71,27 @@ static inline __must_check bool rcuref_get(rcuref_t *ref)
 	return rcuref_get_slowpath(ref);
 }
 
-extern __must_check bool rcuref_put_slowpath(rcuref_t *ref, unsigned int cnt);
+extern __must_check bool rcuref_put_slowpath(rcuref_t *ref);
 
 /*
  * Internal helper. Do not invoke directly.
  */
 static __always_inline __must_check bool __rcuref_put(rcuref_t *ref)
 {
-	int cnt;
-
 	RCU_LOCKDEP_WARN(!rcu_read_lock_held() && preemptible(),
 			 "suspicious rcuref_put_rcusafe() usage");
 	/*
 	 * Unconditionally decrease the reference count. The saturation and
 	 * dead zones provide enough tolerance for this.
 	 */
-	cnt = atomic_sub_return_release(1, &ref->refcnt);
-	if (likely(cnt >= 0))
+	if (likely(!atomic_add_negative_release(-1, &ref->refcnt)))
 		return false;
 
 	/*
 	 * Handle the last reference drop and cases inside the saturation
 	 * and dead zones.
 	 */
-	return rcuref_put_slowpath(ref, cnt);
+	return rcuref_put_slowpath(ref);
 }
 
 /**

@@ -65,9 +65,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
 
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/module.h>
-
 /*
  * Mutex protects:
  * 1) List of modules (also safely readable with preempt_disable),
@@ -89,16 +86,9 @@ struct mod_tree_root mod_tree __cacheline_aligned = {
 
 struct symsearch {
 	const struct kernel_symbol *start, *stop;
-	const u32 *crcs;
+	const s32 *crcs;
 	enum mod_license license;
 };
-
-#if defined(CONFIG_MODULE_SIG_PROTECT) || defined(CONFIG_TRIM_UNUSED_KSYMS)
-static int cmp_string(const void *a, const void *b)
-{
-	return strcmp((const char *)a, *(const char **)b);
-}
-#endif
 
 /*
  * Bounds of module memory, for speeding up __module_address.
@@ -203,38 +193,6 @@ static unsigned int find_sec(const struct load_info *info, const char *name)
 			return i;
 	}
 	return 0;
-}
-
-/**
- * find_any_unique_sec() - Find a unique section index by name
- * @info: Load info for the module to scan
- * @name: Name of the section we're looking for
- *
- * Locates a unique section by name. Ignores SHF_ALLOC.
- *
- * Return: Section index if found uniquely, zero if absent, negative count
- *         of total instances if multiple were found.
- */
-static int find_any_unique_sec(const struct load_info *info, const char *name)
-{
-	unsigned int idx;
-	unsigned int count = 0;
-	int i;
-
-	for (i = 1; i < info->hdr->e_shnum; i++) {
-		if (strcmp(info->secstrings + info->sechdrs[i].sh_name,
-			   name) == 0) {
-			count++;
-			idx = i;
-		}
-	}
-	if (count == 1) {
-		return idx;
-	} else if (count == 0) {
-		return 0;
-	} else {
-		return -count;
-	}
 }
 
 /* Find a module section, or NULL. */
@@ -572,7 +530,6 @@ static struct module_attribute modinfo_##field = {                    \
 
 MODINFO_ATTR(version);
 MODINFO_ATTR(srcversion);
-MODINFO_ATTR(scmversion);
 
 static struct {
 	char name[MODULE_NAME_LEN + 1];
@@ -746,16 +703,14 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 	struct module *mod;
 	char name[MODULE_NAME_LEN];
 	char buf[MODULE_FLAGS_BUF_SIZE];
-	int ret, len, forced = 0;
+	int ret, forced = 0;
 
 	if (!capable(CAP_SYS_MODULE) || modules_disabled)
 		return -EPERM;
 
-	len = strncpy_from_user(name, name_user, MODULE_NAME_LEN);
-	if (len == 0 || len == MODULE_NAME_LEN)
-		return -ENOENT;
-	if (len < 0)
-		return len;
+	if (strncpy_from_user(name, name_user, MODULE_NAME_LEN-1) < 0)
+		return -EFAULT;
+	name[MODULE_NAME_LEN-1] = '\0';
 
 	audit_log_kern_module(name);
 
@@ -1027,7 +982,6 @@ struct module_attribute *modinfo_attrs[] = {
 	&module_uevent,
 	&modinfo_version,
 	&modinfo_srcversion,
-	&modinfo_scmversion,
 	&modinfo_initstate,
 	&modinfo_coresize,
 #ifdef CONFIG_ARCH_WANTS_MODULES_DATA_IN_VMALLOC
@@ -1153,25 +1107,12 @@ static bool inherit_taint(struct module *mod, struct module *owner, const char *
 	return true;
 }
 
-#ifdef CONFIG_TRIM_UNUSED_KSYMS
-static bool is_permitted_symbol_import(const char *name)
-{
-	return bsearch(name, permitted_symbol_imports,
-		       permitted_symbol_imports_count,
-		       sizeof(const char *), cmp_string) != NULL;
-}
-#endif
-
 /* Resolve a symbol for this module.  I.e. if we find one, record usage. */
 static const struct kernel_symbol *resolve_symbol(struct module *mod,
 						  const struct load_info *info,
 						  const char *name,
 						  char ownername[])
 {
-#ifdef CONFIG_TRIM_UNUSED_KSYMS
-	bool is_vendor_module;
-	bool is_vendor_exported_symbol;
-#endif
 	struct find_symbol_arg fsa = {
 		.name	= name,
 		.gplok	= !(mod->taints & (1 << TAINT_PROPRIETARY_MODULE)),
@@ -1207,26 +1148,6 @@ static const struct kernel_symbol *resolve_symbol(struct module *mod,
 		fsa.sym = ERR_PTR(err);
 		goto getname;
 	}
-
-	/*
-	 * ANDROID GKI
-	 *
-	 * Vendor (i.e., unsigned) modules are only permitted to use:
-	 *
-	 * 1. symbols exported by other vendor (unsigned) modules
-	 * 2. symbols which are permitted explicitly
-	 */
-#ifdef CONFIG_TRIM_UNUSED_KSYMS
-	is_vendor_module = !mod->sig_ok;
-	is_vendor_exported_symbol = fsa.owner && !fsa.owner->sig_ok;
-
-	if (is_vendor_module &&
-	    !is_vendor_exported_symbol &&
-	    !is_permitted_symbol_import(name)) {
-		fsa.sym = ERR_PTR(-EACCES);
-		goto getname;
-	}
-#endif
 
 	err = ref_module(mod, fsa.owner);
 	if (err) {
@@ -1304,14 +1225,19 @@ static int module_memory_alloc(struct module *mod, enum mod_mem_type type)
 	return 0;
 }
 
-static void module_memory_free(struct module *mod, enum mod_mem_type type)
+static void module_memory_free(struct module *mod, enum mod_mem_type type,
+			       bool unload_codetags)
 {
-	execmem_free(mod->mem[type].base);
+	void *ptr = mod->mem[type].base;
+
+	if (!unload_codetags && mod_mem_type_is_core_data(type))
+		return;
+
+	execmem_free(ptr);
 }
 
-static void free_mod_mem(struct module *mod)
+static void free_mod_mem(struct module *mod, bool unload_codetags)
 {
-	trace_android_vh_free_mod_mem(mod);
 	for_each_mod_mem_type(type) {
 		struct module_memory *mod_mem = &mod->mem[type];
 
@@ -1321,20 +1247,25 @@ static void free_mod_mem(struct module *mod)
 		/* Free lock-classes; relies on the preceding sync_rcu(). */
 		lockdep_free_key_range(mod_mem->base, mod_mem->size);
 		if (mod_mem->size)
-			module_memory_free(mod, type);
+			module_memory_free(mod, type, unload_codetags);
 	}
 
 	/* MOD_DATA hosts mod, so free it at last */
 	lockdep_free_key_range(mod->mem[MOD_DATA].base, mod->mem[MOD_DATA].size);
-	module_memory_free(mod, MOD_DATA);
+	module_memory_free(mod, MOD_DATA, unload_codetags);
 }
 
 /* Free a module, remove from lists, etc. */
 static void free_module(struct module *mod)
 {
+	bool unload_codetags;
+
 	trace_module_free(mod);
 
-	codetag_unload_module(mod);
+	unload_codetags = codetag_unload_module(mod);
+	if (!unload_codetags)
+		pr_warn("%s: memory allocation(s) from the module still alive, cannot unload cleanly\n",
+			mod->name);
 
 	mod_sysfs_teardown(mod);
 
@@ -1377,7 +1308,7 @@ static void free_module(struct module *mod)
 	kfree(mod->args);
 	percpu_modfree(mod);
 
-	free_mod_mem(mod);
+	free_mod_mem(mod, unload_codetags);
 }
 
 void *__symbol_get(const char *symbol)
@@ -1405,15 +1336,6 @@ fail:
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(__symbol_get);
-
-#ifdef CONFIG_MODULE_SIG_PROTECT
-static bool is_protected_symbol_export(const char *name)
-{
-	return bsearch(name, protected_symbol_exports,
-		       protected_symbol_exports_count,
-		       sizeof(const char *), cmp_string) != NULL;
-}
-#endif
 
 /*
  * Ensure that an exported symbol [global namespace] does not already exist
@@ -1446,13 +1368,6 @@ static int verify_exported_symbols(struct module *mod)
 				       module_name(fsa.owner));
 				return -ENOEXEC;
 			}
-#ifdef CONFIG_MODULE_SIG_PROTECT
-			if (!mod->sig_ok && is_protected_symbol_export(kernel_symbol_name(s))) {
-				pr_err("%s: exports protected symbol %s\n",
-				       mod->name, kernel_symbol_name(s));
-				return -EACCES;
-			}
-#endif
 		}
 	}
 	return 0;
@@ -1526,15 +1441,9 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 			     ignore_undef_symbol(info->hdr->e_machine, name)))
 				break;
 
-			if (PTR_ERR(ksym) == -EACCES) {
-				ret = -EACCES;
-				pr_warn("%s: Protected symbol: %s (err %d)\n",
-					mod->name, name, ret);
-			} else {
-				ret = PTR_ERR(ksym) ?: -ENOENT;
-				pr_warn("%s: Unknown symbol %s (err %d)\n",
-					mod->name, name, ret);
-			}
+			ret = PTR_ERR(ksym) ?: -ENOENT;
+			pr_warn("%s: Unknown symbol %s (err %d)\n",
+				mod->name, name, ret);
 			break;
 
 		default:
@@ -1664,20 +1573,6 @@ static void __layout_sections(struct module *mod, struct load_info *info, bool i
 			if (WARN_ON_ONCE(type == MOD_INVALID))
 				continue;
 
-			/*
-			 * Do not allocate codetag memory as we load it into
-			 * preallocated contiguous memory.
-			 */
-			if (codetag_needs_module_section(mod, sname, s->sh_size)) {
-				/*
-				 * s->sh_entsize won't be used but populate the
-				 * type field to avoid confusion.
-				 */
-				s->sh_entsize = ((unsigned long)(type) & SH_ENTSIZE_TYPE_MASK)
-						<< SH_ENTSIZE_TYPE_SHIFT;
-				continue;
-			}
-
 			s->sh_entsize = module_get_offset_and_type(mod, type, s, i);
 			pr_debug("\t%s\n", sname);
 		}
@@ -1750,7 +1645,7 @@ bool __weak module_exit_section(const char *name)
 	return strstarts(name, ".exit");
 }
 
-static int validate_section_offset(const struct load_info *info, Elf_Shdr *shdr)
+static int validate_section_offset(struct load_info *info, Elf_Shdr *shdr)
 {
 #if defined(CONFIG_64BIT)
 	unsigned long long secend;
@@ -1766,524 +1661,6 @@ static int validate_section_offset(const struct load_info *info, Elf_Shdr *shdr)
 	if (secend < shdr->sh_offset || secend > info->len)
 		return -ENOEXEC;
 
-	return 0;
-}
-
-/**
- * elf_validity_ehdr() - Checks an ELF header for module validity
- * @info: Load info containing the ELF header to check
- *
- * Checks whether an ELF header could belong to a valid module. Checks:
- *
- * * ELF header is within the data the user provided
- * * ELF magic is present
- * * It is relocatable (not final linked, not core file, etc.)
- * * The header's machine type matches what the architecture expects.
- * * Optional arch-specific hook for other properties
- *   - module_elf_check_arch() is currently only used by PPC to check
- *   ELF ABI version, but may be used by others in the future.
- *
- * Return: %0 if valid, %-ENOEXEC on failure.
- */
-static int elf_validity_ehdr(const struct load_info *info)
-{
-	if (info->len < sizeof(*(info->hdr))) {
-		pr_err("Invalid ELF header len %lu\n", info->len);
-		return -ENOEXEC;
-	}
-	if (memcmp(info->hdr->e_ident, ELFMAG, SELFMAG) != 0) {
-		pr_err("Invalid ELF header magic: != %s\n", ELFMAG);
-		return -ENOEXEC;
-	}
-	if (info->hdr->e_type != ET_REL) {
-		pr_err("Invalid ELF header type: %u != %u\n",
-		       info->hdr->e_type, ET_REL);
-		return -ENOEXEC;
-	}
-	if (!elf_check_arch(info->hdr)) {
-		pr_err("Invalid architecture in ELF header: %u\n",
-		       info->hdr->e_machine);
-		return -ENOEXEC;
-	}
-	if (!module_elf_check_arch(info->hdr)) {
-		pr_err("Invalid module architecture in ELF header: %u\n",
-		       info->hdr->e_machine);
-		return -ENOEXEC;
-	}
-	return 0;
-}
-
-/**
- * elf_validity_cache_sechdrs() - Cache section headers if valid
- * @info: Load info to compute section headers from
- *
- * Checks:
- *
- * * ELF header is valid (see elf_validity_ehdr())
- * * Section headers are the size we expect
- * * Section array fits in the user provided data
- * * Section index 0 is NULL
- * * Section contents are inbounds
- *
- * Then updates @info with a &load_info->sechdrs pointer if valid.
- *
- * Return: %0 if valid, negative error code if validation failed.
- */
-static int elf_validity_cache_sechdrs(struct load_info *info)
-{
-	Elf_Shdr *sechdrs;
-	Elf_Shdr *shdr;
-	int i;
-	int err;
-
-	err = elf_validity_ehdr(info);
-	if (err < 0)
-		return err;
-
-	if (info->hdr->e_shentsize != sizeof(Elf_Shdr)) {
-		pr_err("Invalid ELF section header size\n");
-		return -ENOEXEC;
-	}
-
-	/*
-	 * e_shnum is 16 bits, and sizeof(Elf_Shdr) is
-	 * known and small. So e_shnum * sizeof(Elf_Shdr)
-	 * will not overflow unsigned long on any platform.
-	 */
-	if (info->hdr->e_shoff >= info->len
-	    || (info->hdr->e_shnum * sizeof(Elf_Shdr) >
-		info->len - info->hdr->e_shoff)) {
-		pr_err("Invalid ELF section header overflow\n");
-		return -ENOEXEC;
-	}
-
-	sechdrs = (void *)info->hdr + info->hdr->e_shoff;
-
-	/*
-	 * The code assumes that section 0 has a length of zero and
-	 * an addr of zero, so check for it.
-	 */
-	if (sechdrs[0].sh_type != SHT_NULL
-	    || sechdrs[0].sh_size != 0
-	    || sechdrs[0].sh_addr != 0) {
-		pr_err("ELF Spec violation: section 0 type(%d)!=SH_NULL or non-zero len or addr\n",
-		       sechdrs[0].sh_type);
-		return -ENOEXEC;
-	}
-
-	/* Validate contents are inbounds */
-	for (i = 1; i < info->hdr->e_shnum; i++) {
-		shdr = &sechdrs[i];
-		switch (shdr->sh_type) {
-		case SHT_NULL:
-		case SHT_NOBITS:
-			/* No contents, offset/size don't mean anything */
-			continue;
-		default:
-			err = validate_section_offset(info, shdr);
-			if (err < 0) {
-				pr_err("Invalid ELF section in module (section %u type %u)\n",
-				       i, shdr->sh_type);
-				return err;
-			}
-		}
-	}
-
-	info->sechdrs = sechdrs;
-
-	return 0;
-}
-
-/**
- * elf_validity_cache_secstrings() - Caches section names if valid
- * @info: Load info to cache section names from. Must have valid sechdrs.
- *
- * Specifically checks:
- *
- * * Section name table index is inbounds of section headers
- * * Section name table is not empty
- * * Section name table is NUL terminated
- * * All section name offsets are inbounds of the section
- *
- * Then updates @info with a &load_info->secstrings pointer if valid.
- *
- * Return: %0 if valid, negative error code if validation failed.
- */
-static int elf_validity_cache_secstrings(struct load_info *info)
-{
-	Elf_Shdr *strhdr, *shdr;
-	char *secstrings;
-	int i;
-
-	/*
-	 * Verify if the section name table index is valid.
-	 */
-	if (info->hdr->e_shstrndx == SHN_UNDEF
-	    || info->hdr->e_shstrndx >= info->hdr->e_shnum) {
-		pr_err("Invalid ELF section name index: %d || e_shstrndx (%d) >= e_shnum (%d)\n",
-		       info->hdr->e_shstrndx, info->hdr->e_shstrndx,
-		       info->hdr->e_shnum);
-		return -ENOEXEC;
-	}
-
-	strhdr = &info->sechdrs[info->hdr->e_shstrndx];
-
-	/*
-	 * The section name table must be NUL-terminated, as required
-	 * by the spec. This makes strcmp and pr_* calls that access
-	 * strings in the section safe.
-	 */
-	secstrings = (void *)info->hdr + strhdr->sh_offset;
-	if (strhdr->sh_size == 0) {
-		pr_err("empty section name table\n");
-		return -ENOEXEC;
-	}
-	if (secstrings[strhdr->sh_size - 1] != '\0') {
-		pr_err("ELF Spec violation: section name table isn't null terminated\n");
-		return -ENOEXEC;
-	}
-
-	for (i = 0; i < info->hdr->e_shnum; i++) {
-		shdr = &info->sechdrs[i];
-		/* SHT_NULL means sh_name has an undefined value */
-		if (shdr->sh_type == SHT_NULL)
-			continue;
-		if (shdr->sh_name >= strhdr->sh_size) {
-			pr_err("Invalid ELF section name in module (section %u type %u)\n",
-			       i, shdr->sh_type);
-			return -ENOEXEC;
-		}
-	}
-
-	info->secstrings = secstrings;
-	return 0;
-}
-
-/**
- * elf_validity_cache_index_info() - Validate and cache modinfo section
- * @info: Load info to populate the modinfo index on.
- *        Must have &load_info->sechdrs and &load_info->secstrings populated
- *
- * Checks that if there is a .modinfo section, it is unique.
- * Then, it caches its index in &load_info->index.info.
- * Finally, it tries to populate the name to improve error messages.
- *
- * Return: %0 if valid, %-ENOEXEC if multiple modinfo sections were found.
- */
-static int elf_validity_cache_index_info(struct load_info *info)
-{
-	int info_idx;
-
-	info_idx = find_any_unique_sec(info, ".modinfo");
-
-	if (info_idx == 0)
-		/* Early return, no .modinfo */
-		return 0;
-
-	if (info_idx < 0) {
-		pr_err("Only one .modinfo section must exist.\n");
-		return -ENOEXEC;
-	}
-
-	info->index.info = info_idx;
-	/* Try to find a name early so we can log errors with a module name */
-	info->name = get_modinfo(info, "name");
-
-	return 0;
-}
-
-/**
- * elf_validity_cache_index_mod() - Validates and caches this_module section
- * @info: Load info to cache this_module on.
- *        Must have &load_info->sechdrs and &load_info->secstrings populated
- *
- * The ".gnu.linkonce.this_module" ELF section is special. It is what modpost
- * uses to refer to __this_module and let's use rely on THIS_MODULE to point
- * to &__this_module properly. The kernel's modpost declares it on each
- * modules's *.mod.c file. If the struct module of the kernel changes a full
- * kernel rebuild is required.
- *
- * We have a few expectations for this special section, this function
- * validates all this for us:
- *
- * * The section has contents
- * * The section is unique
- * * We expect the kernel to always have to allocate it: SHF_ALLOC
- * * The section size must match the kernel's run time's struct module
- *   size
- *
- * If all checks pass, the index will be cached in &load_info->index.mod
- *
- * Return: %0 on validation success, %-ENOEXEC on failure
- */
-static int elf_validity_cache_index_mod(struct load_info *info)
-{
-	Elf_Shdr *shdr;
-	int mod_idx;
-
-	mod_idx = find_any_unique_sec(info, ".gnu.linkonce.this_module");
-	if (mod_idx <= 0) {
-		pr_err("module %s: Exactly one .gnu.linkonce.this_module section must exist.\n",
-		       info->name ?: "(missing .modinfo section or name field)");
-		return -ENOEXEC;
-	}
-
-	shdr = &info->sechdrs[mod_idx];
-
-	if (shdr->sh_type == SHT_NOBITS) {
-		pr_err("module %s: .gnu.linkonce.this_module section must have a size set\n",
-		       info->name ?: "(missing .modinfo section or name field)");
-		return -ENOEXEC;
-	}
-
-	if (!(shdr->sh_flags & SHF_ALLOC)) {
-		pr_err("module %s: .gnu.linkonce.this_module must occupy memory during process execution\n",
-		       info->name ?: "(missing .modinfo section or name field)");
-		return -ENOEXEC;
-	}
-
-	if (shdr->sh_size != sizeof(struct module)) {
-		pr_err("module %s: .gnu.linkonce.this_module section size must match the kernel's built struct module size at run time\n",
-		       info->name ?: "(missing .modinfo section or name field)");
-		return -ENOEXEC;
-	}
-
-	info->index.mod = mod_idx;
-
-	return 0;
-}
-
-/**
- * elf_validity_cache_index_sym() - Validate and cache symtab index
- * @info: Load info to cache symtab index in.
- *        Must have &load_info->sechdrs and &load_info->secstrings populated.
- *
- * Checks that there is exactly one symbol table, then caches its index in
- * &load_info->index.sym.
- *
- * Return: %0 if valid, %-ENOEXEC on failure.
- */
-static int elf_validity_cache_index_sym(struct load_info *info)
-{
-	unsigned int sym_idx;
-	unsigned int num_sym_secs = 0;
-	int i;
-
-	for (i = 1; i < info->hdr->e_shnum; i++) {
-		if (info->sechdrs[i].sh_type == SHT_SYMTAB) {
-			num_sym_secs++;
-			sym_idx = i;
-		}
-	}
-
-	if (num_sym_secs != 1) {
-		pr_warn("%s: module has no symbols (stripped?)\n",
-			info->name ?: "(missing .modinfo section or name field)");
-		return -ENOEXEC;
-	}
-
-	info->index.sym = sym_idx;
-
-	return 0;
-}
-
-/**
- * elf_validity_cache_index_str() - Validate and cache strtab index
- * @info: Load info to cache strtab index in.
- *        Must have &load_info->sechdrs and &load_info->secstrings populated.
- *        Must have &load_info->index.sym populated.
- *
- * Looks at the symbol table's associated string table, makes sure it is
- * in-bounds, and caches it.
- *
- * Return: %0 if valid, %-ENOEXEC on failure.
- */
-static int elf_validity_cache_index_str(struct load_info *info)
-{
-	unsigned int str_idx = info->sechdrs[info->index.sym].sh_link;
-
-	if (str_idx == SHN_UNDEF || str_idx >= info->hdr->e_shnum) {
-		pr_err("Invalid ELF sh_link!=SHN_UNDEF(%d) or (sh_link(%d) >= hdr->e_shnum(%d)\n",
-		       str_idx, str_idx, info->hdr->e_shnum);
-		return -ENOEXEC;
-	}
-
-	info->index.str = str_idx;
-	return 0;
-}
-
-/**
- * elf_validity_cache_index_versions() - Validate and cache version indices
- * @info:  Load info to cache version indices in.
- *         Must have &load_info->sechdrs and &load_info->secstrings populated.
- * @flags: Load flags, relevant to suppress version loading, see
- *         uapi/linux/module.h
- *
- * If we're ignoring modversions based on @flags, zero all version indices
- * and return validity. Othewrise check:
- *
- * * If "__version_ext_crcs" is present, "__version_ext_names" is present
- * * There is a name present for every crc
- *
- * Then populate:
- *
- * * &load_info->index.vers
- * * &load_info->index.vers_ext_crc
- * * &load_info->index.vers_ext_names
- *
- * if present.
- *
- * Return: %0 if valid, %-ENOEXEC on failure.
- */
-static int elf_validity_cache_index_versions(struct load_info *info, int flags)
-{
-	unsigned int vers_ext_crc;
-	unsigned int vers_ext_name;
-	size_t crc_count;
-	size_t remaining_len;
-	size_t name_size;
-	char *name;
-
-	/* If modversions were suppressed, pretend we didn't find any */
-	if (flags & MODULE_INIT_IGNORE_MODVERSIONS) {
-		info->index.vers = 0;
-		info->index.vers_ext_crc = 0;
-		info->index.vers_ext_name = 0;
-		return 0;
-	}
-
-	vers_ext_crc = find_sec(info, "__version_ext_crcs");
-	vers_ext_name = find_sec(info, "__version_ext_names");
-
-	/* If we have one field, we must have the other */
-	if (!!vers_ext_crc != !!vers_ext_name) {
-		pr_err("extended version crc+name presence does not match");
-		return -ENOEXEC;
-	}
-
-	/*
-	 * If we have extended version information, we should have the same
-	 * number of entries in every section.
-	 */
-	if (vers_ext_crc) {
-		crc_count = info->sechdrs[vers_ext_crc].sh_size / sizeof(u32);
-		name = (void *)info->hdr +
-			info->sechdrs[vers_ext_name].sh_offset;
-		remaining_len = info->sechdrs[vers_ext_name].sh_size;
-
-		while (crc_count--) {
-			name_size = strnlen(name, remaining_len) + 1;
-			if (name_size > remaining_len) {
-				pr_err("more extended version crcs than names");
-				return -ENOEXEC;
-			}
-			remaining_len -= name_size;
-			name += name_size;
-		}
-	}
-
-	info->index.vers = find_sec(info, "__versions");
-	info->index.vers_ext_crc = vers_ext_crc;
-	info->index.vers_ext_name = vers_ext_name;
-	return 0;
-}
-
-/**
- * elf_validity_cache_index() - Resolve, validate, cache section indices
- * @info:  Load info to read from and update.
- *         &load_info->sechdrs and &load_info->secstrings must be populated.
- * @flags: Load flags, relevant to suppress version loading, see
- *         uapi/linux/module.h
- *
- * Populates &load_info->index, validating as it goes.
- * See child functions for per-field validation:
- *
- * * elf_validity_cache_index_info()
- * * elf_validity_cache_index_mod()
- * * elf_validity_cache_index_sym()
- * * elf_validity_cache_index_str()
- * * elf_validity_cache_index_versions()
- *
- * If CONFIG_SMP is enabled, load the percpu section by name with no
- * validation.
- *
- * Return: 0 on success, negative error code if an index failed validation.
- */
-static int elf_validity_cache_index(struct load_info *info, int flags)
-{
-	int err;
-
-	err = elf_validity_cache_index_info(info);
-	if (err < 0)
-		return err;
-	err = elf_validity_cache_index_mod(info);
-	if (err < 0)
-		return err;
-	err = elf_validity_cache_index_sym(info);
-	if (err < 0)
-		return err;
-	err = elf_validity_cache_index_str(info);
-	if (err < 0)
-		return err;
-	err = elf_validity_cache_index_versions(info, flags);
-	if (err < 0)
-		return err;
-
-	info->index.pcpu = find_pcpusec(info);
-
-	return 0;
-}
-
-/**
- * elf_validity_cache_strtab() - Validate and cache symbol string table
- * @info: Load info to read from and update.
- *        Must have &load_info->sechdrs and &load_info->secstrings populated.
- *        Must have &load_info->index populated.
- *
- * Checks:
- *
- * * The string table is not empty.
- * * The string table starts and ends with NUL (required by ELF spec).
- * * Every &Elf_Sym->st_name offset in the symbol table is inbounds of the
- *   string table.
- *
- * And caches the pointer as &load_info->strtab in @info.
- *
- * Return: 0 on success, negative error code if a check failed.
- */
-static int elf_validity_cache_strtab(struct load_info *info)
-{
-	Elf_Shdr *str_shdr = &info->sechdrs[info->index.str];
-	Elf_Shdr *sym_shdr = &info->sechdrs[info->index.sym];
-	char *strtab = (char *)info->hdr + str_shdr->sh_offset;
-	Elf_Sym *syms = (void *)info->hdr + sym_shdr->sh_offset;
-	int i;
-
-	if (str_shdr->sh_size == 0) {
-		pr_err("empty symbol string table\n");
-		return -ENOEXEC;
-	}
-	if (strtab[0] != '\0') {
-		pr_err("symbol string table missing leading NUL\n");
-		return -ENOEXEC;
-	}
-	if (strtab[str_shdr->sh_size - 1] != '\0') {
-		pr_err("symbol string table isn't NUL terminated\n");
-		return -ENOEXEC;
-	}
-
-	/*
-	 * Now that we know strtab is correctly structured, check symbol
-	 * starts are inbounds before they're used later.
-	 */
-	for (i = 0; i < sym_shdr->sh_size / sizeof(*syms); i++) {
-		if (syms[i].st_name >= str_shdr->sh_size) {
-			pr_err("symbol name out of bounds in string table");
-			return -ENOEXEC;
-		}
-	}
-
-	info->strtab = strtab;
 	return 0;
 }
 
@@ -2309,23 +1686,216 @@ static int elf_validity_cache_strtab(struct load_info *info)
  */
 static int elf_validity_cache_copy(struct load_info *info, int flags)
 {
+	unsigned int i;
+	Elf_Shdr *shdr, *strhdr;
 	int err;
+	unsigned int num_mod_secs = 0, mod_idx;
+	unsigned int num_info_secs = 0, info_idx;
+	unsigned int num_sym_secs = 0, sym_idx;
 
-	err = elf_validity_cache_sechdrs(info);
-	if (err < 0)
+	if (info->len < sizeof(*(info->hdr))) {
+		pr_err("Invalid ELF header len %lu\n", info->len);
+		goto no_exec;
+	}
+
+	if (memcmp(info->hdr->e_ident, ELFMAG, SELFMAG) != 0) {
+		pr_err("Invalid ELF header magic: != %s\n", ELFMAG);
+		goto no_exec;
+	}
+	if (info->hdr->e_type != ET_REL) {
+		pr_err("Invalid ELF header type: %u != %u\n",
+		       info->hdr->e_type, ET_REL);
+		goto no_exec;
+	}
+	if (!elf_check_arch(info->hdr)) {
+		pr_err("Invalid architecture in ELF header: %u\n",
+		       info->hdr->e_machine);
+		goto no_exec;
+	}
+	if (!module_elf_check_arch(info->hdr)) {
+		pr_err("Invalid module architecture in ELF header: %u\n",
+		       info->hdr->e_machine);
+		goto no_exec;
+	}
+	if (info->hdr->e_shentsize != sizeof(Elf_Shdr)) {
+		pr_err("Invalid ELF section header size\n");
+		goto no_exec;
+	}
+
+	/*
+	 * e_shnum is 16 bits, and sizeof(Elf_Shdr) is
+	 * known and small. So e_shnum * sizeof(Elf_Shdr)
+	 * will not overflow unsigned long on any platform.
+	 */
+	if (info->hdr->e_shoff >= info->len
+	    || (info->hdr->e_shnum * sizeof(Elf_Shdr) >
+		info->len - info->hdr->e_shoff)) {
+		pr_err("Invalid ELF section header overflow\n");
+		goto no_exec;
+	}
+
+	info->sechdrs = (void *)info->hdr + info->hdr->e_shoff;
+
+	/*
+	 * Verify if the section name table index is valid.
+	 */
+	if (info->hdr->e_shstrndx == SHN_UNDEF
+	    || info->hdr->e_shstrndx >= info->hdr->e_shnum) {
+		pr_err("Invalid ELF section name index: %d || e_shstrndx (%d) >= e_shnum (%d)\n",
+		       info->hdr->e_shstrndx, info->hdr->e_shstrndx,
+		       info->hdr->e_shnum);
+		goto no_exec;
+	}
+
+	strhdr = &info->sechdrs[info->hdr->e_shstrndx];
+	err = validate_section_offset(info, strhdr);
+	if (err < 0) {
+		pr_err("Invalid ELF section hdr(type %u)\n", strhdr->sh_type);
 		return err;
-	err = elf_validity_cache_secstrings(info);
-	if (err < 0)
-		return err;
-	err = elf_validity_cache_index(info, flags);
-	if (err < 0)
-		return err;
-	err = elf_validity_cache_strtab(info);
-	if (err < 0)
-		return err;
+	}
+
+	/*
+	 * The section name table must be NUL-terminated, as required
+	 * by the spec. This makes strcmp and pr_* calls that access
+	 * strings in the section safe.
+	 */
+	info->secstrings = (void *)info->hdr + strhdr->sh_offset;
+	if (strhdr->sh_size == 0) {
+		pr_err("empty section name table\n");
+		goto no_exec;
+	}
+	if (info->secstrings[strhdr->sh_size - 1] != '\0') {
+		pr_err("ELF Spec violation: section name table isn't null terminated\n");
+		goto no_exec;
+	}
+
+	/*
+	 * The code assumes that section 0 has a length of zero and
+	 * an addr of zero, so check for it.
+	 */
+	if (info->sechdrs[0].sh_type != SHT_NULL
+	    || info->sechdrs[0].sh_size != 0
+	    || info->sechdrs[0].sh_addr != 0) {
+		pr_err("ELF Spec violation: section 0 type(%d)!=SH_NULL or non-zero len or addr\n",
+		       info->sechdrs[0].sh_type);
+		goto no_exec;
+	}
+
+	for (i = 1; i < info->hdr->e_shnum; i++) {
+		shdr = &info->sechdrs[i];
+		switch (shdr->sh_type) {
+		case SHT_NULL:
+		case SHT_NOBITS:
+			continue;
+		case SHT_SYMTAB:
+			if (shdr->sh_link == SHN_UNDEF
+			    || shdr->sh_link >= info->hdr->e_shnum) {
+				pr_err("Invalid ELF sh_link!=SHN_UNDEF(%d) or (sh_link(%d) >= hdr->e_shnum(%d)\n",
+				       shdr->sh_link, shdr->sh_link,
+				       info->hdr->e_shnum);
+				goto no_exec;
+			}
+			num_sym_secs++;
+			sym_idx = i;
+			fallthrough;
+		default:
+			err = validate_section_offset(info, shdr);
+			if (err < 0) {
+				pr_err("Invalid ELF section in module (section %u type %u)\n",
+					i, shdr->sh_type);
+				return err;
+			}
+			if (strcmp(info->secstrings + shdr->sh_name,
+				   ".gnu.linkonce.this_module") == 0) {
+				num_mod_secs++;
+				mod_idx = i;
+			} else if (strcmp(info->secstrings + shdr->sh_name,
+				   ".modinfo") == 0) {
+				num_info_secs++;
+				info_idx = i;
+			}
+
+			if (shdr->sh_flags & SHF_ALLOC) {
+				if (shdr->sh_name >= strhdr->sh_size) {
+					pr_err("Invalid ELF section name in module (section %u type %u)\n",
+					       i, shdr->sh_type);
+					return -ENOEXEC;
+				}
+			}
+			break;
+		}
+	}
+
+	if (num_info_secs > 1) {
+		pr_err("Only one .modinfo section must exist.\n");
+		goto no_exec;
+	} else if (num_info_secs == 1) {
+		/* Try to find a name early so we can log errors with a module name */
+		info->index.info = info_idx;
+		info->name = get_modinfo(info, "name");
+	}
+
+	if (num_sym_secs != 1) {
+		pr_warn("%s: module has no symbols (stripped?)\n",
+			info->name ?: "(missing .modinfo section or name field)");
+		goto no_exec;
+	}
+
+	/* Sets internal symbols and strings. */
+	info->index.sym = sym_idx;
+	shdr = &info->sechdrs[sym_idx];
+	info->index.str = shdr->sh_link;
+	info->strtab = (char *)info->hdr + info->sechdrs[info->index.str].sh_offset;
+
+	/*
+	 * The ".gnu.linkonce.this_module" ELF section is special. It is
+	 * what modpost uses to refer to __this_module and let's use rely
+	 * on THIS_MODULE to point to &__this_module properly. The kernel's
+	 * modpost declares it on each modules's *.mod.c file. If the struct
+	 * module of the kernel changes a full kernel rebuild is required.
+	 *
+	 * We have a few expectaions for this special section, the following
+	 * code validates all this for us:
+	 *
+	 *   o Only one section must exist
+	 *   o We expect the kernel to always have to allocate it: SHF_ALLOC
+	 *   o The section size must match the kernel's run time's struct module
+	 *     size
+	 */
+	if (num_mod_secs != 1) {
+		pr_err("module %s: Only one .gnu.linkonce.this_module section must exist.\n",
+		       info->name ?: "(missing .modinfo section or name field)");
+		goto no_exec;
+	}
+
+	shdr = &info->sechdrs[mod_idx];
+
+	/*
+	 * This is already implied on the switch above, however let's be
+	 * pedantic about it.
+	 */
+	if (shdr->sh_type == SHT_NOBITS) {
+		pr_err("module %s: .gnu.linkonce.this_module section must have a size set\n",
+		       info->name ?: "(missing .modinfo section or name field)");
+		goto no_exec;
+	}
+
+	if (!(shdr->sh_flags & SHF_ALLOC)) {
+		pr_err("module %s: .gnu.linkonce.this_module must occupy memory during process execution\n",
+		       info->name ?: "(missing .modinfo section or name field)");
+		goto no_exec;
+	}
+
+	if (shdr->sh_size != sizeof(struct module)) {
+		pr_err("module %s: .gnu.linkonce.this_module section size must match the kernel's built struct module size at run time\n",
+		       info->name ?: "(missing .modinfo section or name field)");
+		goto no_exec;
+	}
+
+	info->index.mod = mod_idx;
 
 	/* This is temporary: point mod into copy of data. */
-	info->mod = (void *)info->hdr + info->sechdrs[info->index.mod].sh_offset;
+	info->mod = (void *)info->hdr + shdr->sh_offset;
 
 	/*
 	 * If we didn't load the .modinfo 'name' field earlier, fall back to
@@ -2334,7 +1904,17 @@ static int elf_validity_cache_copy(struct load_info *info, int flags)
 	if (!info->name)
 		info->name = info->mod->name;
 
+	if (flags & MODULE_INIT_IGNORE_MODVERSIONS)
+		info->index.vers = 0; /* Pretend no __versions section! */
+	else
+		info->index.vers = find_sec(info, "__versions");
+
+	info->index.pcpu = find_pcpusec(info);
+
 	return 0;
+
+no_exec:
+	return -ENOEXEC;
 }
 
 #define COPY_CHUNK_SIZE (16*PAGE_SIZE)
@@ -2438,10 +2018,6 @@ static int rewrite_section_headers(struct load_info *info, int flags)
 
 	/* Track but don't keep modinfo and version sections. */
 	info->sechdrs[info->index.vers].sh_flags &= ~(unsigned long)SHF_ALLOC;
-	info->sechdrs[info->index.vers_ext_crc].sh_flags &=
-		~(unsigned long)SHF_ALLOC;
-	info->sechdrs[info->index.vers_ext_name].sh_flags &=
-		~(unsigned long)SHF_ALLOC;
 	info->sechdrs[info->index.info].sh_flags &= ~(unsigned long)SHF_ALLOC;
 
 	return 0;
@@ -2484,16 +2060,12 @@ static void module_augment_kernel_taints(struct module *mod, struct load_info *i
 	}
 #ifdef CONFIG_MODULE_SIG
 	mod->sig_ok = info->sig_ok;
-#ifndef CONFIG_MODULE_SIG_PROTECT
 	if (!mod->sig_ok) {
 		pr_notice_once("%s: module verification failed: signature "
 			       "and/or required key missing - tainting "
 			       "kernel\n", mod->name);
 		add_taint_module(mod, TAINT_UNSIGNED_MODULE, LOCKDEP_STILL_OK);
 	}
-#endif
-#else
-	mod->sig_ok = 0;
 #endif
 
 	/*
@@ -2675,7 +2247,6 @@ static int move_module(struct module *mod, struct load_info *info)
 	int i;
 	enum mod_mem_type t = 0;
 	int ret = -ENOMEM;
-	bool codetag_section_found = false;
 
 	for_each_mod_mem_type(type) {
 		if (!mod->mem[type].size) {
@@ -2686,7 +2257,7 @@ static int move_module(struct module *mod, struct load_info *info)
 		ret = module_memory_alloc(mod, type);
 		if (ret) {
 			t = type;
-			goto out_err;
+			goto out_enomem;
 		}
 	}
 
@@ -2695,33 +2266,12 @@ static int move_module(struct module *mod, struct load_info *info)
 	for (i = 0; i < info->hdr->e_shnum; i++) {
 		void *dest;
 		Elf_Shdr *shdr = &info->sechdrs[i];
-		const char *sname;
+		enum mod_mem_type type = shdr->sh_entsize >> SH_ENTSIZE_TYPE_SHIFT;
 
 		if (!(shdr->sh_flags & SHF_ALLOC))
 			continue;
 
-		sname = info->secstrings + shdr->sh_name;
-		/*
-		 * Load codetag sections separately as they might still be used
-		 * after module unload.
-		 */
-		if (codetag_needs_module_section(mod, sname, shdr->sh_size)) {
-			dest = codetag_alloc_module_section(mod, sname, shdr->sh_size,
-					arch_mod_section_prepend(mod, i), shdr->sh_addralign);
-			if (WARN_ON(!dest)) {
-				ret = -EINVAL;
-				goto out_err;
-			}
-			if (IS_ERR(dest)) {
-				ret = PTR_ERR(dest);
-				goto out_err;
-			}
-			codetag_section_found = true;
-		} else {
-			enum mod_mem_type type = shdr->sh_entsize >> SH_ENTSIZE_TYPE_SHIFT;
-
-			dest = mod->mem[type].base + (shdr->sh_entsize & SH_ENTSIZE_OFFSET_MASK);
-		}
+		dest = mod->mem[type].base + (shdr->sh_entsize & SH_ENTSIZE_OFFSET_MASK);
 
 		if (shdr->sh_type != SHT_NOBITS) {
 			/*
@@ -2733,7 +2283,7 @@ static int move_module(struct module *mod, struct load_info *info)
 			if (i == info->index.mod &&
 			   (WARN_ON_ONCE(shdr->sh_size != sizeof(struct module)))) {
 				ret = -ENOEXEC;
-				goto out_err;
+				goto out_enomem;
 			}
 			memcpy(dest, (void *)shdr->sh_addr, shdr->sh_size);
 		}
@@ -2749,12 +2299,9 @@ static int move_module(struct module *mod, struct load_info *info)
 	}
 
 	return 0;
-out_err:
+out_enomem:
 	for (t--; t >= 0; t--)
-		module_memory_free(mod, t);
-	if (codetag_section_found)
-		codetag_free_module_sections(mod);
-
+		module_memory_free(mod, t, true);
 	return ret;
 }
 
@@ -2875,8 +2422,6 @@ static struct module *layout_and_allocate(struct load_info *info, int flags)
 	/* Module has been copied to its final place now: return it. */
 	mod = (void *)info->sechdrs[info->index.mod].sh_addr;
 	kmemleak_load_module(mod, info);
-	codetag_module_replaced(info->mod, mod);
-
 	return mod;
 }
 
@@ -2885,9 +2430,8 @@ static void module_deallocate(struct module *mod, struct load_info *info)
 {
 	percpu_modfree(mod);
 	module_arch_freeing_init(mod);
-	codetag_free_module_sections(mod);
 
-	free_mod_mem(mod);
+	free_mod_mem(mod, true);
 }
 
 int __weak module_finalize(const Elf_Ehdr *hdr,
@@ -3039,11 +2583,7 @@ static noinline int do_init_module(struct module *mod)
 #endif
 	ret = module_enable_rodata_ro(mod, true);
 	if (ret)
-		pr_warn("%s: module_enable_rodata_ro_after_init() returned %d, "
-			"ro_after_init data might still be writable\n",
-			mod->name, ret);
-	trace_android_vh_set_mod_perm_after_init(mod);
-
+		goto fail_mutex_unlock;
 	mod_tree_remove_init(mod);
 	module_arch_freeing_init(mod);
 	for_class_mod_mem_type(type, init) {
@@ -3082,6 +2622,8 @@ static noinline int do_init_module(struct module *mod)
 
 	return 0;
 
+fail_mutex_unlock:
+	mutex_unlock(&module_mutex);
 fail_free_freeinit:
 	kfree(freeinit);
 fail:
@@ -3218,7 +2760,6 @@ static int complete_formation(struct module *mod, struct load_info *info)
 	err = module_enable_text_rox(mod);
 	if (err)
 		goto out_strict_rwx;
-	trace_android_vh_set_mod_perm_before_init(mod);
 
 	/*
 	 * Mark state as coming so strong_try_module_get() ignores us,
@@ -3356,7 +2897,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	module_allocated = true;
 
-	audit_log_kern_module(info->name);
+	audit_log_kern_module(mod->name);
 
 	/* Reserve our place in the list. */
 	err = add_unformed_module(mod);
@@ -3516,10 +3057,8 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	 * failures once the proper module was allocated and
 	 * before that.
 	 */
-	if (!module_allocated) {
-		audit_log_kern_module(info->name ? info->name : "?");
+	if (!module_allocated)
 		mod_stat_bump_becoming(info, flags);
-	}
 	free_copy(info, flags);
 	return err;
 }
@@ -3822,19 +3361,6 @@ bool is_module_text_address(unsigned long addr)
 	preempt_enable();
 
 	return ret;
-}
-
-void module_for_each_mod(int(*func)(struct module *mod, void *data), void *data)
-{
-	struct module *mod;
-
-	guard(rcu)();
-	list_for_each_entry_rcu(mod, &modules, list) {
-		if (mod->state == MODULE_STATE_UNFORMED)
-			continue;
-		if (func(mod, data))
-			break;
-	}
 }
 
 /**

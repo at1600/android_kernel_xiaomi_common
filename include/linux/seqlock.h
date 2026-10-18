@@ -319,29 +319,6 @@ SEQCOUNT_LOCKNAME(mutex,        struct mutex,    true,     mutex)
 })
 
 /**
- * raw_seqcount_try_begin() - begin a seqcount_t read critical section
- *                            w/o lockdep and w/o counter stabilization
- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
- * @start: count to be passed to read_seqcount_retry()
- *
- * Similar to raw_seqcount_begin(), except it enables eliding the critical
- * section entirely if odd, instead of doing the speculation knowing it will
- * fail.
- *
- * Useful when counter stabilization is more or less equivalent to taking
- * the lock and there is a slowpath that does that.
- *
- * If true, start will be set to the (even) sequence count read.
- *
- * Return: true when a read critical section is started.
- */
-#define raw_seqcount_try_begin(s, start)				\
-({									\
-	start = raw_read_seqcount(s);					\
-	!(start & 1);							\
-})
-
-/**
  * raw_seqcount_begin() - begin a seqcount_t read critical section w/o
  *                        lockdep and w/o counter stabilization
  * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
@@ -645,23 +622,6 @@ static __always_inline unsigned raw_read_seqcount_latch(const seqcount_latch_t *
 }
 
 /**
- * read_seqcount_latch() - pick even/odd latch data copy
- * @s: Pointer to seqcount_latch_t
- *
- * See write_seqcount_latch() for details and a full reader/writer usage
- * example.
- *
- * Return: sequence counter raw value. Use the lowest bit as an index for
- * picking which data copy to read. The full counter must then be checked
- * with read_seqcount_latch_retry().
- */
-static __always_inline unsigned read_seqcount_latch(const seqcount_latch_t *s)
-{
-	kcsan_atomic_next(KCSAN_SEQLOCK_REGION_MAX);
-	return raw_read_seqcount_latch(s);
-}
-
-/**
  * raw_read_seqcount_latch_retry() - end a seqcount_latch_t read section
  * @s:		Pointer to seqcount_latch_t
  * @start:	count, from raw_read_seqcount_latch()
@@ -676,32 +636,7 @@ raw_read_seqcount_latch_retry(const seqcount_latch_t *s, unsigned start)
 }
 
 /**
- * read_seqcount_latch_retry() - end a seqcount_latch_t read section
- * @s:		Pointer to seqcount_latch_t
- * @start:	count, from read_seqcount_latch()
- *
- * Return: true if a read section retry is required, else false
- */
-static __always_inline int
-read_seqcount_latch_retry(const seqcount_latch_t *s, unsigned start)
-{
-	kcsan_atomic_next(0);
-	return raw_read_seqcount_latch_retry(s, start);
-}
-
-/**
  * raw_write_seqcount_latch() - redirect latch readers to even/odd copy
- * @s: Pointer to seqcount_latch_t
- */
-static __always_inline void raw_write_seqcount_latch(seqcount_latch_t *s)
-{
-	smp_wmb();	/* prior stores before incrementing "sequence" */
-	s->seqcount.sequence++;
-	smp_wmb();      /* increment "sequence" before following stores */
-}
-
-/**
- * write_seqcount_latch_begin() - redirect latch readers to odd copy
  * @s: Pointer to seqcount_latch_t
  *
  * The latch technique is a multiversion concurrency control method that allows
@@ -730,11 +665,17 @@ static __always_inline void raw_write_seqcount_latch(seqcount_latch_t *s)
  *
  *	void latch_modify(struct latch_struct *latch, ...)
  *	{
- *		write_seqcount_latch_begin(&latch->seq);
+ *		smp_wmb();	// Ensure that the last data[1] update is visible
+ *		latch->seq.sequence++;
+ *		smp_wmb();	// Ensure that the seqcount update is visible
+ *
  *		modify(latch->data[0], ...);
- *		write_seqcount_latch(&latch->seq);
+ *
+ *		smp_wmb();	// Ensure that the data[0] update is visible
+ *		latch->seq.sequence++;
+ *		smp_wmb();	// Ensure that the seqcount update is visible
+ *
  *		modify(latch->data[1], ...);
- *		write_seqcount_latch_end(&latch->seq);
  *	}
  *
  * The query will have a form like::
@@ -745,13 +686,13 @@ static __always_inline void raw_write_seqcount_latch(seqcount_latch_t *s)
  *		unsigned seq, idx;
  *
  *		do {
- *			seq = read_seqcount_latch(&latch->seq);
+ *			seq = raw_read_seqcount_latch(&latch->seq);
  *
  *			idx = seq & 0x01;
  *			entry = data_query(latch->data[idx], ...);
  *
  *		// This includes needed smp_rmb()
- *		} while (read_seqcount_latch_retry(&latch->seq, seq));
+ *		} while (raw_read_seqcount_latch_retry(&latch->seq, seq));
  *
  *		return entry;
  *	}
@@ -775,31 +716,11 @@ static __always_inline void raw_write_seqcount_latch(seqcount_latch_t *s)
  *	When data is a dynamic data structure; one should use regular RCU
  *	patterns to manage the lifetimes of the objects within.
  */
-static __always_inline void write_seqcount_latch_begin(seqcount_latch_t *s)
+static inline void raw_write_seqcount_latch(seqcount_latch_t *s)
 {
-	kcsan_nestable_atomic_begin();
-	raw_write_seqcount_latch(s);
-}
-
-/**
- * write_seqcount_latch() - redirect latch readers to even copy
- * @s: Pointer to seqcount_latch_t
- */
-static __always_inline void write_seqcount_latch(seqcount_latch_t *s)
-{
-	raw_write_seqcount_latch(s);
-}
-
-/**
- * write_seqcount_latch_end() - end a seqcount_latch_t write section
- * @s:		Pointer to seqcount_latch_t
- *
- * Marks the end of a seqcount_latch_t writer section, after all copies of the
- * latch-protected data have been updated.
- */
-static __always_inline void write_seqcount_latch_end(seqcount_latch_t *s)
-{
-	kcsan_nestable_atomic_end();
+	smp_wmb();	/* prior stores before incrementing "sequence" */
+	s->seqcount.sequence++;
+	smp_wmb();      /* increment "sequence" before following stores */
 }
 
 #define __SEQLOCK_UNLOCKED(lockname)					\
@@ -833,7 +754,11 @@ static __always_inline void write_seqcount_latch_end(seqcount_latch_t *s)
  */
 static inline unsigned read_seqbegin(const seqlock_t *sl)
 {
-	return read_seqcount_begin(&sl->seqcount);
+	unsigned ret = read_seqcount_begin(&sl->seqcount);
+
+	kcsan_atomic_next(0);  /* non-raw usage, assume closing read_seqretry() */
+	kcsan_flat_atomic_begin();
+	return ret;
 }
 
 /**
@@ -849,6 +774,12 @@ static inline unsigned read_seqbegin(const seqlock_t *sl)
  */
 static inline unsigned read_seqretry(const seqlock_t *sl, unsigned start)
 {
+	/*
+	 * Assume not nested: read_seqretry() may be called multiple times when
+	 * completing read critical section.
+	 */
+	kcsan_flat_atomic_end();
+
 	return read_seqcount_retry(&sl->seqcount, start);
 }
 

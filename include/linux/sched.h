@@ -34,7 +34,6 @@
 #include <linux/sched/prio.h>
 #include <linux/sched/types.h>
 #include <linux/signal_types.h>
-#include <linux/spinlock.h>
 #include <linux/syscall_user_dispatch_types.h>
 #include <linux/mm_types_task.h>
 #include <linux/netdevice_xmit.h>
@@ -47,8 +46,6 @@
 #include <linux/rv.h>
 #include <linux/livepatch_sched.h>
 #include <linux/uidgid_types.h>
-#include <linux/android_vendor.h>
-#include <linux/android_kabi.h>
 #include <asm/kmap_size.h>
 
 /* task_struct member predeclarations (sorted alphabetically): */
@@ -81,7 +78,6 @@ struct seq_file;
 struct sighand_struct;
 struct signal_struct;
 struct task_delay_info;
-struct task_dma_buf_info;
 struct task_group;
 struct task_struct;
 struct user_event_mm;
@@ -330,8 +326,6 @@ extern int __must_check io_schedule_prepare(void);
 extern void io_schedule_finish(int token);
 extern long io_schedule_timeout(long timeout);
 extern void io_schedule(void);
-extern int select_fallback_rq(int cpu, struct task_struct *p);
-extern struct task_struct *pick_task(struct rq *rq);
 
 /**
  * struct prev_cputime - snapshot of system and user cputime
@@ -563,15 +557,7 @@ struct sched_entity {
 	u64				sum_exec_runtime;
 	u64				prev_sum_exec_runtime;
 	u64				vruntime;
-	union {
-		/*
-		 * When !@on_rq this field is vlag.
-		 * When cfs_rq->curr == se (which implies @on_rq)
-		 * this field is vprot. See protect_slice().
-		 */
-		s64                     vlag;
-		u64                     vprot;
-	};
+	s64				vlag;
 	u64				slice;
 
 	u64				nr_migrations;
@@ -596,11 +582,6 @@ struct sched_entity {
 	 */
 	struct sched_avg		avg;
 #endif
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 struct sched_rt_entity {
@@ -619,11 +600,6 @@ struct sched_rt_entity {
 	/* rq "owned" by this entity/group: */
 	struct rt_rq			*my_q;
 #endif
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 } __randomize_layout;
 
 typedef bool (*dl_server_has_tasks_f)(struct sched_dl_entity *);
@@ -680,12 +656,6 @@ struct sched_dl_entity {
 	 * @dl_defer_armed tells if the deferrable server is waiting
 	 * for the replenishment timer to activate it.
 	 *
-	 * @dl_server_active tells if the dlserver is active(started).
-	 * dlserver is started on first cfs enqueue on an idle runqueue
-	 * and is stopped when a dequeue results in 0 cfs tasks on the
-	 * runqueue. In other words, dlserver is active only when cpu's
-	 * runqueue has atleast one cfs task.
-	 *
 	 * @dl_defer_running tells if the deferrable server is actually
 	 * running, skipping the defer phase.
 	 */
@@ -694,11 +664,9 @@ struct sched_dl_entity {
 	unsigned int			dl_non_contending : 1;
 	unsigned int			dl_overrun	  : 1;
 	unsigned int			dl_server         : 1;
-	unsigned int			dl_server_active  : 1;
 	unsigned int			dl_defer	  : 1;
 	unsigned int			dl_defer_armed	  : 1;
 	unsigned int			dl_defer_running  : 1;
-	unsigned int			dl_server_idle    : 1; //UNUSED but kept for KMI
 
 	/*
 	 * Bandwidth enforcement timer. Each -deadline task has its
@@ -725,7 +693,7 @@ struct sched_dl_entity {
 	 * runnable task.
 	 */
 	struct rq			*rq;
-	dl_server_has_tasks_f		server_has_tasks; //UNUSED, but preserved for KMI
+	dl_server_has_tasks_f		server_has_tasks;
 	dl_server_pick_f		server_pick_task;
 
 #ifdef CONFIG_RT_MUTEXES
@@ -805,12 +773,6 @@ struct kmap_ctrl {
 	int				idx;
 	pte_t				pteval[KM_MAX_IDX];
 #endif
-};
-
-enum blocked_on_state {
-	BO_RUNNABLE,
-	BO_BLOCKED,
-	BO_WAKING,
 };
 
 struct task_struct {
@@ -975,7 +937,6 @@ struct task_struct {
 	unsigned			sched_reset_on_fork:1;
 	unsigned			sched_contributes_to_load:1;
 	unsigned			sched_migrated:1;
-	unsigned			sched_task_hot:1;
 
 	/* Force alignment to the next boundary: */
 	unsigned			:0;
@@ -1112,10 +1073,6 @@ struct task_struct {
 	u64				stimescaled;
 #endif
 	u64				gtime;
-#ifdef CONFIG_CPU_FREQ_TIMES
-	u64				*time_in_state;
-	unsigned int			max_state;
-#endif
 	struct prev_cputime		prev_cputime;
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
 	struct vtime			vtime;
@@ -1228,7 +1185,6 @@ struct task_struct {
 	raw_spinlock_t			pi_lock;
 
 	struct wake_q_node		wake_q;
-	int				wake_q_count;
 
 #ifdef CONFIG_RT_MUTEXES
 	/* PI waiters blocked on a rt_mutex held by this task: */
@@ -1239,21 +1195,9 @@ struct task_struct {
 	struct rt_mutex_waiter		*pi_blocked_on;
 #endif
 
-	enum blocked_on_state		blocked_on_state;
-	struct mutex			*blocked_on;	/* lock we're blocked on */
-	struct task_struct		*blocked_donor;	/* task that is boosting this task */
-	struct list_head		migration_node;
-#ifdef CONFIG_SCHED_PROXY_EXEC
-	struct list_head		blocked_head;  /* tasks blocked on this task */
-	struct list_head		blocked_node;  /* our entry on someone elses blocked_head */
-	/* Node for list of tasks to process blocked_head list for blocked entitiy activations */
-	struct list_head		blocked_activation_node;
-	struct task_struct		*sleeping_owner; /* task our blocked_node is enqueued on */
-#endif
-	raw_spinlock_t			blocked_lock;
-
-#ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
-	struct mutex			*blocker_mutex;
+#ifdef CONFIG_DEBUG_MUTEXES
+	/* Mutex deadlock detection: */
+	struct mutex_waiter		*blocked_on;
 #endif
 
 #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
@@ -1616,8 +1560,6 @@ struct task_struct {
 	struct callback_head		mce_kill_me;
 	int				mce_count;
 #endif
-	ANDROID_VENDOR_DATA_ARRAY(1, 6);
-	ANDROID_OEM_DATA_ARRAY(1, 6);
 
 #ifdef CONFIG_KRETPROBES
 	struct llist_head               kretprobe_instances;
@@ -1635,18 +1577,6 @@ struct task_struct {
 	 */
 	struct callback_head		l1d_flush_kill;
 #endif
-	ANDROID_KABI_USE(1, struct task_dma_buf_info *dmabuf_info);
-#ifdef CONFIG_ARM64_ERRATUM_4193714
-	ANDROID_KABI_USE(2, u64 __donotuse_b448672457);
-#else
-	ANDROID_KABI_RESERVE(2);
-#endif
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
-	ANDROID_KABI_RESERVE(5);
-	ANDROID_KABI_RESERVE(6);
-	ANDROID_KABI_RESERVE(7);
-	ANDROID_KABI_RESERVE(8);
 
 #ifdef CONFIG_RV
 	/*
@@ -1679,19 +1609,6 @@ struct task_struct {
 	 */
 };
 
-#ifdef CONFIG_SCHED_PROXY_EXEC
-DECLARE_STATIC_KEY_FALSE(__sched_proxy_exec);
-static inline bool sched_proxy_exec(void)
-{
-	return static_branch_likely(&__sched_proxy_exec);
-}
-#else
-static inline bool sched_proxy_exec(void)
-{
-	return false;
-}
-#endif
-
 #define TASK_REPORT_IDLE	(TASK_REPORT + 1)
 #define TASK_REPORT_MAX		(TASK_REPORT_IDLE << 1)
 
@@ -1709,9 +1626,8 @@ static inline unsigned int __task_state_index(unsigned int tsk_state,
 	 * We're lying here, but rather than expose a completely new task state
 	 * to userspace, we can make this appear as if the task has gone through
 	 * a regular rt_mutex_lock() call.
-	 * Report frozen tasks as uninterruptible.
 	 */
-	if ((tsk_state & TASK_RTLOCK_WAIT) || (tsk_state & TASK_FROZEN))
+	if (tsk_state & TASK_RTLOCK_WAIT)
 		state = TASK_UNINTERRUPTIBLE;
 
 	return fls(state);
@@ -1757,7 +1673,7 @@ extern struct pid *cad_pid;
 #define PF_USED_MATH		0x00002000	/* If unset the fpu must be initialized before use */
 #define PF_USER_WORKER		0x00004000	/* Kernel thread cloned from userspace thread */
 #define PF_NOFREEZE		0x00008000	/* This thread should not be frozen */
-#define PF_KCOMPACTD		0x00010000	/* I am kcompactd */
+#define PF__HOLE__00010000	0x00010000
 #define PF_KSWAPD		0x00020000	/* I am kswapd */
 #define PF_MEMALLOC_NOFS	0x00040000	/* All allocations inherit GFP_NOFS. See memalloc_nfs_save() */
 #define PF_MEMALLOC_NOIO	0x00080000	/* All allocations inherit GFP_NOIO. See memalloc_noio_save() */
@@ -1812,11 +1728,6 @@ static __always_inline bool is_percpu_thread(void)
 #else
 	return true;
 #endif
-}
-
-static __always_inline bool is_user_task(struct task_struct *task)
-{
-	return task->mm && !(task->flags & (PF_KTHREAD | PF_USER_WORKER));
 }
 
 /* Per-process atomic flags. */
@@ -2192,93 +2103,6 @@ extern int __cond_resched_rwlock_write(rwlock_t *lock);
 	__cond_resched_rwlock_write(lock);					\
 })
 
-static inline void __force_blocked_on_runnable(struct task_struct *p)
-{
-	lockdep_assert_held(&p->blocked_lock);
-	p->blocked_on_state = BO_RUNNABLE;
-}
-
-static inline void force_blocked_on_runnable(struct task_struct *p)
-{
-	guard(raw_spinlock_irqsave)(&p->blocked_lock);
-	__force_blocked_on_runnable(p);
-}
-
-static inline void __set_blocked_on_runnable(struct task_struct *p)
-{
-	lockdep_assert_held(&p->blocked_lock);
-
-	if (p->blocked_on_state == BO_WAKING)
-		p->blocked_on_state = BO_RUNNABLE;
-}
-
-static inline void set_blocked_on_runnable(struct task_struct *p)
-{
-	if (!sched_proxy_exec())
-		return;
-
-	guard(raw_spinlock_irqsave)(&p->blocked_lock);
-	__set_blocked_on_runnable(p);
-}
-
-static inline void __set_blocked_on_waking(struct task_struct *p)
-{
-	lockdep_assert_held(&p->blocked_lock);
-
-	if (p->blocked_on_state == BO_BLOCKED)
-		p->blocked_on_state = BO_WAKING;
-}
-
-static inline struct mutex *__get_task_blocked_on(struct task_struct *p)
-{
-	lockdep_assert_held_once(&p->blocked_lock);
-	return p->blocked_on;
-}
-
-#ifndef CONFIG_PREEMPT_RT
-static inline void set_blocked_on_waking_nested(struct task_struct *p, struct mutex *m)
-{
-	raw_spin_lock_nested(&p->blocked_lock, SINGLE_DEPTH_NESTING);
-	__set_blocked_on_waking(p);
-	raw_spin_unlock(&p->blocked_lock);
-}
-#else
-static inline void set_blocked_on_waking_nested(struct task_struct *p, struct rt_mutex *m)
-{
-	raw_spin_lock_nested(&p->blocked_lock, SINGLE_DEPTH_NESTING);
-	__set_blocked_on_waking(p);
-	raw_spin_unlock(&p->blocked_lock);
-}
-#endif
-
-static inline void __set_task_blocked_on(struct task_struct *p, struct mutex *m)
-{
-	WARN_ON_ONCE(!m);
-	/* The task should only be setting itself as blocked */
-	WARN_ON_ONCE(p != current);
-	/* Currently we serialize blocked_on under the task::blocked_lock */
-	lockdep_assert_held_once(&p->blocked_lock);
-	/*
-	 * Check ensure we don't overwrite existing mutex value
-	 * with a different mutex.
-	 */
-	WARN_ON_ONCE(p->blocked_on);
-	p->blocked_on = m;
-	p->blocked_on_state = BO_BLOCKED;
-}
-
-static inline void __clear_task_blocked_on(struct task_struct *p, struct mutex *m)
-{
-	/* The task should only be clearing itself */
-	WARN_ON_ONCE(p != current);
-	/* Currently we serialize blocked_on under the task::blocked_lock */
-	lockdep_assert_held_once(&p->blocked_lock);
-	/* Make sure we are clearing the relationship with the right lock */
-	WARN_ON_ONCE(p->blocked_on != m);
-	p->blocked_on = NULL;
-	p->blocked_on_state = BO_RUNNABLE;
-}
-
 static __always_inline bool need_resched(void)
 {
 	return unlikely(tif_need_resched());
@@ -2317,6 +2141,8 @@ static inline bool task_is_runnable(struct task_struct *p)
 extern bool sched_task_on_rq(struct task_struct *p);
 extern unsigned long get_wchan(struct task_struct *p);
 extern struct task_struct *cpu_curr_snapshot(int cpu);
+
+#include <linux/spinlock.h>
 
 /*
  * In order to reduce various lock holder preemption latencies provide an

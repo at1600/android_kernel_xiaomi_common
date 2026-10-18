@@ -100,13 +100,9 @@ dma_addr_t virtqueue_get_avail_addr(const struct virtqueue *vq);
 dma_addr_t virtqueue_get_used_addr(const struct virtqueue *vq);
 
 int virtqueue_resize(struct virtqueue *vq, u32 num,
-		     void (*recycle)(struct virtqueue *vq, void *buf),
-		     void (*recycle_done)(struct virtqueue *vq));
+		     void (*recycle)(struct virtqueue *vq, void *buf));
 int virtqueue_reset(struct virtqueue *vq,
-		    void (*recycle)(struct virtqueue *vq, void *buf),
-		    void (*recycle_done)(struct virtqueue *vq));
-
-void virtqueue_disable_dma_api_for_buffers(struct virtqueue *vq);
+		    void (*recycle)(struct virtqueue *vq, void *buf));
 
 struct virtio_admin_cmd {
 	__le16 opcode;

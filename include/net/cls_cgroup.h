@@ -20,8 +20,6 @@ struct cgroup_cls_state {
 	u32 classid;
 };
 
-void _trace_android_vh_task_get_classid(const struct sk_buff *skb, u32 *classid);
-
 struct cgroup_cls_state *task_cls_state(struct task_struct *p);
 
 static inline u32 task_cls_classid(struct task_struct *p)
@@ -65,7 +63,7 @@ static inline u32 task_get_classid(const struct sk_buff *skb)
 	 * calls by looking at the number of nested bh disable calls because
 	 * softirqs always disables bh.
 	 */
-	if (softirq_count()) {
+	if (in_serving_softirq()) {
 		struct sock *sk = skb_to_full_sk(skb);
 
 		/* If there is an sock_cgroup_classid we'll use that. */
@@ -74,8 +72,6 @@ static inline u32 task_get_classid(const struct sk_buff *skb)
 
 		classid = sock_cgroup_classid(&sk->sk_cgrp_data);
 	}
-
-	_trace_android_vh_task_get_classid(skb, &classid);
 
 	return classid;
 }

@@ -25,7 +25,6 @@
 #include <linux/jhash.h>
 #include <linux/sockptr.h>
 #include <linux/static_key.h>
-#include <linux/android_kabi.h>
 
 #include <net/inet_sock.h>
 #include <net/route.h>
@@ -84,7 +83,6 @@ struct ipcm_cookie {
 	__s16			tos;
 	char			priority;
 	__u16			gso_size;
-	ANDROID_KABI_RESERVE(1);
 };
 
 static inline void ipcm_init(struct ipcm_cookie *ipcm)
@@ -426,11 +424,6 @@ int ip_decrease_ttl(struct iphdr *iph)
 	return --iph->ttl;
 }
 
-static inline dscp_t ip4h_dscp(const struct iphdr *ip4h)
-{
-	return inet_dsfield_to_dscp(ip4h->tos);
-}
-
 static inline int ip_mtu_locked(const struct dst_entry *dst)
 {
 	const struct rtable *rt = dst_rtable(dst);
@@ -472,12 +465,9 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
 						    bool forwarding)
 {
 	const struct rtable *rt = dst_rtable(dst);
-	unsigned int mtu, res;
-	struct net *net;
+	struct net *net = dev_net(dst->dev);
+	unsigned int mtu;
 
-	rcu_read_lock();
-
-	net = dev_net_rcu(dst_dev(dst));
 	if (READ_ONCE(net->ipv4.sysctl_ip_fwd_use_pmtu) ||
 	    ip_mtu_locked(dst) ||
 	    !forwarding) {
@@ -491,7 +481,7 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
 	if (mtu)
 		goto out;
 
-	mtu = READ_ONCE(dst_dev(dst)->mtu);
+	mtu = READ_ONCE(dst->dev->mtu);
 
 	if (unlikely(ip_mtu_locked(dst))) {
 		if (rt->rt_uses_gateway && mtu > 576)
@@ -501,27 +491,22 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
 out:
 	mtu = min_t(unsigned int, mtu, IP_MAX_MTU);
 
-	res = mtu - lwtunnel_headroom(dst->lwtstate, mtu);
-
-	rcu_read_unlock();
-
-	return res;
+	return mtu - lwtunnel_headroom(dst->lwtstate, mtu);
 }
 
 static inline unsigned int ip_skb_dst_mtu(struct sock *sk,
 					  const struct sk_buff *skb)
 {
-	const struct dst_entry *dst = skb_dst(skb);
 	unsigned int mtu;
 
 	if (!sk || !sk_fullsock(sk) || ip_sk_use_pmtu(sk)) {
 		bool forwarding = IPCB(skb)->flags & IPSKB_FORWARDED;
 
-		return ip_dst_mtu_maybe_forward(dst, forwarding);
+		return ip_dst_mtu_maybe_forward(skb_dst(skb), forwarding);
 	}
 
-	mtu = min(READ_ONCE(dst_dev(dst)->mtu), IP_MAX_MTU);
-	return mtu - lwtunnel_headroom(dst->lwtstate, mtu);
+	mtu = min(READ_ONCE(skb_dst(skb)->dev->mtu), IP_MAX_MTU);
+	return mtu - lwtunnel_headroom(skb_dst(skb)->lwtstate, mtu);
 }
 
 struct dst_metrics *ip_fib_metrics_init(struct nlattr *fc_mx, int fc_mx_len,

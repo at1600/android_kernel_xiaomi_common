@@ -28,7 +28,6 @@
 #include <linux/srcu.h>
 #include <linux/static_call_types.h>
 #include <linux/dynamic_debug.h>
-#include <linux/android_kabi.h>
 
 #include <linux/percpu.h>
 #include <asm/module.h>
@@ -162,8 +161,6 @@ extern void cleanup_module(void);
 #define __INITDATA_OR_MODULE __INITDATA
 #define __INITRODATA_OR_MODULE __INITRODATA
 #endif /*CONFIG_MODULES*/
-
-struct module_kobject *lookup_or_create_module_kobject(const char *name);
 
 /* Generic info of form tag = "info" */
 #define MODULE_INFO(tag, info) __MODULE_INFO(tag, tag, info)
@@ -427,12 +424,11 @@ struct module {
 	struct module_attribute *modinfo_attrs;
 	const char *version;
 	const char *srcversion;
-	const char *scmversion;
 	struct kobject *holders_dir;
 
 	/* Exported symbols */
 	const struct kernel_symbol *syms;
-	const u32 *crcs;
+	const s32 *crcs;
 	unsigned int num_syms;
 
 #ifdef CONFIG_ARCH_USES_CFI_TRAPS
@@ -450,15 +446,13 @@ struct module {
 	/* GPL-only exported symbols. */
 	unsigned int num_gpl_syms;
 	const struct kernel_symbol *gpl_syms;
-	const u32 *gpl_crcs;
+	const s32 *gpl_crcs;
 	bool using_gplonly_symbols;
 
-	/*
-	 * Signature was verified. Unconditionally compiled in Android to
-	 * preserve ABI compatibility between kernels without module
-	 * signing enabled and signed modules.
-	 */
+#ifdef CONFIG_MODULE_SIG
+	/* Signature was verified. */
 	bool sig_ok;
+#endif
 
 	bool async_probe_requested;
 
@@ -586,11 +580,6 @@ struct module {
 	atomic_t refcnt;
 #endif
 
-#ifdef CONFIG_MITIGATION_ITS
-	int its_num_pages;
-	void **its_page_array;
-#endif
-
 #ifdef CONFIG_CONSTRUCTORS
 	/* Constructor functions. */
 	ctor_fn_t *ctors;
@@ -604,11 +593,6 @@ struct module {
 #ifdef CONFIG_DYNAMIC_DEBUG_CORE
 	struct _ddebug_info dyndbg_info;
 #endif
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 } ____cacheline_aligned __randomize_layout;
 #ifndef MODULE_ARCH_INIT
 #define MODULE_ARCH_INIT {}
@@ -783,8 +767,6 @@ static inline bool is_livepatch_module(struct module *mod)
 
 void set_module_sig_enforced(void);
 
-void module_for_each_mod(int(*func)(struct module *mod, void *data), void *data);
-
 #else /* !CONFIG_MODULES... */
 
 static inline struct module *__module_address(unsigned long addr)
@@ -891,10 +873,6 @@ void *dereference_module_function_descriptor(struct module *mod, void *ptr)
 static inline bool module_is_coming(struct module *mod)
 {
 	return false;
-}
-
-static inline void module_for_each_mod(int(*func)(struct module *mod, void *data), void *data)
-{
 }
 #endif /* CONFIG_MODULES */
 
