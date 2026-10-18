@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-only
-
 /*
  * The implementation of the wait_bit*() and related waiting APIs:
  */
-
 #define WAIT_TABLE_BITS 8
 #define WAIT_TABLE_SIZE (1 << WAIT_TABLE_BITS)
-
 static wait_queue_head_t bit_wait_table[WAIT_TABLE_SIZE] __cacheline_aligned;
 
-wait_queue_head_t *bit_waitqueue(void *word, int bit)
+static __always_inline unsigned long bit_wait_hash(void *word, int bit)
 {
 	const int shift = BITS_PER_LONG == 32 ? 5 : 6;
 	unsigned long val = (unsigned long)word << shift | bit;
+	return hash_long(val, WAIT_TABLE_BITS);
+}
 
-	return bit_wait_table + hash_long(val, WAIT_TABLE_BITS);
+wait_queue_head_t *bit_waitqueue(void *word, int bit)
+{
+	return bit_wait_table + bit_wait_hash(word, bit);
 }
 EXPORT_SYMBOL(bit_waitqueue);
 
-int wake_bit_function(struct wait_queue_entry *wq_entry, unsigned mode, int sync, void *arg)
+static noinline void __hot wake_bit_function(struct wait_queue_entry *wq_entry, unsigned mode, int sync, void *arg)
 {
 	struct wait_bit_key *key = arg;
 	struct wait_bit_queue_entry *wait_bit = container_of(wq_entry, struct wait_bit_queue_entry, wq_entry);
@@ -27,7 +28,6 @@ int wake_bit_function(struct wait_queue_entry *wq_entry, unsigned mode, int sync
 			wait_bit->key.bit_nr != key->bit_nr ||
 			test_bit(key->bit_nr, key->flags))
 		return 0;
-
 	return autoremove_wake_function(wq_entry, mode, sync, key);
 }
 EXPORT_SYMBOL(wake_bit_function);
@@ -42,15 +42,15 @@ __wait_on_bit(struct wait_queue_head *wq_head, struct wait_bit_queue_entry *wbq_
 	      wait_bit_action_f *action, unsigned mode)
 {
 	int ret = 0;
+	struct wait_bit_key *k = &wbq_entry->key;
 
 	do {
 		prepare_to_wait(wq_head, &wbq_entry->wq_entry, mode);
-		if (test_bit(wbq_entry->key.bit_nr, wbq_entry->key.flags))
-			ret = (*action)(&wbq_entry->key, mode);
-	} while (test_bit_acquire(wbq_entry->key.bit_nr, wbq_entry->key.flags) && !ret);
+		if (test_bit(k->bit_nr, k->flags))
+			ret = (*action)(k, mode);
+	} while (test_bit_acquire(k->bit_nr, k->flags) && !ret);
 
 	finish_wait(wq_head, &wbq_entry->wq_entry);
-
 	return ret;
 }
 EXPORT_SYMBOL(__wait_on_bit);
@@ -60,7 +60,6 @@ int __sched out_of_line_wait_on_bit(void *word, int bit,
 {
 	struct wait_queue_head *wq_head = bit_waitqueue(word, bit);
 	DEFINE_WAIT_BIT(wq_entry, word, bit);
-
 	return __wait_on_bit(wq_head, &wq_entry, action, mode);
 }
 EXPORT_SYMBOL(out_of_line_wait_on_bit);
@@ -71,9 +70,7 @@ int __sched out_of_line_wait_on_bit_timeout(
 {
 	struct wait_queue_head *wq_head = bit_waitqueue(word, bit);
 	DEFINE_WAIT_BIT(wq_entry, word, bit);
-
 	wq_entry.key.timeout = jiffies + timeout;
-
 	return __wait_on_bit(wq_head, &wq_entry, action, mode);
 }
 EXPORT_SYMBOL_GPL(out_of_line_wait_on_bit_timeout);
@@ -83,11 +80,12 @@ __wait_on_bit_lock(struct wait_queue_head *wq_head, struct wait_bit_queue_entry 
 			wait_bit_action_f *action, unsigned mode)
 {
 	int ret = 0;
+	struct wait_bit_key *k = &wbq_entry->key;
 
 	for (;;) {
 		prepare_to_wait_exclusive(wq_head, &wbq_entry->wq_entry, mode);
-		if (test_bit(wbq_entry->key.bit_nr, wbq_entry->key.flags)) {
-			ret = action(&wbq_entry->key, mode);
+		if (test_bit(k->bit_nr, k->flags)) {
+			ret = action(k, mode);
 			/*
 			 * See the comment in prepare_to_wait_event().
 			 * finish_wait() does not necessarily takes wwq_head->lock,
@@ -97,7 +95,7 @@ __wait_on_bit_lock(struct wait_queue_head *wq_head, struct wait_bit_queue_entry 
 			if (ret)
 				finish_wait(wq_head, &wbq_entry->wq_entry);
 		}
-		if (!test_and_set_bit(wbq_entry->key.bit_nr, wbq_entry->key.flags)) {
+		if (!test_and_set_bit(k->bit_nr, k->flags)) {
 			if (!ret)
 				finish_wait(wq_head, &wbq_entry->wq_entry);
 			return 0;
@@ -113,7 +111,6 @@ int __sched out_of_line_wait_on_bit_lock(void *word, int bit,
 {
 	struct wait_queue_head *wq_head = bit_waitqueue(word, bit);
 	DEFINE_WAIT_BIT(wq_entry, word, bit);
-
 	return __wait_on_bit_lock(wq_head, &wq_entry, action, mode);
 }
 EXPORT_SYMBOL(out_of_line_wait_on_bit_lock);
@@ -121,8 +118,7 @@ EXPORT_SYMBOL(out_of_line_wait_on_bit_lock);
 void __wake_up_bit(struct wait_queue_head *wq_head, void *word, int bit)
 {
 	struct wait_bit_key key = __WAIT_BIT_KEY_INITIALIZER(word, bit);
-
-	if (waitqueue_active(wq_head))
+	if (likely(waitqueue_active(wq_head)))
 		__wake_up(wq_head, TASK_NORMAL, 1, &key);
 }
 EXPORT_SYMBOL(__wake_up_bit);
@@ -156,8 +152,7 @@ wait_queue_head_t *__var_waitqueue(void *p)
 }
 EXPORT_SYMBOL(__var_waitqueue);
 
-static int
-var_wake_function(struct wait_queue_entry *wq_entry, unsigned int mode,
+static noinline void __hot var_wake_function(struct wait_queue_entry *wq_entry, unsigned int mode,
 		  int sync, void *arg)
 {
 	struct wait_bit_key *key = arg;
@@ -167,7 +162,6 @@ var_wake_function(struct wait_queue_entry *wq_entry, unsigned int mode,
 	if (wbq_entry->key.flags != key->flags ||
 	    wbq_entry->key.bit_nr != key->bit_nr)
 		return 0;
-
 	return autoremove_wake_function(wq_entry, mode, sync, key);
 }
 
@@ -197,9 +191,8 @@ EXPORT_SYMBOL(wake_up_var);
 __sched int bit_wait(struct wait_bit_key *word, int mode)
 {
 	schedule();
-	if (signal_pending_state(mode, current))
+	if (unlikely(signal_pending_state(mode, current)))
 		return -EINTR;
-
 	return 0;
 }
 EXPORT_SYMBOL(bit_wait);
@@ -207,9 +200,8 @@ EXPORT_SYMBOL(bit_wait);
 __sched int bit_wait_io(struct wait_bit_key *word, int mode)
 {
 	io_schedule();
-	if (signal_pending_state(mode, current))
+	if (unlikely(signal_pending_state(mode, current)))
 		return -EINTR;
-
 	return 0;
 }
 EXPORT_SYMBOL(bit_wait_io);
@@ -217,13 +209,11 @@ EXPORT_SYMBOL(bit_wait_io);
 __sched int bit_wait_timeout(struct wait_bit_key *word, int mode)
 {
 	unsigned long now = READ_ONCE(jiffies);
-
 	if (time_after_eq(now, word->timeout))
 		return -EAGAIN;
 	schedule_timeout(word->timeout - now);
-	if (signal_pending_state(mode, current))
+	if (unlikely(signal_pending_state(mode, current)))
 		return -EINTR;
-
 	return 0;
 }
 EXPORT_SYMBOL_GPL(bit_wait_timeout);
@@ -231,13 +221,11 @@ EXPORT_SYMBOL_GPL(bit_wait_timeout);
 __sched int bit_wait_io_timeout(struct wait_bit_key *word, int mode)
 {
 	unsigned long now = READ_ONCE(jiffies);
-
 	if (time_after_eq(now, word->timeout))
 		return -EAGAIN;
 	io_schedule_timeout(word->timeout - now);
-	if (signal_pending_state(mode, current))
+	if (unlikely(signal_pending_state(mode, current)))
 		return -EINTR;
-
 	return 0;
 }
 EXPORT_SYMBOL_GPL(bit_wait_io_timeout);
@@ -245,7 +233,7 @@ EXPORT_SYMBOL_GPL(bit_wait_io_timeout);
 void __init wait_bit_init(void)
 {
 	int i;
-
 	for (i = 0; i < WAIT_TABLE_SIZE; i++)
 		init_waitqueue_head(bit_wait_table + i);
 }
+

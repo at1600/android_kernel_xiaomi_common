@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-only
-
 /*
  * A simple wrapper around refcount. An allocated sched_core_cookie's
  * address is used to compute the cookie of the task.
@@ -8,19 +7,18 @@ struct sched_core_cookie {
 	refcount_t refcnt;
 };
 
-static unsigned long sched_core_alloc_cookie(void)
+static __hot unsigned long sched_core_alloc_cookie(void)
 {
 	struct sched_core_cookie *ck = kmalloc(sizeof(*ck), GFP_KERNEL);
-	if (!ck)
+	if (unlikely(!ck))
 		return 0;
 
 	refcount_set(&ck->refcnt, 1);
 	sched_core_get();
-
 	return (unsigned long)ck;
 }
 
-static void sched_core_put_cookie(unsigned long cookie)
+static __hot void sched_core_put_cookie(unsigned long cookie)
 {
 	struct sched_core_cookie *ptr = (void *)cookie;
 
@@ -30,13 +28,12 @@ static void sched_core_put_cookie(unsigned long cookie)
 	}
 }
 
-static unsigned long sched_core_get_cookie(unsigned long cookie)
+static __hot unsigned long sched_core_get_cookie(unsigned long cookie)
 {
 	struct sched_core_cookie *ptr = (void *)cookie;
 
-	if (ptr)
+	if (likely(ptr))
 		refcount_inc(&ptr->refcnt);
-
 	return cookie;
 }
 
@@ -50,7 +47,7 @@ static unsigned long sched_core_get_cookie(unsigned long cookie)
  *
  * Returns: the old cookie
  */
-static unsigned long sched_core_update_cookie(struct task_struct *p,
+static __hot unsigned long sched_core_update_cookie(struct task_struct *p,
 					      unsigned long cookie)
 {
 	unsigned long old_cookie;
@@ -67,7 +64,7 @@ static unsigned long sched_core_update_cookie(struct task_struct *p,
 	 */
 	SCHED_WARN_ON((p->core_cookie || cookie) && !sched_core_enabled(rq));
 
-	if (sched_core_enqueued(p))
+	if (unlikely(sched_core_enqueued(p)))
 		sched_core_dequeue(rq, p, DEQUEUE_SAVE);
 
 	old_cookie = p->core_cookie;
@@ -92,18 +89,17 @@ static unsigned long sched_core_update_cookie(struct task_struct *p,
 		resched_curr(rq);
 
 	task_rq_unlock(rq, p, &rf);
-
 	return old_cookie;
 }
 
-static unsigned long sched_core_clone_cookie(struct task_struct *p)
+static __hot unsigned long sched_core_clone_cookie(struct task_struct *p)
 {
-	unsigned long cookie, flags;
+	unsigned long cookie;
+	unsigned long flags;
 
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
 	cookie = sched_core_get_cookie(p->core_cookie);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
-
 	return cookie;
 }
 
@@ -118,7 +114,7 @@ void sched_core_free(struct task_struct *p)
 	sched_core_put_cookie(p->core_cookie);
 }
 
-static void __sched_core_set(struct task_struct *p, unsigned long cookie)
+static __hot void __sched_core_set(struct task_struct *p, unsigned long cookie)
 {
 	cookie = sched_core_get_cookie(cookie);
 	cookie = sched_core_update_cookie(p, cookie);
@@ -141,8 +137,8 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 	BUILD_BUG_ON(PR_SCHED_CORE_SCOPE_THREAD_GROUP != PIDTYPE_TGID);
 	BUILD_BUG_ON(PR_SCHED_CORE_SCOPE_PROCESS_GROUP != PIDTYPE_PGID);
 
-	if (type > PIDTYPE_PGID || cmd >= PR_SCHED_CORE_MAX || pid < 0 ||
-	    (cmd != PR_SCHED_CORE_GET && uaddr))
+	if (unlikely(type > PIDTYPE_PGID || cmd >= PR_SCHED_CORE_MAX || pid < 0 ||
+	    (cmd != PR_SCHED_CORE_GET && uaddr)))
 		return -EINVAL;
 
 	rcu_read_lock();
@@ -150,7 +146,7 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 		task = current;
 	} else {
 		task = find_task_by_vpid(pid);
-		if (!task) {
+		if (unlikely(!task)) {
 			rcu_read_unlock();
 			return -ESRCH;
 		}
@@ -162,14 +158,14 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 	 * Check if this process has the right to modify the specified
 	 * process. Use the regular "ptrace_may_access()" checks.
 	 */
-	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
+	if (unlikely(!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS))) {
 		err = -EPERM;
 		goto out;
 	}
 
 	switch (cmd) {
 	case PR_SCHED_CORE_GET:
-		if (type != PIDTYPE_PID || uaddr & 7) {
+		if (unlikely(type != PIDTYPE_PID || uaddr & 7)) {
 			err = -EINVAL;
 			goto out;
 		}
@@ -183,7 +179,7 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 
 	case PR_SCHED_CORE_CREATE:
 		cookie = sched_core_alloc_cookie();
-		if (!cookie) {
+		if (unlikely(!cookie)) {
 			err = -ENOMEM;
 			goto out;
 		}
@@ -194,7 +190,7 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 		break;
 
 	case PR_SCHED_CORE_SHARE_FROM:
-		if (type != PIDTYPE_PID) {
+		if (unlikely(type != PIDTYPE_PID)) {
 			err = -EINVAL;
 			goto out;
 		}
@@ -216,7 +212,7 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 	grp = task_pid_type(task, type);
 
 	do_each_pid_thread(grp, type, p) {
-		if (!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS)) {
+		if (unlikely(!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS))) {
 			err = -EPERM;
 			goto out_tasklist;
 		}
@@ -225,9 +221,9 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 	do_each_pid_thread(grp, type, p) {
 		__sched_core_set(p, cookie);
 	} while_each_pid_thread(grp, type, p);
+
 out_tasklist:
 	read_unlock(&tasklist_lock);
-
 out:
 	sched_core_put_cookie(cookie);
 	put_task_struct(task);
@@ -235,7 +231,6 @@ out:
 }
 
 #ifdef CONFIG_SCHEDSTATS
-
 /* REQUIRES: rq->core's clock recently updated. */
 void __sched_core_account_forceidle(struct rq *rq)
 {
@@ -246,7 +241,6 @@ void __sched_core_account_forceidle(struct rq *rq)
 	int i;
 
 	lockdep_assert_rq_held(rq);
-
 	WARN_ON_ONCE(!rq->core->core_forceidle_count);
 
 	if (rq->core->core_forceidle_start == 0)
@@ -274,10 +268,8 @@ void __sched_core_account_forceidle(struct rq *rq)
 	for_each_cpu(i, smt_mask) {
 		rq_i = cpu_rq(i);
 		p = rq_i->core_pick ?: rq_i->curr;
-
 		if (p == rq_i->idle)
 			continue;
-
 		/*
 		 * Note: this will account forceidle to the current CPU, even
 		 * if it comes from our SMT sibling.
@@ -290,11 +282,9 @@ void __sched_core_tick(struct rq *rq)
 {
 	if (!rq->core->core_forceidle_count)
 		return;
-
 	if (rq != rq->core)
 		update_rq_clock(rq->core);
-
 	__sched_core_account_forceidle(rq);
 }
-
 #endif /* CONFIG_SCHEDSTATS */
+
