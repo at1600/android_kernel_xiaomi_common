@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Per Entity Load Tracking
+ * Per Entity Load Tracking (PELT)
  *
  *  Copyright (C) 2007 Red Hat, Inc., Ingo Molnar <mingo@redhat.com>
  *
@@ -23,8 +23,6 @@
  *  Move PELT related code from fair.c into this pelt.c file
  *  Author: Vincent Guittot <vincent.guittot@linaro.org>
  */
-
-#include <trace/hooks/sched.h>
 
 /*
  * Approximate:
@@ -178,7 +176,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  *   load_avg = u_0` + y*(u_0 + u_1*y + u_2*y^2 + ... )
  *            = u_0 + u_1*y + u_2*y^2 + ... [re-labeling u_i --> u_{i+1}]
  */
-int
+static __always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
 {
@@ -204,16 +202,14 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 
 	sa->last_update_time += delta << 10;
 
-	trace_android_rvh_update_load_sum(sa, &delta, &sched_pelt_lshift);
-
 	/*
 	 * running is a subset of runnable (weight) so running can't be set if
 	 * runnable is clear. But there are some corner cases where the current
 	 * se has been already dequeued but cfs_rq->curr still points to it.
 	 * This means that weight will be 0 but not running for a sched_entity
 	 * but also for a cfs_rq if the latter becomes idle. As an example,
-	 * this happens during idle_balance() which calls
-	 * update_blocked_averages().
+	 * this happens during sched_balance_newidle() which calls
+	 * sched_balance_update_blocked_averages().
 	 *
 	 * Also see the comment in accumulate_sum().
 	 */
@@ -232,7 +228,6 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 
 	return 1;
 }
-EXPORT_SYMBOL_GPL(___update_load_sum);
 
 /*
  * When syncing *_avg with *_sum, we must take into account the current
@@ -258,7 +253,7 @@ EXPORT_SYMBOL_GPL(___update_load_sum);
  * the period_contrib of cfs_rq when updating the sched_avg of a sched_entity
  * if it's more convenient.
  */
-void
+static __always_inline void
 ___update_load_avg(struct sched_avg *sa, unsigned long load)
 {
 	u32 divider = get_pelt_divider(sa);
@@ -270,7 +265,6 @@ ___update_load_avg(struct sched_avg *sa, unsigned long load)
 	sa->runnable_avg = div_u64(sa->runnable_sum, divider);
 	WRITE_ONCE(sa->util_avg, sa->util_sum / divider);
 }
-EXPORT_SYMBOL_GPL(___update_load_avg);
 
 /*
  * sched_entity:
@@ -308,7 +302,6 @@ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(__update_load_avg_blocked_se);
 
 int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
@@ -391,30 +384,30 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
 	return 0;
 }
 
-#ifdef CONFIG_SCHED_THERMAL_PRESSURE
+#ifdef CONFIG_SCHED_HW_PRESSURE
 /*
- * thermal:
+ * hardware:
  *
  *   load_sum = \Sum se->avg.load_sum but se->avg.load_sum is not tracked
  *
  *   util_avg and runnable_load_avg are not supported and meaningless.
  *
  * Unlike rt/dl utilization tracking that track time spent by a cpu
- * running a rt/dl task through util_avg, the average thermal pressure is
- * tracked through load_avg. This is because thermal pressure signal is
+ * running a rt/dl task through util_avg, the average HW pressure is
+ * tracked through load_avg. This is because HW pressure signal is
  * time weighted "delta" capacity unlike util_avg which is binary.
  * "delta capacity" =  actual capacity  -
- *			capped capacity a cpu due to a thermal event.
+ *			capped capacity a cpu due to a HW event.
  */
 
-int update_thermal_load_avg(u64 now, struct rq *rq, u64 capacity)
+int update_hw_load_avg(u64 now, struct rq *rq, u64 capacity)
 {
-	if (___update_load_sum(now, &rq->avg_thermal,
+	if (___update_load_sum(now, &rq->avg_hw,
 			       capacity,
 			       capacity,
 			       capacity)) {
-		___update_load_avg(&rq->avg_thermal, 1);
-		trace_pelt_thermal_tp(rq);
+		___update_load_avg(&rq->avg_hw, 1);
+		trace_pelt_hw_tp(rq);
 		return 1;
 	}
 
@@ -424,7 +417,7 @@ int update_thermal_load_avg(u64 now, struct rq *rq, u64 capacity)
 
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 /*
- * irq:
+ * IRQ:
  *
  *   util_sum = \Sum se->avg.util_sum but se->avg.util_sum is not tracked
  *   util_sum = cpu_scale * load_sum
@@ -439,7 +432,7 @@ int update_irq_load_avg(struct rq *rq, u64 running)
 	int ret = 0;
 
 	/*
-	 * We can't use clock_pelt because irq time is not accounted in
+	 * We can't use clock_pelt because IRQ time is not accounted in
 	 * clock_task. Instead we directly scale the running time to
 	 * reflect the real amount of computation
 	 */
@@ -475,67 +468,22 @@ int update_irq_load_avg(struct rq *rq, u64 running)
 }
 #endif
 
-__read_mostly unsigned int sched_pelt_lshift;
-
-#ifdef CONFIG_SYSCTL
-#include <trace/hooks/sched.h>
-static unsigned int sysctl_sched_pelt_multiplier = 1;
-
-int sched_pelt_multiplier(struct ctl_table *table, int write, void *buffer,
-			  size_t *lenp, loff_t *ppos)
+/*
+ * Load avg and utiliztion metrics need to be updated periodically and before
+ * consumption. This function updates the metrics for all subsystems except for
+ * the fair class. @rq must be locked and have its clock updated.
+ */
+bool update_other_load_avgs(struct rq *rq)
 {
-	static DEFINE_MUTEX(mutex);
-	unsigned int old;
-	int ret;
+	u64 now = rq_clock_pelt(rq);
+	const struct sched_class *curr_class = rq->curr->sched_class;
+	unsigned long hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
 
-	mutex_lock(&mutex);
-	old = sysctl_sched_pelt_multiplier;
-	ret = proc_dointvec(table, write, buffer, lenp, ppos);
-	if (ret)
-		goto undo;
-	if (!write)
-		goto done;
+	lockdep_assert_rq_held(rq);
 
-	trace_android_vh_sched_pelt_multiplier(old, sysctl_sched_pelt_multiplier, &ret);
-	if (ret)
-		goto undo;
-
-	switch (sysctl_sched_pelt_multiplier)  {
-	case 1:
-		fallthrough;
-	case 2:
-		fallthrough;
-	case 4:
-		WRITE_ONCE(sched_pelt_lshift,
-			   sysctl_sched_pelt_multiplier >> 1);
-		goto done;
-	default:
-		ret = -EINVAL;
-	}
-
-undo:
-	sysctl_sched_pelt_multiplier = old;
-done:
-	mutex_unlock(&mutex);
-
-	return ret;
+	/* hw_pressure doesn't care about invariance */
+	return update_rt_rq_load_avg(now, rq, curr_class == &rt_sched_class) |
+		update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
+		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
+		update_irq_load_avg(rq, 0);
 }
-
-static struct ctl_table sched_pelt_sysctls[] = {
-	{
-		.procname       = "sched_pelt_multiplier",
-		.data           = &sysctl_sched_pelt_multiplier,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = sched_pelt_multiplier,
-	},
-	{}
-};
-
-static int __init sched_pelt_sysctl_init(void)
-{
-	register_sysctl_init("kernel", sched_pelt_sysctls);
-	return 0;
-}
-late_initcall(sched_pelt_sysctl_init);
-#endif

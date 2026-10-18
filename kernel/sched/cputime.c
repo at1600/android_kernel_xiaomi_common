@@ -2,8 +2,6 @@
 /*
  * Simple CPU accounting cgroup controller
  */
-#include <linux/cpufreq_times.h>
-#include <trace/hooks/sched.h>
 
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
  #include <asm/cputime.h>
@@ -16,14 +14,13 @@
  * They are only modified in vtime_account, on corresponding CPU
  * with interrupts disabled. So, writes are safe.
  * They are read and saved off onto struct rq in update_rq_clock().
- * This may result in other CPU reading this CPU's irq time and can
+ * This may result in other CPU reading this CPU's IRQ time and can
  * race with irq/vtime_account on this CPU. We would either get old
- * or new value with a side effect of accounting a slice of irq time to wrong
- * task when irq is in progress while we read rq->clock. That is a worthy
- * compromise in place of having locks on each irq in account_system_time.
+ * or new value with a side effect of accounting a slice of IRQ time to wrong
+ * task when IRQ is in progress while we read rq->clock. That is a worthy
+ * compromise in place of having locks on each IRQ in account_system_time.
  */
 DEFINE_PER_CPU(struct irqtime, cpu_irqtime);
-EXPORT_PER_CPU_SYMBOL_GPL(cpu_irqtime);
 
 static int sched_clock_irqtime;
 
@@ -59,7 +56,6 @@ void irqtime_account_irq(struct task_struct *curr, unsigned int offset)
 	unsigned int pc;
 	s64 delta;
 	int cpu;
-	bool irq_start = true;
 
 	if (!sched_clock_irqtime)
 		return;
@@ -75,15 +71,10 @@ void irqtime_account_irq(struct task_struct *curr, unsigned int offset)
 	 * in that case, so as not to confuse scheduler with a special task
 	 * that do not consume any time, but still wants to run.
 	 */
-	if (pc & HARDIRQ_MASK) {
+	if (pc & HARDIRQ_MASK)
 		irqtime_account_delta(irqtime, delta, CPUTIME_IRQ);
-		irq_start = false;
-	} else if ((pc & SOFTIRQ_OFFSET) && curr != this_cpu_ksoftirqd()) {
+	else if ((pc & SOFTIRQ_OFFSET) && curr != this_cpu_ksoftirqd())
 		irqtime_account_delta(irqtime, delta, CPUTIME_SOFTIRQ);
-		irq_start = false;
-	}
-
-	trace_android_rvh_account_irq(curr, cpu, delta, irq_start);
 }
 
 static u64 irqtime_tick_accounted(u64 maxtime)
@@ -142,9 +133,6 @@ void account_user_time(struct task_struct *p, u64 cputime)
 
 	/* Account for user time used */
 	acct_account_cputime(p);
-
-	/* Account power usage for user time */
-	cpufreq_acct_update_power(p, cputime);
 }
 
 /*
@@ -189,9 +177,6 @@ void account_system_index_time(struct task_struct *p,
 
 	/* Account for system time used */
 	acct_account_cputime(p);
-
-	/* Account power usage for system time */
-	cpufreq_acct_update_power(p, cputime);
 }
 
 /*
@@ -284,7 +269,7 @@ static __always_inline u64 steal_account_process_time(u64 maxtime)
 }
 
 /*
- * Account how much elapsed time was spent in steal, irq, or softirq time.
+ * Account how much elapsed time was spent in steal, IRQ, or softirq time.
  */
 static inline u64 account_other_time(u64 max)
 {
@@ -385,7 +370,7 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
  * Check for hardirq is done both for system and user time as there is
  * no timer going off while we are on hardirq and hence we may never get an
  * opportunity to update it solely in system time.
- * p->stime and friends are only updated on system time and not on irq
+ * p->stime and friends are only updated on system time and not on IRQ
  * softirq as those do not count in task exec_runtime any more.
  */
 static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
@@ -395,7 +380,7 @@ static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 
 	/*
 	 * When returning from idle, many ticks can get accounted at
-	 * once, including some ticks of steal, irq, and softirq time.
+	 * once, including some ticks of steal, IRQ, and softirq time.
 	 * Subtract those ticks from the amount of time accounted to
 	 * idle, or potentially user or system time. Due to rounding,
 	 * other time can exceed ticks occasionally.
@@ -422,7 +407,6 @@ static void irqtime_account_process_tick(struct task_struct *p, int user_tick,
 	} else {
 		account_system_index_time(p, cputime, CPUTIME_SYSTEM);
 	}
-	trace_android_vh_irqtime_account_process_tick(p, this_rq(), user_tick, ticks);
 }
 
 static void irqtime_account_idle_ticks(int ticks)
@@ -439,19 +423,6 @@ static inline void irqtime_account_process_tick(struct task_struct *p, int user_
  * Use precise platform statistics if available:
  */
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
-
-# ifndef __ARCH_HAS_VTIME_TASK_SWITCH
-void vtime_task_switch(struct task_struct *prev)
-{
-	if (is_idle_task(prev))
-		vtime_account_idle(prev);
-	else
-		vtime_account_kernel(prev);
-
-	vtime_flush(prev);
-	arch_vtime_task_switch(prev);
-}
-# endif
 
 void vtime_account_irq(struct task_struct *tsk, unsigned int offset)
 {
@@ -492,33 +463,27 @@ void thread_group_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
 	*ut = cputime.utime;
 	*st = cputime.stime;
 }
-EXPORT_SYMBOL_GPL(thread_group_cputime_adjusted);
 
 #else /* !CONFIG_VIRT_CPU_ACCOUNTING_NATIVE: */
 
 /*
- * Account a single tick or a few ticks of CPU time.
+ * Account a single tick of CPU time.
  * @p: the process that the CPU time gets accounted to
  * @user_tick: indicates if the tick is a user or a system tick
  */
 void account_process_tick(struct task_struct *p, int user_tick)
 {
 	u64 cputime, steal;
-	int ticks = 1;
-
-	trace_android_vh_account_process_tick_gran(p, this_rq(), user_tick, &ticks);
-	if (!ticks)
-		return;
 
 	if (vtime_accounting_enabled_this_cpu())
 		return;
 
 	if (sched_clock_irqtime) {
-		irqtime_account_process_tick(p, user_tick, ticks);
+		irqtime_account_process_tick(p, user_tick, 1);
 		return;
 	}
 
-	cputime = TICK_NSEC * ticks;
+	cputime = TICK_NSEC;
 	steal = steal_account_process_time(ULONG_MAX);
 
 	if (steal >= cputime)
@@ -617,6 +582,12 @@ void cputime_adjust(struct task_cputime *curr, struct prev_cputime *prev,
 	}
 
 	stime = mul_u64_u64_div_u64(stime, rtime, stime + utime);
+	/*
+	 * Because mul_u64_u64_div_u64() can approximate on some
+	 * achitectures; enforce the constraint that: a*b/(b+c) <= a.
+	 */
+	if (unlikely(stime > rtime))
+		stime = rtime;
 
 update:
 	/*
@@ -668,8 +639,6 @@ void thread_group_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
 	thread_group_cputime(p, &cputime);
 	cputime_adjust(&cputime, &p->signal->prev_cputime, ut, st);
 }
-EXPORT_SYMBOL_GPL(thread_group_cputime_adjusted);
-
 #endif /* !CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
 
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
