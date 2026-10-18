@@ -3448,7 +3448,7 @@ EXPORT_SYMBOL_GPL(kick_process);
  * select_task_rq() below may allow selection of !active CPUs in order
  * to satisfy the above rules.
  */
-int select_fallback_rq(int cpu, struct task_struct *p)
+static int select_fallback_rq(int cpu, struct task_struct *p)
 {
 	int nid = cpu_to_node(cpu);
 	const struct cpumask *nodemask = NULL;
