@@ -506,29 +506,15 @@ static inline int pte_none_mostly(pte_t pte)
 	return pte_none(pte) || is_pte_marker(pte);
 }
 
-static inline void swap_entry_migration_sync(swp_entry_t entry,
-		struct folio *folio)
+static inline struct page *pfn_swap_entry_to_page(swp_entry_t entry)
 {
-	/*
-	 * Ensure we do not race with split, which might alter tail pages into new
-	 * folios and thus result in observing an unlocked folio.
-	 * This matches the write barrier in __split_folio_to_order().
-	 */
-	smp_rmb();
+	struct page *p = pfn_to_page(swp_offset_pfn(entry));
 
 	/*
 	 * Any use of migration entries may only occur while the
 	 * corresponding page is locked
 	 */
-	BUG_ON(!folio_test_locked(folio));
-}
-
-static inline struct page *pfn_swap_entry_to_page(swp_entry_t entry)
-{
-	struct page *p = pfn_to_page(swp_offset_pfn(entry));
-
-	if (is_migration_entry(entry))
-		swap_entry_migration_sync(entry, page_folio(p));
+	BUG_ON(is_migration_entry(entry) && !PageLocked(p));
 
 	return p;
 }
@@ -537,8 +523,11 @@ static inline struct folio *pfn_swap_entry_folio(swp_entry_t entry)
 {
 	struct folio *folio = pfn_folio(swp_offset_pfn(entry));
 
-	if (is_migration_entry(entry))
-		swap_entry_migration_sync(entry, folio);
+	/*
+	 * Any use of migration entries may only occur while the
+	 * corresponding folio is locked
+	 */
+	BUG_ON(is_migration_entry(entry) && !folio_test_locked(folio));
 
 	return folio;
 }

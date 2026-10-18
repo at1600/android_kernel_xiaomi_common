@@ -55,7 +55,6 @@
 #define _ANDROID_KABI_RULE(hint, target, value) \
 	__ANDROID_KABI_RULE(hint, #target, #value)
 
-#ifdef CONFIG_64BIT
 #define _ANDROID_KABI_NORMAL_SIZE_ALIGN(_orig, _new)			\
 	union {								\
 		_Static_assert(						\
@@ -70,9 +69,6 @@
 				" is not aligned the same as "		\
 				__stringify(_new));			\
 	}
-#else
-#define _ANDROID_KABI_NORMAL_SIZE_ALIGN(_orig, _new)
-#endif
 
 #define _ANDROID_KABI_REPLACE(_orig, _new)		      \
 	union {						      \

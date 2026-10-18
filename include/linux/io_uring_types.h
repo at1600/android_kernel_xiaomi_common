@@ -343,15 +343,7 @@ struct io_ring_ctx {
 
 	spinlock_t		completion_lock;
 
-	/*
-	 * ANDROID
-	 * The io_buffers_comp variable was removed in 6.12.81, but needs to remain to keep the ABI
-	 * "stable"
-	 * DO NOT TOUCH OR USE!
-	 * See Bug 512370883 for more details if you are curious.
-	 */
 	struct list_head	io_buffers_comp;
-
 	struct list_head	cq_overflow_list;
 	struct io_hash_table	cancel_table;
 
@@ -371,13 +363,6 @@ struct io_ring_ctx {
 	unsigned int		file_alloc_start;
 	unsigned int		file_alloc_end;
 
-	/*
-	 * ANDROID
-	 * The io_buffers_cache variable was removed in 6.12.81, but needs to remain to keep
-	 * the ABI "stable"
-	 * DO NOT TOUCH OR USE!
-	 * See Bug 512370883 for more details if you are curious.
-	 */
 	struct list_head	io_buffers_cache;
 
 	/* Keep this last, we don't need it for the fast path */
@@ -487,7 +472,6 @@ enum {
 	REQ_F_BL_EMPTY_BIT,
 	REQ_F_BL_NO_RECYCLE_BIT,
 	REQ_F_BUFFERS_COMMIT_BIT,
-	REQ_F_BUF_MORE_BIT,
 
 	/* not a real bit, just to check we're not overflowing the space */
 	__REQ_F_LAST_BIT,
@@ -568,8 +552,6 @@ enum {
 	REQ_F_BL_NO_RECYCLE	= IO_REQ_FLAG(REQ_F_BL_NO_RECYCLE_BIT),
 	/* buffer ring head needs incrementing on put */
 	REQ_F_BUFFERS_COMMIT	= IO_REQ_FLAG(REQ_F_BUFFERS_COMMIT_BIT),
-	/* incremental buffer consumption, more space available */
-	REQ_F_BUF_MORE		= IO_REQ_FLAG(REQ_F_BUF_MORE_BIT),
 };
 
 typedef void (*io_req_tw_func_t)(struct io_kiocb *req, struct io_tw_state *ts);
@@ -649,13 +631,10 @@ struct io_kiocb {
 		struct io_buffer	*kbuf;
 
 		/*
-		 * ANDROID
-		 * This buf_list variable was removed in 6.12.81, but needs to remain to keep
-		 * gendwarfsyms from crashing.
-		 * DO NOT TOUCH OR USE!
-		 * See Bug 512370883 for more details if you are curious.
+		 * stores buffer ID for ring provided buffers, valid IFF
+		 * REQ_F_BUFFER_RING is set.
 		 */
-		struct io_buffer_list   *buf_list;
+		struct io_buffer_list	*buf_list;
 	};
 
 	union {

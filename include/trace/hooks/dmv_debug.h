@@ -13,30 +13,20 @@ DECLARE_HOOK(android_vh_handle_add_fec_mismatch_blks,
 		TP_PROTO(sector_t cur_blk, char *dev_name),
 		TP_ARGS(cur_blk, dev_name));
 
-#define DMV_ERROR_EVENT_PRE_FEC		0
-#define DMV_ERROR_EVENT_FEC_FAILED	1
+struct dm_verity;
+struct dm_verity_io;
 
 DECLARE_HOOK(android_vh_handle_data_error,
-		TP_PROTO(const char *dev_name, sector_t block,
-			const u8 *data, unsigned int data_len,
-			const u8 *want_digest, const u8 *runtime_digest,
-			unsigned int digest_size,
-			const u8 *salt, unsigned int salt_size,
-			unsigned int event),
-		TP_ARGS(dev_name, block, data, data_len,
-			want_digest, runtime_digest, digest_size,
-			salt, salt_size, event));
+		TP_PROTO(struct dm_verity *v,
+			sector_t block, struct dm_verity_io *io,
+			const u8 *data, const u8 *want_digest),
+		TP_ARGS(v, block, io, data, want_digest));
 
 DECLARE_HOOK(android_vh_handle_metadata_error,
-		TP_PROTO(const char *dev_name, sector_t block,
-			const u8 *data, unsigned int data_len,
-			const u8 *want_digest, const u8 *runtime_digest,
-			unsigned int digest_size,
-			const u8 *salt, unsigned int salt_size,
-			unsigned int event),
-		TP_ARGS(dev_name, block, data, data_len,
-			want_digest, runtime_digest, digest_size,
-			salt, salt_size, event));
+		TP_PROTO(struct dm_verity *v,
+			sector_t block, struct dm_verity_io *io,
+			const u8 *want_digest),
+		TP_ARGS(v, block, io, want_digest));
 
 DECLARE_HOOK(android_vh_handle_add_skipped_blks,
 		TP_PROTO(void *unused),

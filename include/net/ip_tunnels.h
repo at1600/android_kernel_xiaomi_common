@@ -24,13 +24,6 @@
 #include <net/ip6_route.h>
 #endif
 
-/* Recursion limit for tunnel xmit to detect routing loops.
- * Unlike XMIT_RECURSION_LIMIT (8) used in the no-qdisc path, tunnel
- * recursion involves route lookups and full IP output, consuming much
- * more stack per level, so a lower limit is needed.
- */
-#define IP_TUNNEL_RECURSION_LIMIT	5
-
 /* Keep error state on tunnel for 30 sec */
 #define IPTUNNEL_ERR_TIMEO	(30*HZ)
 
@@ -468,12 +461,11 @@ static inline bool pskb_inet_may_pull(struct sk_buff *skb)
 
 /* Variant of pskb_inet_may_pull().
  */
-static inline enum skb_drop_reason
-skb_vlan_inet_prepare(struct sk_buff *skb, bool inner_proto_inherit)
+static inline bool skb_vlan_inet_prepare(struct sk_buff *skb,
+					 bool inner_proto_inherit)
 {
 	int nhlen = 0, maclen = inner_proto_inherit ? 0 : ETH_HLEN;
 	__be16 type = skb->protocol;
-	enum skb_drop_reason reason;
 
 	/* Essentially this is skb_protocol(skb, true)
 	 * And we get MAC len.
@@ -494,13 +486,11 @@ skb_vlan_inet_prepare(struct sk_buff *skb, bool inner_proto_inherit)
 	/* For ETH_P_IPV6/ETH_P_IP we make sure to pull
 	 * a base network header in skb->head.
 	 */
-	reason = pskb_may_pull_reason(skb, maclen + nhlen);
-	if (reason)
-		return reason;
+	if (!pskb_may_pull(skb, maclen + nhlen))
+		return false;
 
 	skb_set_network_header(skb, maclen);
-
-	return SKB_NOT_DROPPED_YET;
+	return true;
 }
 
 static inline int ip_encap_hlen(struct ip_tunnel_encap *e)
