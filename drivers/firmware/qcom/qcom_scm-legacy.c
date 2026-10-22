@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2010,2015,2019 The Linux Foundation. All rights reserved.
  * Copyright (C) 2015 Linaro Ltd.
- * Copyright (c) 2023,2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/slab.h>
@@ -15,6 +14,17 @@
 #include <linux/dma-mapping.h>
 
 #include "qcom_scm.h"
+
+static DEFINE_MUTEX(qcom_scm_lock);
+
+
+/**
+ * struct arm_smccc_args
+ * @args:	The array of values used in registers in smc instruction
+ */
+struct arm_smccc_args {
+	unsigned long args[8];
+};
 
 
 /**
@@ -138,9 +148,6 @@ int scm_legacy_call(struct device *dev, const struct qcom_scm_desc *desc,
 	__le32 *arg_buf;
 	const __le32 *res_buf;
 
-	if (!dev)
-		return -EPROBE_DEFER;
-
 	cmd = kzalloc(PAGE_ALIGN(alloc_len), GFP_KERNEL);
 	if (!cmd)
 		return -ENOMEM;
@@ -166,11 +173,11 @@ int scm_legacy_call(struct device *dev, const struct qcom_scm_desc *desc,
 	smc.args[1] = (unsigned long)&context_id;
 	smc.args[2] = cmd_phys;
 
-	down(&qcom_scm_sem_lock);
+	mutex_lock(&qcom_scm_lock);
 	__scm_legacy_do(&smc, &smc_res);
 	if (smc_res.a0)
 		ret = qcom_scm_remap_error(smc_res.a0);
-	up(&qcom_scm_sem_lock);
+	mutex_unlock(&qcom_scm_lock);
 	if (ret)
 		goto out;
 
