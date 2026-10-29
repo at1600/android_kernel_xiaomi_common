@@ -171,7 +171,6 @@ struct walt_task_struct {
         unsigned int                    lst_state_counter;
         unsigned int                    pipeline_activity_cnt;
         unsigned int                    lib_app_state;
-        atomic_t                        event_windows;
 	s64				lst_cnt;
 	bool			lst;
 
