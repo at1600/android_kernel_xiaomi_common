@@ -11,3 +11,6 @@ sched-walt-debug-$(CONFIG_SCHED_WALT_DEBUG) := walt_debug.o
 
 obj-$(CONFIG_SCHED_WALT) += sched-penalty.o
 sched-penalty-$(CONFIG_SCHED_WALT) := penalty.o
+
+obj-$(CONFIG_SCHED_WALT_STATS) += sysctl_walt_stats.o
+obj-$(CONFIG_SCHED_WALT_MIDPOINT) += midpoint.o
