@@ -9,7 +9,7 @@
 
 #include <linux/pm_qos.h>
 #include <linux/sched/cputime.h>
-#include <kernel/sched/sched.h>
+#include <../sched.h>
 #include <fs/proc/internal.h>
 #include <linux/sched/walt.h>
 #include <linux/jump_label.h>
