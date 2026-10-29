@@ -175,7 +175,7 @@ struct walt_task_struct {
 	bool			lst;
 
 	s64				pipeline_cnt;
-	unsigned int			event_windows;
+	atomic_t			event_windows;
 	unsigned int			continous_active;
 // MIUI ADD: Game_MIGT
 	int                             mmlock_wakeup;
