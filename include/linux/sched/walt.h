@@ -168,6 +168,10 @@ struct walt_task_struct {
 	u64				yield_ts;
 	u64				yield_total_sleep_usec;
 	s64				lst_start_ns;
+        unsigned int                    lst_state_counter;
+        unsigned int                    pipeline_activity_cnt;
+        unsigned int                    lib_app_state;
+        atomic_t                        event_windows;
 	s64				lst_cnt;
 	bool			lst;
 
