@@ -22,7 +22,7 @@
 #include <trace/hooks/cpufreq.h>
 #include <trace/hooks/power.h>
 #include <trace/events/power.h>
-#include "walt.h"
+#include <linux/sched/walt.h>
 #include "trace.h"
 #include "sysctl_walt_stats.h"
 
