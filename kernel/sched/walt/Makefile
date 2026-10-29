@@ -9,7 +9,5 @@ sched-walt-$(CONFIG_SCHED_WALT) := walt.o boost.o sched_avg.o walt_halt.o core_c
 obj-$(CONFIG_SCHED_WALT_DEBUG) += sched-walt-debug.o
 sched-walt-debug-$(CONFIG_SCHED_WALT_DEBUG) := walt_debug.o
 
-obj-$(CONFIG_SCHED_WALT) += sched-penalty.o
-
 obj-$(CONFIG_SCHED_WALT_STATS) += sysctl_walt_stats.o
 obj-$(CONFIG_SCHED_WALT_MIDPOINT) += midpoint.o
