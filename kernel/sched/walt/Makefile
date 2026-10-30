@@ -9,4 +9,4 @@ obj-$(CONFIG_SCHED_WALT_DEBUG) += sched-walt-debug.o
 sched-walt-debug-$(CONFIG_SCHED_WALT_DEBUG) := walt_debug.o
 
 obj-$(CONFIG_SCHED_WALT_STATS) += sysctl_walt_stats.o
-obj-$(CONFIG_SCHED_WALT_MIDPOINT) += midpoint.o
+
