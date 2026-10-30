@@ -636,7 +636,7 @@ extern bool walt_is_idle_task(struct task_struct *p);
  */
 static inline unsigned long capacity_orig_of(int cpu)
 {
-	return cpu_rq(cpu)->cpu_capacity;
+	return cpu_rq(cpu)->cpu_capacity_orig;
 }
 
 static inline unsigned long capacity_curr_of(int cpu)
@@ -1214,11 +1214,6 @@ static inline void walt_irq_work_queue(struct irq_work *work)
 		irq_work_queue(work);
 	else
 		irq_work_queue_on(work, cpumask_any(cpu_online_mask));
-}
-
-//static inline struct task_group *css_tg(struct cgroup_subsys_state *css)
-{
-	return css ? container_of(css, struct task_group, css) : NULL;
 }
 
 /*
