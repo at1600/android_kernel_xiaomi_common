@@ -1287,6 +1287,7 @@ struct rq {
 	struct sched_domain __rcu	*sd;
 
 	unsigned long		cpu_capacity;
+	unsigned long           cpu_capacity_orig;
 
 	struct balance_callback *balance_callback;
 
