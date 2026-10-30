@@ -4,24 +4,15 @@
  */
 
 #include <trace/hooks/dtask.h>
-#include <linux/mutex.h>
+#include "../../locking/mutex.h"
 #include "walt.h"
-
-struct mutex_waiter {
-	struct list_head	list;
-	struct task_struct	*task;
-	struct ww_acquire_ctx	*ww_ctx;
-#ifdef CONFIG_DEBUG_MUTEXES
-	void			*magic;
-#endif
-};
 
 static void android_vh_alter_mutex_list_add(void *unused, struct mutex *lock,
 				struct mutex_waiter *waiter, struct list_head *list,
 				bool *already_on_list)
 {
 	struct walt_task_struct *wts_waiter =
-		(struct walt_task_struct *)android_task_vendor_data(current);
+		(struct walt_task_struct *)current->android_vendor_data1;
 	struct mutex_waiter *pos = NULL;
 	struct mutex_waiter *n = NULL;
 	struct list_head *head = list;
@@ -38,7 +29,7 @@ static void android_vh_alter_mutex_list_add(void *unused, struct mutex *lock,
 
 	list_for_each_entry_safe(pos, n, head, list) {
 		wts = (struct walt_task_struct *)
-			android_task_vendor_data((struct task_struct *)(pos->task));
+			((struct task_struct *)(pos->task)->android_vendor_data1);
 		if (!is_mvp(wts)) {
 			list_add(&waiter->list, pos->list.prev);
 			*already_on_list = true;
