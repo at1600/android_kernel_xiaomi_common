@@ -7,6 +7,15 @@
 #include <linux/mutex.h>
 #include "walt.h"
 
+struct mutex_waiter {
+	struct list_head	list;
+	struct task_struct	*task;
+	struct ww_acquire_ctx	*ww_ctx;
+#ifdef CONFIG_DEBUG_MUTEXES
+	void			*magic;
+#endif
+};
+
 static void android_vh_alter_mutex_list_add(void *unused, struct mutex *lock,
 				struct mutex_waiter *waiter, struct list_head *list,
 				bool *already_on_list)
