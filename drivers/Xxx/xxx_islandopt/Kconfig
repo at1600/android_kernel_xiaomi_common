@@ -1,5 +1,5 @@
 config XXX_ISLAND_OPT
     tristate "XXX_ISLAND_OPT to improve island experience "
-	default n
+	default y
     help
       Used to boost island.
