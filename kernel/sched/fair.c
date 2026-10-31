@@ -9237,7 +9237,13 @@ void fair_server_init(struct rq *rq)
 
 	init_dl_entity(dl_se);
 
-	dl_server_init(dl_se, rq, fair_server_pick_task);
+	static bool fair_server_has_tasks(struct sched_dl_entity *dl_se)
+{
+	struct cfs_rq *cfs_rq = container_of(dl_se, struct cfs_rq, dl_se);
+	return cfs_rq->nr_running > 0;
+}
+
+dl_server_init(dl_se, rq, fair_server_has_tasks, fair_server_pick_task);
 }
 
 /*

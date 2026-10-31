@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2012, 2015-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 /*
@@ -18,9 +17,7 @@
 
 static DEFINE_PER_CPU(u64, nr_prod_sum);
 static DEFINE_PER_CPU(u64, last_time);
-static DEFINE_PER_CPU(int, last_time_cpu);
 static DEFINE_PER_CPU(u64, nr_big_prod_sum);
-static DEFINE_PER_CPU(u64, nr_giant_prod_sum);
 static DEFINE_PER_CPU(u64, nr);
 static DEFINE_PER_CPU(u64, nr_max);
 
@@ -33,15 +30,12 @@ static DEFINE_PER_CPU(u64, hyst_time);
 static DEFINE_PER_CPU(u64, coloc_hyst_busy);
 static DEFINE_PER_CPU(u64, coloc_hyst_time);
 static DEFINE_PER_CPU(u64, util_hyst_time);
-static DEFINE_PER_CPU(u64, smart_freq_legacy_reason_hyst_ns);
 
 #define NR_THRESHOLD_PCT		40
 #define MAX_RTGB_TIME (sysctl_sched_coloc_busy_hyst_max_ms * NSEC_PER_MSEC)
 
 struct sched_avg_stats stats[WALT_NR_CPUS];
 unsigned int cstats_util_pct[MAX_CLUSTERS];
-
-u8 smart_freq_legacy_reason_hyst_ms[LEGACY_SMART_FREQ][WALT_NR_CPUS];
 
 /**
  * sched_get_cluster_util_pct
@@ -62,7 +56,6 @@ unsigned int sched_get_cluster_util_pct(struct walt_sched_cluster *cluster)
 	return cluster_util_pct;
 }
 
-u64 trailblazer_boost_state_ns;
 /**
  * sched_get_nr_running_avg
  * @return: Average nr_running, iowait and nr_big_tasks value since last poll.
@@ -80,14 +73,9 @@ struct sched_avg_stats *sched_get_nr_running_avg(void)
 	int cpu;
 	u64 curr_time = sched_clock();
 	u64 period = curr_time - last_get_time;
-	u64 tmp_nr, tmp_misfit, tmp_giant;
+	u64 tmp_nr, tmp_misfit;
 	bool any_hyst_time = false;
 	struct walt_sched_cluster *cluster;
-	bool trailblazer_boost_cpu = false;
-	bool large_cpu_cap_low = is_large_cpu_cap_low();
-
-	if (unlikely(walt_disabled))
-		return NULL;
 
 	if (!period)
 		goto done;
@@ -97,32 +85,19 @@ struct sched_avg_stats *sched_get_nr_running_avg(void)
 		unsigned long flags;
 		u64 diff;
 
-		trailblazer_boost_cpu |= (walt_trailblazer_tasks(cpu) &&
-				cpumask_test_cpu(cpu, &cpu_array[0][num_sched_clusters-1]) &&
-				per_cpu(ipc_cnt, cpu) >= TRAILBLAZER_BOOST_THRESH_IPC &&
-				!large_cpu_cap_low);
-
 		spin_lock_irqsave(&per_cpu(nr_lock, cpu), flags);
 		curr_time = sched_clock();
 		diff = curr_time - per_cpu(last_time, cpu);
-		if ((s64)diff < 0) {
-			printk_deferred("WALT-BUG CPU%d; curr_time=%llu(0x%llx) is lesser than per_cpu_last_time=%llu(0x%llx) last_time_cpu=%d",
-				cpu, curr_time, curr_time, per_cpu(last_time, cpu),
-				per_cpu(last_time, cpu), per_cpu(last_time_cpu, cpu));
-			WALT_PANIC(1);
-		}
+		BUG_ON((s64)diff < 0);
 
 		tmp_nr = per_cpu(nr_prod_sum, cpu);
 		tmp_nr += per_cpu(nr, cpu) * diff;
 		tmp_nr = div64_u64((tmp_nr * 100), period);
 
 		tmp_misfit = per_cpu(nr_big_prod_sum, cpu);
-		tmp_misfit += walt_big_tasks(cpu) * diff;
+		tmp_misfit += walt_big_64bit_tasks(cpu) * diff;
 		tmp_misfit = div64_u64((tmp_misfit * 100), period);
 
-		tmp_giant = per_cpu(nr_giant_prod_sum, cpu);
-		tmp_giant += walt_giant_tasks(cpu) * diff;
-		tmp_giant = div64_u64((tmp_giant * 100), period);
 		/*
 		 * NR_THRESHOLD_PCT is to make sure that the task ran
 		 * at least 85% in the last window to compensate any
@@ -132,29 +107,21 @@ struct sched_avg_stats *sched_get_nr_running_avg(void)
 								100);
 		stats[cpu].nr_misfit = (int)div64_u64((tmp_misfit +
 						NR_THRESHOLD_PCT), 100);
-		stats[cpu].nr_giant = (int)div64_u64((tmp_giant +
-						NR_THRESHOLD_PCT), 100);
-
 		stats[cpu].nr_max = per_cpu(nr_max, cpu);
 		stats[cpu].nr_scaled = tmp_nr;
 
 		trace_sched_get_nr_running_avg(cpu, stats[cpu].nr,
 				stats[cpu].nr_misfit, stats[cpu].nr_max,
-				stats[cpu].nr_scaled, stats[cpu].nr_giant,
-				trailblazer_boost_cpu);
+				stats[cpu].nr_scaled);
 
 		per_cpu(last_time, cpu) = curr_time;
-		per_cpu(last_time_cpu, cpu) = raw_smp_processor_id();
 		per_cpu(nr_prod_sum, cpu) = 0;
 		per_cpu(nr_big_prod_sum, cpu) = 0;
-		per_cpu(nr_giant_prod_sum, cpu) = 0;
 		per_cpu(nr_max, cpu) = per_cpu(nr, cpu);
 
 		spin_unlock_irqrestore(&per_cpu(nr_lock, cpu), flags);
 	}
 
-	if (trailblazer_boost_cpu)
-		trailblazer_boost_state_ns = curr_time;
 	/* collect cluster load stats */
 	for_each_sched_cluster(cluster) {
 		unsigned int num_cpus = cpumask_weight(&cluster->cpus);
@@ -163,7 +130,7 @@ struct sched_avg_stats *sched_get_nr_running_avg(void)
 		/* load is already scaled, see freq_policy_load/prev_runnable_sum */
 		for_each_cpu(cpu, &cluster->cpus) {
 			struct rq *rq = cpu_rq(cpu);
-			struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
+			struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
 
 			/* compute the % this cpu's utilization of the cpu capacity,
 			 * and sum it across all cpus
@@ -190,7 +157,7 @@ struct sched_avg_stats *sched_get_nr_running_avg(void)
 done:
 	return &stats[0];
 }
-EXPORT_SYMBOL_GPL(sched_get_nr_running_avg);
+EXPORT_SYMBOL(sched_get_nr_running_avg);
 
 void sched_update_hyst_times(void)
 {
@@ -232,13 +199,8 @@ static inline void update_busy_hyst_end_time(int cpu, int enq,
 	bool hyst_trigger, coloc_trigger;
 	bool dequeue = (enq < 0);
 
-	if (is_max_possible_cluster_cpu(cpu) && is_obet
-			&& (cpumask_weight(&cpu_array[0][num_sched_clusters - 1]) > 1
-			|| !pipeline_in_progress()))
-		return;
-
 	if (!per_cpu(hyst_time, cpu) && !per_cpu(coloc_hyst_time, cpu) &&
-	    !per_cpu(util_hyst_time, cpu) && !per_cpu(smart_freq_legacy_reason_hyst_ns, cpu))
+	    !per_cpu(util_hyst_time, cpu))
 		return;
 
 	if (prev_nr_run >= BUSY_NR_RUN && per_cpu(nr, cpu) < BUSY_NR_RUN)
@@ -271,7 +233,6 @@ static inline void update_busy_hyst_end_time(int cpu, int enq,
 	agg_hyst_time = max(max(hyst_trigger ? per_cpu(hyst_time, cpu) : 0,
 			    coloc_trigger ? per_cpu(coloc_hyst_time, cpu) : 0),
 			    util_load_trigger ?	per_cpu(util_hyst_time, cpu) : 0);
-	agg_hyst_time = max(agg_hyst_time, per_cpu(smart_freq_legacy_reason_hyst_ns, cpu));
 
 	if (agg_hyst_time) {
 		atomic64_set(&per_cpu(busy_hyst_end_time, cpu),
@@ -279,21 +240,19 @@ static inline void update_busy_hyst_end_time(int cpu, int enq,
 		trace_sched_busy_hyst_time(cpu, agg_hyst_time, prev_nr_run,
 					cpu_util(cpu), per_cpu(hyst_time, cpu),
 					per_cpu(coloc_hyst_time, cpu),
-					per_cpu(util_hyst_time, cpu),
-					per_cpu(smart_freq_legacy_reason_hyst_ns, cpu));
+					per_cpu(util_hyst_time, cpu));
 	}
 }
 
-int sched_busy_hyst_handler(const struct ctl_table *table, int write,
+int sched_busy_hyst_handler(struct ctl_table *table, int write,
 				void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
-	struct ctl_table local_table = *table;
 
-	if (local_table.maxlen > (sizeof(unsigned int) * num_possible_cpus()))
-		local_table.maxlen = sizeof(unsigned int) * num_possible_cpus();
+	if (table->maxlen > (sizeof(unsigned int) * num_possible_cpus()))
+		table->maxlen = sizeof(unsigned int) * num_possible_cpus();
 
-	ret = proc_dointvec_minmax(&local_table, write, buffer, lenp, ppos);
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 
 	if (!ret && write)
 		sched_update_hyst_times();
@@ -319,15 +278,9 @@ void sched_update_nr_prod(int cpu, int enq)
 	nr_running = per_cpu(nr, cpu);
 	curr_time = sched_clock();
 	diff = curr_time - per_cpu(last_time, cpu);
-	if ((s64)diff < 0) {
-		printk_deferred("WALT-BUG CPU%d; curr_time=%llu(0x%llx) is lesser than per_cpu_last_time=%llu(0x%llx) last_time_cpu=%d",
-			cpu, curr_time, curr_time, per_cpu(last_time, cpu),
-			per_cpu(last_time, cpu), per_cpu(last_time_cpu, cpu));
-		WALT_PANIC(1);
-	}
+	BUG_ON((s64)diff < 0);
 	per_cpu(last_time, cpu) = curr_time;
-	per_cpu(last_time_cpu, cpu) = raw_smp_processor_id();
-	per_cpu(nr, cpu) = cpu_rq(cpu)->nr_running + enq;
+	per_cpu(nr, cpu) = cpu_rq(cpu)->nr_running;
 
 	if (per_cpu(nr, cpu) > per_cpu(nr_max, cpu))
 		per_cpu(nr_max, cpu) = per_cpu(nr, cpu);
@@ -338,7 +291,6 @@ void sched_update_nr_prod(int cpu, int enq)
 
 	per_cpu(nr_prod_sum, cpu) += nr_running * diff;
 	per_cpu(nr_big_prod_sum, cpu) += walt_big_tasks(cpu) * diff;
-	per_cpu(nr_giant_prod_sum, cpu) += (u64) walt_giant_tasks(cpu) * diff;
 	spin_unlock_irqrestore(&per_cpu(nr_lock, cpu), flags);
 }
 
@@ -351,7 +303,7 @@ unsigned int sched_get_cpu_util_pct(int cpu)
 	u64 util;
 	unsigned long capacity, flags;
 	unsigned int busy;
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu);
+	struct walt_rq *wrq = (struct walt_rq *) cpu_rq(cpu)->android_vendor_data1;
 
 	raw_spin_lock_irqsave(&rq->__lock, flags);
 
@@ -371,9 +323,6 @@ int sched_lpm_disallowed_time(int cpu, u64 *timeout)
 	u64 now = sched_clock();
 	u64 bias_end_time = atomic64_read(&per_cpu(busy_hyst_end_time, cpu));
 
-	if (unlikely(walt_disabled))
-		return -EAGAIN;
-
 	if (unlikely(is_reserved(cpu))) {
 		*timeout = 10 * NSEC_PER_MSEC;
 		return 0; /* shallowest c-state */
@@ -386,21 +335,4 @@ int sched_lpm_disallowed_time(int cpu, u64 *timeout)
 
 	return INT_MAX; /* don't care */
 }
-EXPORT_SYMBOL_GPL(sched_lpm_disallowed_time);
-
-void update_smart_freq_legacy_reason_hyst_time(struct walt_sched_cluster *cluster)
-{
-	int cpu, i;
-	u8 max_hyst_ms;
-
-	for_each_cpu(cpu, &cluster->cpus) {
-		max_hyst_ms = 0;
-		for (i = 0; i < LEGACY_SMART_FREQ; i++) {
-			if (cluster->smart_freq_info->cluster_active_reason & BIT(i))
-				max_hyst_ms =
-					max(smart_freq_legacy_reason_hyst_ms[i][cpu],
-						max_hyst_ms);
-		}
-		per_cpu(smart_freq_legacy_reason_hyst_ns, cpu) = max_hyst_ms * NSEC_PER_MSEC;
-	}
-}
+EXPORT_SYMBOL(sched_lpm_disallowed_time);

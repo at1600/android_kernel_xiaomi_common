@@ -50,8 +50,7 @@ static void setup_prev_cnts(u32 cpu, u32 cnten_val)
 }
 
 void tracectr_notifier(void *ignore, bool preempt,
-			struct task_struct *prev, struct task_struct *next,
-			unsigned int prev_state)
+			struct task_struct *prev, struct task_struct *next)
 {
 	u32 cnten_val;
 	int current_pid;
@@ -105,15 +104,6 @@ static void unregister_sched_switch_ctrs(void)
 	cpuhp_remove_state_nocalls(USE_CPUHP_STATE);
 }
 
-const struct cpumask *sched_trace_rd_span(struct root_domain *rd)
-{
-#ifdef CONFIG_SMP
-	return rd ? rd->span : NULL;
-#else
-	return NULL;
-#endif
-}
-
 static void sched_overutilized(void *data, struct root_domain *rd,
 				 bool overutilized)
 {
@@ -137,18 +127,17 @@ static void walt_unregister_dynamic_tp_events(void)
 	unregister_sched_switch_ctrs();
 }
 
-int sched_dynamic_tp_handler(const struct ctl_table *table, int write,
+int sched_dynamic_tp_handler(struct ctl_table *table, int write,
 			void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	static DEFINE_MUTEX(mutex);
 	int ret = 0, *val = (unsigned int *)table->data;
 	unsigned int old_val;
-	struct ctl_table local_table = *table;
 
 	mutex_lock(&mutex);
 	old_val = sysctl_sched_dynamic_tp_enable;
 
-	ret = proc_dointvec_minmax(&local_table, write, buffer, lenp, ppos);
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 	if (ret || !write || (old_val == sysctl_sched_dynamic_tp_enable))
 		goto done;
 

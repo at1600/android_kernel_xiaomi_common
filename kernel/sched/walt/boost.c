@@ -21,60 +21,41 @@ static DEFINE_MUTEX(boost_mutex);
 
 void walt_init_tg(struct task_group *tg)
 {
-	struct walt_task_group *wtg = (struct walt_task_group *) tg->android_vendor_data1;
+	struct walt_task_group *wtg;
+
+	wtg = (struct walt_task_group *) tg->android_vendor_data1;
 
 	wtg->colocate = false;
 	wtg->sched_boost_enable[NO_BOOST] = false;
 	wtg->sched_boost_enable[FULL_THROTTLE_BOOST] = true;
 	wtg->sched_boost_enable[CONSERVATIVE_BOOST] = false;
 	wtg->sched_boost_enable[RESTRAINED_BOOST] = false;
-	wtg->sched_boost_enable[STORAGE_BOOST] = true;
-	wtg->sched_boost_enable[BALANCE_BOOST] = false;
-	wtg->group_type = ANDROID_CGROUP_OTHER;
 }
 
 void walt_init_topapp_tg(struct task_group *tg)
 {
-	struct walt_task_group *wtg = (struct walt_task_group *) tg->android_vendor_data1;
+	struct walt_task_group *wtg;
+
+	wtg = (struct walt_task_group *) tg->android_vendor_data1;
 
 	wtg->colocate = true;
 	wtg->sched_boost_enable[NO_BOOST] = false;
 	wtg->sched_boost_enable[FULL_THROTTLE_BOOST] = true;
-	wtg->sched_boost_enable[CONSERVATIVE_BOOST] =
-		soc_feat(SOC_ENABLE_CONSERVATIVE_BOOST_TOPAPP_BIT);
+	wtg->sched_boost_enable[CONSERVATIVE_BOOST] = true;
 	wtg->sched_boost_enable[RESTRAINED_BOOST] = false;
-	wtg->sched_boost_enable[STORAGE_BOOST] = true;
-	wtg->sched_boost_enable[BALANCE_BOOST] = true;
-	wtg->group_type = ANDROID_CGROUP_TOPAPP;
 }
 
 void walt_init_foreground_tg(struct task_group *tg)
 {
-	struct walt_task_group *wtg = (struct walt_task_group *) tg->android_vendor_data1;
+	struct walt_task_group *wtg;
+
+	wtg = (struct walt_task_group *) tg->android_vendor_data1;
 
 	wtg->colocate = false;
 	wtg->sched_boost_enable[NO_BOOST] = false;
 	wtg->sched_boost_enable[FULL_THROTTLE_BOOST] = true;
-	wtg->sched_boost_enable[CONSERVATIVE_BOOST] =
-		soc_feat(SOC_ENABLE_CONSERVATIVE_BOOST_FG_BIT);
+	wtg->sched_boost_enable[CONSERVATIVE_BOOST] = true;
 	wtg->sched_boost_enable[RESTRAINED_BOOST] = false;
-	wtg->sched_boost_enable[STORAGE_BOOST] = true;
-	wtg->sched_boost_enable[BALANCE_BOOST] = true;
-	wtg->group_type = ANDROID_CGROUP_FOREGROUND;
-}
-
-void walt_init_background_tg(struct task_group *tg)
-{
-	struct walt_task_group *wtg = (struct walt_task_group *) tg->android_vendor_data1;
-
-	wtg->colocate = false;
-	wtg->sched_boost_enable[NO_BOOST] = false;
-	wtg->sched_boost_enable[FULL_THROTTLE_BOOST] = true;
-	wtg->sched_boost_enable[CONSERVATIVE_BOOST] = false;
-	wtg->sched_boost_enable[RESTRAINED_BOOST] = false;
-	wtg->sched_boost_enable[STORAGE_BOOST] = true;
-	wtg->sched_boost_enable[BALANCE_BOOST] = false;
-	wtg->group_type = ANDROID_CGROUP_BACKGROUND;
 }
 
 /*
@@ -105,7 +86,7 @@ static void set_boost_policy(int type)
 
 static bool verify_boost_params(int type)
 {
-	return type >= BALANCE_BOOST_DISABLE && type <= BALANCE_BOOST;
+	return type >= RESTRAINED_BOOST_DISABLE && type <= RESTRAINED_BOOST;
 }
 
 static void sched_no_boost_nop(void)
@@ -142,26 +123,6 @@ static void sched_restrained_boost_exit(void)
 	walt_enable_frequency_aggregation(false);
 }
 
-static void sched_storage_boost_enter(void)
-{
-	core_ctl_set_boost(true);
-}
-
-static void sched_storage_boost_exit(void)
-{
-	core_ctl_set_boost(false);
-}
-
-static void sched_balance_boost_enter(void)
-{
-	core_ctl_set_boost(true);
-}
-
-static void sched_balance_boost_exit(void)
-{
-	core_ctl_set_boost(false);
-}
-
 struct sched_boost_data {
 	int	refcount;
 	void	(*enter)(void);
@@ -189,20 +150,10 @@ static struct sched_boost_data sched_boosts[] = {
 		.enter		= sched_restrained_boost_enter,
 		.exit		= sched_restrained_boost_exit,
 	},
-	[STORAGE_BOOST] = {
-		.refcount	= 0,
-		.enter		= sched_storage_boost_enter,
-		.exit		= sched_storage_boost_exit,
-	},
-	[BALANCE_BOOST] = {
-		.refcount	= 0,
-		.enter		= sched_balance_boost_enter,
-		.exit		= sched_balance_boost_exit,
-	},
 };
 
 #define SCHED_BOOST_START FULL_THROTTLE_BOOST
-#define SCHED_BOOST_END (BALANCE_BOOST + 1)
+#define SCHED_BOOST_END (RESTRAINED_BOOST + 1)
 
 static int sched_effective_boost(void)
 {
@@ -309,9 +260,6 @@ int sched_set_boost(int type)
 {
 	int ret = 0;
 
-	if (unlikely(walt_disabled))
-		return -EAGAIN;
-
 	mutex_lock(&boost_mutex);
 	if (verify_boost_params(type))
 		_sched_set_boost(type);
@@ -320,9 +268,8 @@ int sched_set_boost(int type)
 	mutex_unlock(&boost_mutex);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(sched_set_boost);
 
-int sched_boost_handler(const struct ctl_table *table, int write,
+int sched_boost_handler(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp,
 		loff_t *ppos)
 {

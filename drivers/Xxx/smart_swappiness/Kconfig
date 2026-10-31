@@ -1,6 +1,6 @@
 config XXX_SMART_SWAPPINESS
 	bool "XXX Kernel smart swappiness support"
-	default n
+	default y
 	help
 	  This option enables a swappiness controller for Android 5.15 GKI
 	  kernels. It monitors available memory once per second. When memory

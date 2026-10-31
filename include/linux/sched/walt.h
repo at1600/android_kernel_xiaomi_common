@@ -168,11 +168,15 @@ struct walt_task_struct {
 	u64				yield_ts;
 	u64				yield_total_sleep_usec;
 	s64				lst_start_ns;
+	s64                             lst_tgt_ns;
+        unsigned int                    lst_state_counter;
+        unsigned int                    pipeline_activity_cnt;
+        unsigned int                    lib_app_state;
 	s64				lst_cnt;
 	bool			lst;
 
 	s64				pipeline_cnt;
-	unsigned int			event_windows;
+	atomic_t			event_windows;
 	unsigned int			continous_active;
 // MIUI ADD: Game_MIGT
 	int                             mmlock_wakeup;

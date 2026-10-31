@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2021 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
@@ -11,24 +12,15 @@
 
 #ifdef CONFIG_HOTPLUG_CPU
 
-enum pause_type {
-	HALT,
-	PARTIAL_HALT,
-
-	MAX_PAUSE_TYPE
-};
-
 /* if a cpu is halting */
 struct cpumask __cpu_halt_mask;
-EXPORT_SYMBOL_GPL(__cpu_halt_mask);
-struct cpumask __cpu_partial_halt_mask;
-EXPORT_SYMBOL_GPL(__cpu_partial_halt_mask);
 
 /* spin lock to allow calling from non-preemptible context */
 static DEFINE_RAW_SPINLOCK(halt_lock);
 
 struct halt_cpu_state {
-	u8		client_vote_mask[MAX_PAUSE_TYPE];
+	u64		last_halt;
+	u8		reason;
 };
 
 static DEFINE_PER_CPU(struct halt_cpu_state, halt_state);
@@ -48,7 +40,7 @@ void
 detach_one_task_core(struct task_struct *p, struct rq *rq,
 		     struct list_head *tasks)
 {
-	walt_lockdep_assert_rq(rq, p);
+	lockdep_assert_held(&rq->__lock);
 
 	p->on_rq = TASK_ON_RQ_MIGRATING;
 	deactivate_task(rq, p, 0);
@@ -59,7 +51,7 @@ void attach_tasks_core(struct list_head *tasks, struct rq *rq)
 {
 	struct task_struct *p;
 
-	walt_lockdep_assert_rq(rq, NULL);
+	lockdep_assert_held(&rq->__lock);
 
 	while (!list_empty(tasks)) {
 		p = list_first_entry(tasks, struct task_struct, se.group_node);
@@ -121,10 +113,7 @@ static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf)
 		if (rq->nr_running == 1)
 			break;
 
-		next = pick_task(rq);
-
-		if (walt_is_idle_task(next))
-			break;
+		next = pick_migrate_task(rq);
 
 		/*
 		 * Argh ... no iterator for tasks, we need to remove the
@@ -148,8 +137,7 @@ static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf)
 		 */
 		rq_unlock(rq, rf);
 		raw_spin_lock(&next->pi_lock);
-		raw_spin_rq_lock(rq);
-		rq_repin_lock(rq, rf);
+		rq_relock(rq, rf);
 
 		/*
 		 * Since we're inside stop-machine, _nothing_ should have
@@ -172,8 +160,7 @@ static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf)
 				rq_unlock(rq, rf);
 				rq = dead_rq;
 				*rf = orf;
-				raw_spin_rq_lock(rq);
-				rq_repin_lock(rq, rf);
+				rq_relock(rq, rf);
 			}
 		} else {
 			detach_one_task_core(next, rq, &percpu_kthreads);
@@ -195,16 +182,10 @@ static int drain_rq_cpu_stop(void *data)
 {
 	struct rq *rq = this_rq();
 	struct rq_flags rf;
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
 
 	rq_lock_irqsave(rq, &rf);
-	/* rq lock is pinned */
-
-	/* migrate tasks assumes that the lock is pinned, and will unlock/repin */
 	migrate_tasks(rq, &rf);
-
-	/* __balance_callbacks can unlock and relock the rq lock. unpin */
-	rq_unpin_lock(rq, &rf);
 
 	/*
 	 * service any callbacks that were accumulated, prior to unlocking. such that
@@ -216,8 +197,7 @@ static int drain_rq_cpu_stop(void *data)
 	if (wrq->enqueue_counter)
 		WALT_BUG(WALT_BUG_WALT, NULL, "cpu: %d task was re-enqueued", cpu_of(rq));
 
-	/* lock is no longer pinned, raw unlock using same flags as locking */
-	raw_spin_rq_unlock_irqrestore(rq, rf.flags);
+	rq_unlock_irqrestore(rq, &rf);
 
 	return 0;
 }
@@ -232,6 +212,21 @@ static int cpu_drain_rq(unsigned int cpu)
 
 	/* this will schedule, must not be in atomic context */
 	return stop_one_cpu(cpu, drain_rq_cpu_stop, NULL);
+}
+
+/*
+ * returns true if last halt is within threshold
+ * note: do not take halt_lock, called from atomic context
+ */
+bool walt_halt_check_last(int cpu)
+{
+	u64 last_halt = per_cpu_ptr(&halt_state, cpu)->last_halt;
+
+	/* last_halt is valid, check it against sched_clock */
+	if (last_halt != 0 && sched_clock() - last_halt >  WALT_HALT_CHECK_THRESHOLD_NS)
+		return false;
+
+	return true;
 }
 
 struct drain_thread_data {
@@ -272,47 +267,24 @@ static int __ref try_drain_rqs(void *data)
 	return 0;
 }
 
-void restrict_cpus_and_freq(struct cpumask *cpus)
-{
-	struct cpumask restrict_cpus;
-	int cpu = 0;
-
-	cpumask_copy(&restrict_cpus, cpus);
-
-	if (cpumask_intersects(cpus, cpu_partial_halt_mask) &&
-			!cpumask_intersects(cpus, cpu_halt_mask) &&
-			is_state1()) {
-		for_each_cpu(cpu, cpus)
-			freq_cap[PARTIAL_HALT_CAP][cpu_cluster(cpu)->id] =
-				sysctl_max_freq_partial_halt;
-	} else {
-		for_each_cpu(cpu, cpus) {
-			cpumask_or(&restrict_cpus, &restrict_cpus, &(cpu_cluster(cpu)->cpus));
-			freq_cap[PARTIAL_HALT_CAP][cpu_cluster(cpu)->id] =
-				FREQ_QOS_MAX_DEFAULT_VALUE;
-		}
-	}
-
-	update_smart_freq_capacities();
-}
-
 struct task_struct *walt_drain_thread;
 
-static int halt_cpus(struct cpumask *cpus, enum pause_type type, enum pause_client client)
+/*
+ * 1) add the cpus to the halt mask
+ * 2) migrate tasks off the cpu
+ */
+static int halt_cpus(struct cpumask *cpus)
 {
 	int cpu;
 	int ret = 0;
-	u64 start_time = 0;
+	u64 start_time = sched_clock();
 	struct halt_cpu_state *halt_cpu_state;
 	unsigned long flags;
 
-	if (trace_halt_cpus_enabled())
-		start_time = sched_clock();
-
 	trace_halt_cpus_start(cpus, 1);
 
-	/* add the cpus to the halt mask */
 	for_each_cpu(cpu, cpus) {
+
 		if (cpu == cpumask_first(system_32bit_el0_cpumask())) {
 			ret = -EINVAL;
 			goto out;
@@ -320,34 +292,34 @@ static int halt_cpus(struct cpumask *cpus, enum pause_type type, enum pause_clie
 
 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
 
-		if (type == HALT)
-			cpumask_set_cpu(cpu, cpu_halt_mask);
-		else
-			cpumask_set_cpu(cpu, cpu_partial_halt_mask);
+		/* set the cpu as halted */
+		cpumask_set_cpu(cpu, cpu_halt_mask);
 
-		/* guarantee mask written at this time */
+		/* guarantee mask written before updating last_halt */
 		wmb();
+
+		halt_cpu_state->last_halt = start_time;
 	}
 
-	restrict_cpus_and_freq(cpus);
+	/* signal and wakeup the drain kthread */
+	raw_spin_lock_irqsave(&walt_drain_pending_lock, flags);
+	cpumask_or(&drain_data.cpus_to_drain, &drain_data.cpus_to_drain, cpus);
+	raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
 
-	/* migrate tasks off the cpu */
-	if (type == HALT) {
-		/* signal and wakeup the drain kthread */
-		raw_spin_lock_irqsave(&walt_drain_pending_lock, flags);
-		cpumask_or(&drain_data.cpus_to_drain, &drain_data.cpus_to_drain, cpus);
-		raw_spin_unlock_irqrestore(&walt_drain_pending_lock, flags);
-
+	if (!IS_ERR(walt_drain_thread))
 		wake_up_process(walt_drain_thread);
-	}
+
 out:
-	trace_halt_cpus(cpus, start_time, 1, ret, client);
+	trace_halt_cpus(cpus, start_time, 1, ret);
 
 	return ret;
 }
 
-/* start the cpus again, and kick them to balance */
-static int start_cpus(struct cpumask *cpus, enum pause_type type, enum pause_client client)
+/*
+ * 1) remove the cpus from the halt mask
+ *
+ */
+static int start_cpus(struct cpumask *cpus)
 {
 	u64 start_time = sched_clock();
 	struct halt_cpu_state *halt_cpu_state;
@@ -357,14 +329,12 @@ static int start_cpus(struct cpumask *cpus, enum pause_type type, enum pause_cli
 
 	for_each_cpu(cpu, cpus) {
 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-
-		/* guarantee the halt state is updated */
+		halt_cpu_state->last_halt = 0;
 		wmb();
 
-		if (type == HALT)
-			cpumask_clear_cpu(cpu, cpu_halt_mask);
-		else
-			cpumask_clear_cpu(cpu, cpu_partial_halt_mask);
+		/* wmb to guarantee zero'd last_halt before clearing from the mask */
+
+		cpumask_clear_cpu(cpu, cpu_halt_mask);
 
 		/* kick the cpu so it can pull tasks
 		 * after the mask has been cleared.
@@ -372,16 +342,13 @@ static int start_cpus(struct cpumask *cpus, enum pause_type type, enum pause_cli
 		walt_smp_call_newidle_balance(cpu);
 	}
 
-	restrict_cpus_and_freq(cpus);
-
-	trace_halt_cpus(cpus, start_time, 0, 0, client);
+	trace_halt_cpus(cpus, start_time, 0, 0);
 
 	return 0;
 }
 
-/* update client for cpus in yield/halt mask */
-static void update_clients(struct cpumask *cpus, bool halt, enum pause_client client,
-			   enum pause_type type)
+/* update reason for cpus in yield/halt mask */
+static void update_reasons(struct cpumask *cpus, bool halt, enum pause_reason reason)
 {
 	int cpu;
 	struct halt_cpu_state *halt_cpu_state;
@@ -389,27 +356,27 @@ static void update_clients(struct cpumask *cpus, bool halt, enum pause_client cl
 	for_each_cpu(cpu, cpus) {
 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
 		if (halt)
-			halt_cpu_state->client_vote_mask[type] |=  client;
+			halt_cpu_state->reason |=  reason;
 		else
-			halt_cpu_state->client_vote_mask[type] &= ~client;
+			halt_cpu_state->reason &= ~reason;
 	}
 }
 
 /* remove cpus that are already halted */
-static void update_halt_cpus(struct cpumask *cpus, enum pause_type type)
+static void update_halt_cpus(struct cpumask *cpus)
 {
 	int cpu;
 	struct halt_cpu_state *halt_cpu_state;
 
 	for_each_cpu(cpu, cpus) {
 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-		if (halt_cpu_state->client_vote_mask[type])
+		if (halt_cpu_state->reason)
 			cpumask_clear_cpu(cpu, cpus);
 	}
 }
 
 /* cpus will be modified */
-static int walt_halt_cpus(struct cpumask *cpus, enum pause_client client, enum pause_type type)
+int walt_halt_cpus(struct cpumask *cpus, enum pause_reason reason)
 {
 	int ret = 0;
 	cpumask_t requested_cpus;
@@ -420,44 +387,34 @@ static int walt_halt_cpus(struct cpumask *cpus, enum pause_client client, enum p
 	cpumask_copy(&requested_cpus, cpus);
 
 	/* remove cpus that are already halted */
-	update_halt_cpus(cpus, type);
+	update_halt_cpus(cpus);
 
 	if (cpumask_empty(cpus)) {
-		update_clients(&requested_cpus, true, client, type);
+		update_reasons(&requested_cpus, true, reason);
 		goto unlock;
 	}
 
-	ret = halt_cpus(cpus, type, client);
+	ret = halt_cpus(cpus);
 
 	if (ret < 0)
 		pr_debug("halt_cpus failure ret=%d cpus=%*pbl\n", ret,
 			 cpumask_pr_args(&requested_cpus));
 	else
-		update_clients(&requested_cpus, true, client, type);
+		update_reasons(&requested_cpus, true, reason);
 unlock:
 	raw_spin_unlock_irqrestore(&halt_lock, flags);
 
 	return ret;
 }
 
-int walt_pause_cpus(struct cpumask *cpus, enum pause_client client)
+int walt_pause_cpus(struct cpumask *cpus, enum pause_reason reason)
 {
-	if (walt_disabled)
-		return -EAGAIN;
-	return walt_halt_cpus(cpus, client, HALT);
+	return walt_halt_cpus(cpus, reason);
 }
-EXPORT_SYMBOL_GPL(walt_pause_cpus);
-
-int walt_partial_pause_cpus(struct cpumask *cpus, enum pause_client client)
-{
-	if (walt_disabled)
-		return -EAGAIN;
-	return walt_halt_cpus(cpus, client, PARTIAL_HALT);
-}
-EXPORT_SYMBOL_GPL(walt_partial_pause_cpus);
+EXPORT_SYMBOL(walt_pause_cpus);
 
 /* cpus will be modified */
-static int walt_start_cpus(struct cpumask *cpus, enum pause_client client, enum pause_type type)
+int walt_start_cpus(struct cpumask *cpus, enum pause_reason reason)
 {
 	int ret = 0;
 	cpumask_t requested_cpus;
@@ -465,18 +422,18 @@ static int walt_start_cpus(struct cpumask *cpus, enum pause_client client, enum 
 
 	raw_spin_lock_irqsave(&halt_lock, flags);
 	cpumask_copy(&requested_cpus, cpus);
-	update_clients(&requested_cpus, false, client, type);
+	update_reasons(&requested_cpus, false, reason);
 
 	/* remove cpus that should still be halted */
-	update_halt_cpus(cpus, type);
+	update_halt_cpus(cpus);
 
-	ret = start_cpus(cpus, type, client);
+	ret = start_cpus(cpus);
 
 	if (ret < 0) {
 		pr_debug("halt_cpus failure ret=%d cpus=%*pbl\n", ret,
 			 cpumask_pr_args(&requested_cpus));
 		/* restore/increment ref counts in case of error */
-		update_clients(&requested_cpus, true, client, type);
+		update_reasons(&requested_cpus, true, reason);
 	}
 
 	raw_spin_unlock_irqrestore(&halt_lock, flags);
@@ -484,78 +441,30 @@ static int walt_start_cpus(struct cpumask *cpus, enum pause_client client, enum 
 	return ret;
 }
 
-int walt_resume_cpus(struct cpumask *cpus, enum pause_client client)
+int walt_resume_cpus(struct cpumask *cpus, enum pause_reason reason)
 {
-	if (walt_disabled)
-		return -EAGAIN;
-	return walt_start_cpus(cpus, client, HALT);
+	return walt_start_cpus(cpus, reason);
 }
-EXPORT_SYMBOL_GPL(walt_resume_cpus);
-
-int walt_partial_resume_cpus(struct cpumask *cpus, enum pause_client client)
-{
-	if (walt_disabled)
-		return -EAGAIN;
-	return walt_start_cpus(cpus, client, PARTIAL_HALT);
-}
-EXPORT_SYMBOL_GPL(walt_partial_resume_cpus);
-
-/* return true if the requested client has fully halted one of the cpus */
-bool cpus_halted_by_client(struct cpumask *cpus, enum pause_client client)
-{
-	struct halt_cpu_state *halt_cpu_state;
-	int cpu;
-
-	for_each_cpu(cpu, cpus) {
-		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-		if ((bool)(halt_cpu_state->client_vote_mask[HALT] & client))
-			return true;
-	}
-
-	return false;
-}
+EXPORT_SYMBOL(walt_resume_cpus);
 
 static void android_rvh_get_nohz_timer_target(void *unused, int *cpu, bool *done)
 {
 	int i, default_cpu = -1;
 	struct sched_domain *sd;
-	cpumask_t active_unhalted;
+	cpumask_t unhalted;
 
 	*done = true;
-	cpumask_andnot(&active_unhalted, cpu_active_mask, cpu_halt_mask);
 
-	if (housekeeping_cpu(*cpu, HK_TYPE_TIMER) && !cpu_halted(*cpu)) {
+	if (housekeeping_cpu(*cpu, HK_FLAG_TIMER) && !cpu_halted(*cpu)) {
 		if (!available_idle_cpu(*cpu))
 			return;
 		default_cpu = *cpu;
 	}
 
-	/*
-	 * find first cpu halted by core control and try to avoid
-	 * affecting externally halted cpus.
-	 */
-	if (!cpumask_weight(&active_unhalted)) {
-		cpumask_t tmp_pause, tmp_part_pause, tmp_halt, *tmp;
-
-		cpumask_and(&tmp_part_pause, cpu_active_mask, &cpus_part_paused_by_us);
-		cpumask_and(&tmp_pause, cpu_active_mask, &cpus_paused_by_us);
-		cpumask_and(&tmp_halt, cpu_active_mask, cpu_halt_mask);
-		tmp = cpumask_weight(&tmp_part_pause) ? &tmp_part_pause :
-			cpumask_weight(&tmp_pause) ? &tmp_pause : &tmp_halt;
-
-		for_each_cpu(i, tmp) {
-			if ((*cpu == i) && cpumask_weight(tmp) > 1)
-				continue;
-
-			*cpu = i;
-			return;
-		}
-	}
-
 	rcu_read_lock();
 	for_each_domain(*cpu, sd) {
 		for_each_cpu_and(i, sched_domain_span(sd),
-			housekeeping_cpumask(HK_TYPE_TIMER)) {
+			housekeeping_cpumask(HK_FLAG_TIMER)) {
 			if (*cpu == i)
 				continue;
 
@@ -567,8 +476,9 @@ static void android_rvh_get_nohz_timer_target(void *unused, int *cpu, bool *done
 	}
 
 	if (default_cpu == -1) {
-		for_each_cpu_and(i, &active_unhalted,
-				 housekeeping_cpumask(HK_TYPE_TIMER)) {
+		cpumask_complement(&unhalted, cpu_halt_mask);
+		for_each_cpu_and(i, &unhalted,
+				 housekeeping_cpumask(HK_FLAG_TIMER)) {
 			if (*cpu == i)
 				continue;
 
@@ -578,8 +488,9 @@ static void android_rvh_get_nohz_timer_target(void *unused, int *cpu, bool *done
 			}
 		}
 
-		/* choose any active unhalted cpu */
-		default_cpu = cpumask_any(&active_unhalted);
+		/* no active, non-halted, not-idle, choose any */
+		default_cpu = cpumask_any(&unhalted);
+
 		if (unlikely(default_cpu >= nr_cpu_ids))
 			goto unlock;
 	}
@@ -589,46 +500,24 @@ unlock:
 	rcu_read_unlock();
 }
 
-/**
- * android_rvh_set_cpus_allowed_by_task: disallow cpus that are halted
- *
- * NOTES: may be called if migration is disabled for the task
- *        if per-cpu-kthread, must not deliberately return an invalid cpu
- *        if !per-cpu-kthread, may return an invalid cpu (reject dest_cpu)
- *        must not change cpu in in_exec 32bit task case
- */
 static void android_rvh_set_cpus_allowed_by_task(void *unused,
 						 const struct cpumask *cpu_valid_mask,
 						 const struct cpumask *new_mask,
 						 struct task_struct *p,
 						 unsigned int *dest_cpu)
 {
+	cpumask_t allowed_cpus;
+
 	if (unlikely(walt_disabled))
 		return;
 
-	/* allow kthreads to change affinity regardless of halt status of dest_cpu */
-	if (p->flags & PF_KTHREAD)
-		return;
-
 	if (cpu_halted(*dest_cpu) && !p->migration_disabled) {
-		cpumask_t allowed_cpus;
-
-		if (unlikely(is_compat_thread(task_thread_info(p)) && p->in_execve))
-			return;
-
 		/* remove halted cpus from the valid mask, and store locally */
 		cpumask_andnot(&allowed_cpus, cpu_valid_mask, cpu_halt_mask);
-		cpumask_and(&allowed_cpus, &allowed_cpus, new_mask);
-
-		/* do not modify dest_cpu if there are no cpus to choose from */
-		if (!cpumask_empty(&allowed_cpus))
-			*dest_cpu = cpumask_any_and_distribute(&allowed_cpus, new_mask);
+		*dest_cpu = cpumask_any_and_distribute(&allowed_cpus, new_mask);
 	}
 }
 
-/**
- * android_rvh_rto_next-cpu: disallow halted cpus for irq workfunctions
- */
 static void android_rvh_rto_next_cpu(void *unused, int rto_cpu, struct cpumask *rto_mask, int *cpu)
 {
 	cpumask_t allowed_cpus;
@@ -646,7 +535,10 @@ static void android_rvh_rto_next_cpu(void *unused, int rto_cpu, struct cpumask *
 /**
  * android_rvh_is_cpu_allowed: disallow cpus that are halted
  *
- * NOTE: this function will not be called if migration is disabled for the task.
+ * Caveat: For 32 bit tasks that are being directed to a halted cpu, allow the halted cpu
+ *         in a particular case (32 bit task, in execve, moving to a 32 bit cpu)
+ *         This is to handle the call to is_cpu_allowed() from __migrate_task, in the
+ *         event that a 32bit task is being execve'd.
  */
 static void android_rvh_is_cpu_allowed(void *unused, struct task_struct *p, int cpu, bool *allowed)
 {
@@ -654,41 +546,15 @@ static void android_rvh_is_cpu_allowed(void *unused, struct task_struct *p, int 
 		return;
 
 	if (cpumask_test_cpu(cpu, cpu_halt_mask)) {
-		cpumask_t cpus_allowed;
 
 		/* default reject for any halted cpu */
 		*allowed = false;
 
-		if (unlikely(is_compat_thread(task_thread_info(p)) && p->in_execve)) {
-			/* 32bit task in execve. allow this cpu. */
-			*allowed = true;
-			return;
-		}
-
-		/*
-		 * for cfs threads, active cpus in the affinity are allowed
-		 * but halted cpus are not allowed
-		 */
-		cpumask_and(&cpus_allowed, cpu_active_mask, p->cpus_ptr);
-		cpumask_andnot(&cpus_allowed, &cpus_allowed, cpu_halt_mask);
-
-		if (!(p->flags & PF_KTHREAD)) {
-			if (cpumask_empty(&cpus_allowed)) {
-				/*
-				 * All affined cpus are inactive or halted.
-				 * Allow this cpu for user threads
-				 */
-				*allowed = true;
-			}
-			return;
-		}
-
-		/* for kthreads, dying cpus are not allowed */
-		cpumask_andnot(&cpus_allowed, &cpus_allowed, cpu_dying_mask);
-		if (cpumask_empty(&cpus_allowed)) {
+		if (is_compat_thread(task_thread_info(p)) &&
+		    p->in_execve) {
 			/*
-			 * All affined cpus inactive or halted or dying.
-			 * Allow this cpu for kthreads
+			 * the task is 32 bit capable and
+			 * the context is execve. allow this cpu.
 			 */
 			*allowed = true;
 		}

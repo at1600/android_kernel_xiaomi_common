@@ -1,3 +1,3 @@
 config XXX_KERNEL_VERSION
     tristate "MorizukuiNeko version"
-    default n
+    default y

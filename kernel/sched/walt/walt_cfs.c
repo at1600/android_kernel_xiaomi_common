@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/seq_file.h>
@@ -10,30 +10,45 @@
 
 #include "walt.h"
 #include "trace.h"
-#include "drivers/android/binder_internal.h"
-#include "drivers/android/binder_trace.h"
+#include <../../../drivers/android/binder_internal.h>
+#include "../../../drivers/android/binder_trace.h"
 
-static void create_freq_to_cost_pd(struct em_perf_domain *pd)
+// MIUI ADD:
+typedef struct binder_transaction_extra {
+	int from_pid;
+	int from_tid;
+	u64 times_record;
+	u64 boost;
+}transaction_extra;
+// END
+
+static void create_util_to_cost_pd(struct em_perf_domain *pd)
 {
-	int cpu = cpumask_first(to_cpumask(pd->cpus));
-	struct walt_sched_cluster *cluster = cpu_cluster(cpu);
-	struct em_perf_table *em_table = rcu_dereference(pd->em_table);
-	struct em_perf_state *ps;
-	bool size_mismatch;
+	int util, cpu = cpumask_first(to_cpumask(pd->cpus));
+	unsigned long fmax;
+	unsigned long scale_cpu;
+	struct walt_rq *wrq = (struct walt_rq *) cpu_rq(cpu)->android_vendor_data1;
+	struct walt_sched_cluster *cluster = wrq->cluster;
 
-	if (pd->nr_perf_states > soc_cluster_freq_table_size[cluster->id])
-		size_mismatch = true;
+	fmax = (u64)pd->table[pd->nr_perf_states - 1].frequency;
+	scale_cpu = arch_scale_cpu_capacity(cpu);
 
-	for (int i = 0; i < pd->nr_perf_states; i++) {
-		ps = &em_table->state[i];
-		if (size_mismatch)
-			cluster->freq_to_cost[i] = ps->cost;
-		else
-			cluster->freq_to_cost[i] = soc_cluster_freq_table[cluster->id][i];
+	for (util = 0; util < 1024; util++) {
+		int j;
+
+		int f = (fmax * util) / scale_cpu;
+		struct em_perf_state *ps = &pd->table[0];
+
+		for (j = 0; j < pd->nr_perf_states; j++) {
+			ps = &pd->table[j];
+			if (ps->frequency >= f)
+				break;
+		}
+		cluster->util_to_cost[util] = ps->cost;
 	}
 }
 
-void create_freq_to_cost(void)
+void create_util_to_cost(void)
 {
 	struct perf_domain *pd;
 	struct root_domain *rd = cpu_rq(smp_processor_id())->rd;
@@ -41,30 +56,19 @@ void create_freq_to_cost(void)
 	rcu_read_lock();
 	pd = rcu_dereference(rd->pd);
 	for (; pd; pd = pd->next)
-		create_freq_to_cost_pd(pd->em_pd);
+		create_util_to_cost_pd(pd->em_pd);
 	rcu_read_unlock();
 }
 
 DECLARE_PER_CPU(unsigned long, gov_last_util);
 
 /* Migration margins */
-unsigned int sched_capacity_margin_up[ANDROID_CGROUPS][MAX_CLUSTERS] = {
-			/* ~5% margin */
-			{[0 ... MAX_CLUSTERS-1] = 1078},
-			{[0 ... MAX_CLUSTERS-1] = 1078},
-			{[0 ... MAX_CLUSTERS-1] = 1078},
-			{[0 ... MAX_CLUSTERS-1] = 1078}
-
+unsigned int sched_capacity_margin_up[WALT_NR_CPUS] = {
+			[0 ... WALT_NR_CPUS-1] = 1078 /* ~5% margin */
 };
-unsigned int sched_capacity_margin_down[ANDROID_CGROUPS][MAX_CLUSTERS] = {
-			/* ~15% margin */
-			{[0 ... MAX_CLUSTERS-1] = 1205},
-			{[0 ... MAX_CLUSTERS-1] = 1205},
-			{[0 ... MAX_CLUSTERS-1] = 1205},
-			{[0 ... MAX_CLUSTERS-1] = 1205}
+unsigned int sched_capacity_margin_down[WALT_NR_CPUS] = {
+			[0 ... WALT_NR_CPUS-1] = 1205 /* ~15% margin */
 };
-EXPORT_SYMBOL_GPL(sched_capacity_margin_up);
-EXPORT_SYMBOL_GPL(sched_capacity_margin_down);
 
 static inline bool
 bias_to_this_cpu(struct task_struct *p, int cpu, int start_cpu)
@@ -72,23 +76,26 @@ bias_to_this_cpu(struct task_struct *p, int cpu, int start_cpu)
 	bool base_test = cpumask_test_cpu(cpu, p->cpus_ptr) &&
 						cpu_active(cpu);
 
-	bool start_cap_test = !check_for_higher_capacity(start_cpu, cpu);
+	struct walt_rq *wrq = (struct walt_rq *) cpu_rq(cpu)->android_vendor_data1;
+	struct walt_rq *start_wrq = (struct walt_rq *) cpu_rq(start_cpu)->android_vendor_data1;
+	bool start_cap_test = (wrq->cluster->id >= start_wrq->cluster->id);
 
 	return base_test && start_cap_test;
 }
 
-static inline bool task_demand_fits(struct task_struct *p, int dst_cpu)
+static inline bool task_demand_fits(struct task_struct *p, int cpu)
 {
-	if (is_max_possible_cluster_cpu(dst_cpu))
+	unsigned long capacity = capacity_orig_of(cpu);
+
+	if (is_max_cluster_cpu(cpu))
 		return true;
 
 	if (!task_in_related_thread_group(p) && p->prio >= 124 &&
-			!is_min_possible_cluster_cpu(dst_cpu) &&
-			!is_max_possible_cluster_cpu(dst_cpu)) {
+			!is_min_cluster_cpu(cpu) && !is_max_cluster_cpu(cpu)) {
 		/* a non topapp low prio task fits on gold */
 		return true;
 	}
-	return task_fits_capacity(p, dst_cpu);
+	return task_fits_capacity(p, capacity, cpu);
 }
 
 struct find_best_target_env {
@@ -119,8 +126,7 @@ struct find_best_target_env {
 static unsigned long cpu_util_without(int cpu, struct task_struct *p)
 {
 	unsigned int util;
-	struct walt_rq *wrq;
-	u64 walt_cpu_util;
+
 	/*
 	 * WALT does not decay idle tasks in the same manner
 	 * as PELT, so it makes little sense to subtract task
@@ -134,9 +140,7 @@ static unsigned long cpu_util_without(int cpu, struct task_struct *p)
 	if (cpu != task_cpu(p) || !READ_ONCE(p->se.avg.last_update_time))
 		return cpu_util(cpu);
 
-	wrq = &per_cpu(walt_rq, cpu);
-	walt_cpu_util = wrq->walt_stats.cumulative_runnable_avg_scaled;
-	util = max_t(long, walt_cpu_util - task_util(p), 0);
+	util = max_t(long, cpu_util(cpu) - task_util(p), 0);
 
 	/*
 	 * Utilization (estimated) can exceed the CPU capacity, thus let's
@@ -148,11 +152,11 @@ static unsigned long cpu_util_without(int cpu, struct task_struct *p)
 
 static inline bool walt_task_skip_min_cpu(struct task_struct *p)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 
 	return (sched_boost_type != CONSERVATIVE_BOOST) &&
 		walt_get_rtg_status(p) && (wts->unfilter ||
-		(pipeline_in_progress() && walt_pipeline_low_latency_task(p)));
+		walt_pipeline_low_latency_task(p));
 }
 
 static inline bool walt_is_many_wakeup(int sibling_count_hint)
@@ -172,6 +176,8 @@ static void walt_get_indicies(struct task_struct *p, int *order_index,
 		int *end_index, int per_task_boost, bool is_uclamp_boosted,
 		bool *energy_eval_needed)
 {
+	int i = 0;
+
 	*order_index = 0;
 	*end_index = 0;
 
@@ -187,14 +193,9 @@ static void walt_get_indicies(struct task_struct *p, int *order_index,
 	if (is_full_throttle_boost()) {
 		*energy_eval_needed = false;
 		*order_index = num_sched_clusters - 1;
-		*end_index = num_sched_clusters - 2;
-		if (soc_feat(SOC_ENABLE_FT_BOOST_TO_ALL))
+		if ((*order_index > 1) && task_demand_fits(p,
+			cpumask_first(&cpu_array[*order_index][1])))
 			*end_index = 1;
-
-		for (; *end_index >= 0; (*end_index)--)
-			if (task_demand_fits(p,
-					cpumask_first(&cpu_array[*order_index][*end_index])))
-				break;
 		return;
 	}
 
@@ -203,19 +204,18 @@ static void walt_get_indicies(struct task_struct *p, int *order_index,
 		walt_task_skip_min_cpu(p)) {
 		*energy_eval_needed = false;
 		*order_index = 1;
-		if (soc_feat(SOC_ENABLE_BOOST_TO_NEXT_CLUSTER_BIT))
-			*end_index = 1;
-
 		if (sysctl_sched_asymcap_boost) {
-			(*end_index)++;
+			*end_index = 1;
 			return;
 		}
 	}
 
-	for (; *order_index < num_sched_clusters - 1; (*order_index)++) {
-		if (task_demand_fits(p, cpumask_first(&cpu_array[*order_index][0])))
+	for (i = *order_index ; i < num_sched_clusters - 1; i++) {
+		if (task_demand_fits(p, cpumask_first(&cpu_array[i][0])))
 			break;
 	}
+
+	*order_index = i;
 
 	if (*order_index == 0 &&
 			(task_util(p) >= MIN_UTIL_FOR_ENERGY_EVAL) &&
@@ -230,14 +230,11 @@ static void walt_get_indicies(struct task_struct *p, int *order_index,
 		*energy_eval_needed = false;
 }
 
-
 enum fastpaths {
 	NONE = 0,
 	SYNC_WAKEUP,
 	PREV_CPU_FASTPATH,
 	CLUSTER_PACKING_FASTPATH,
-	PIPELINE_FASTPATH,
-	YIELD_FASTPATH,
 };
 
 static inline bool is_complex_sibling_idle(int cpu)
@@ -247,77 +244,11 @@ static inline bool is_complex_sibling_idle(int cpu)
 	return false;
 }
 
-static inline bool walt_should_reject_fbt_cpu(struct walt_rq *wrq, struct task_struct *p,
-						int cpu, int order_index,
-						struct find_best_target_env *fbt_env)
-{
-	if (!cpu_active(cpu))
-		return true;
-
-	if (cpu_halted(cpu))
-		return true;
-
-	if (order_index != 0 && cpu_partial_halted(cpu))
-		return true;
-
-	/*
-	 * This CPU is the target of an active migration that's
-	 * yet to complete. Avoid placing another task on it.
-	 */
-	if (is_reserved(cpu))
-		return true;
-
-	if (sched_cpu_high_irqload(cpu))
-		return true;
-
-	if (fbt_env->skip_cpu == cpu)
-		return true;
-
-	if (wrq->num_mvp_tasks > 0 && per_task_boost(p) != TASK_BOOST_STRICT_MAX)
-		return true;
-
-	return false;
-}
-
-bool select_prev_cpu_fastpath(int prev_cpu, int start_cpu, int order_index,
-		struct task_struct *p)
-{
-	struct walt_rq *prev_wrq = &per_cpu(walt_rq, prev_cpu);
-	struct walt_rq *start_wrq = &per_cpu(walt_rq, start_cpu);
-	bool valid_part_haltable_prev_cpu = false, valid_prev_cpu = false;
-
-	if (!cpu_active(prev_cpu))
-		return false;
-
-	if (!available_idle_cpu(prev_cpu))
-		return false;
-
-	if (!cpumask_test_cpu(prev_cpu, p->cpus_ptr))
-		return false;
-
-	if (cpu_halted(prev_cpu))
-		return false;
-
-	if (is_reserved(prev_cpu))
-		return false;
-
-	valid_part_haltable_prev_cpu = cpumask_test_cpu(prev_cpu, &part_haltable_cpus) &&
-					((order_index == 0 && cpu_partial_halted(prev_cpu)) ||
-					 (order_index == 1 && !cpu_partial_halted(prev_cpu)));
-	valid_prev_cpu = (prev_wrq->cluster->id == start_wrq->cluster->id);
-
-	if (!(valid_part_haltable_prev_cpu || valid_prev_cpu))
-		return false;
-
-	return true;
-}
-
 #define DIRE_STRAITS_PREV_NR_LIMIT 10
 static void walt_find_best_target(struct sched_domain *sd,
 					cpumask_t *candidates,
 					struct task_struct *p,
-					struct find_best_target_env *fbt_env,
-					bool *force_energy_eval)
+					struct find_best_target_env *fbt_env)
 {
 	unsigned long min_task_util = uclamp_task_util(p);
 	long target_max_spare_cap = 0;
@@ -335,14 +266,14 @@ static void walt_find_best_target(struct sched_domain *sd,
 	unsigned int target_nr_rtg_high_prio = UINT_MAX;
 	bool rtg_high_prio_task = task_rtg_high_prio(p);
 	cpumask_t visit_cpus;
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
-	int packing_cpu, cpu;
-	unsigned int search_sibling_cluster = 0;
-
-	bool visited_clusters[MAX_CLUSTERS] = {[0 ... (MAX_CLUSTERS-1)] = false};
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
+	int packing_cpu;
+	struct walt_rq *prev_wrq = (struct walt_rq *) cpu_rq(prev_cpu)->android_vendor_data1;
+	struct walt_rq *start_wrq;
 
 	/* Find start CPU based on boost value */
 	start_cpu = fbt_env->start_cpu;
+	start_wrq = (struct walt_rq *) cpu_rq(start_cpu)->android_vendor_data1;
 
 	/*
 	 * For higher capacity worth I/O tasks, stop the search
@@ -360,63 +291,69 @@ static void walt_find_best_target(struct sched_domain *sd,
 
 	/* fast path for packing_cpu */
 	packing_cpu = walt_find_and_choose_cluster_packing_cpu(start_cpu, p);
-
 	if (packing_cpu >= 0) {
 		fbt_env->fastpath = CLUSTER_PACKING_FASTPATH;
 		cpumask_set_cpu(packing_cpu, candidates);
-		visited_clusters[cpu_cluster(packing_cpu)->id] = true;
-		goto out;
+			goto out;
 	}
 
 	/* fast path for prev_cpu */
-	if (select_prev_cpu_fastpath(prev_cpu, start_cpu, order_index, p)) {
+	if (((prev_wrq->cluster->id == start_wrq->cluster->id) ||
+				asym_cap_siblings(prev_cpu, start_cpu)) &&
+				cpu_active(prev_cpu) &&
+				available_idle_cpu(prev_cpu) &&
+				cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+				!cpu_halted(prev_cpu)) {
+
 		fbt_env->fastpath = PREV_CPU_FASTPATH;
 		cpumask_set_cpu(prev_cpu, candidates);
-		visited_clusters[cpu_cluster(prev_cpu)->id] = true;
 		goto out;
 	}
 
-/* retry for sibling cluster */
-retry:
 	for (cluster = 0; cluster < num_sched_clusters; cluster++) {
 		int best_idle_cpu_cluster = -1;
 		int target_cpu_cluster = -1;
 		int this_complex_idle = 0;
 		int best_complex_idle = 0;
-		int cluster_id;
 
 		target_max_spare_cap = 0;
 		min_exit_latency = INT_MAX;
 		best_idle_cuml_util = ULONG_MAX;
 
-		if (search_sibling_cluster) {
-			if (!(search_sibling_cluster & BIT(cluster)))
-				continue;
-			cluster_id = cluster;
-			cpumask_and(&visit_cpus, p->cpus_ptr, &sched_cluster[cluster]->cpus);
-		} else {
-			cpumask_and(&visit_cpus, p->cpus_ptr, &cpu_array[order_index][cluster]);
-			cluster_id = cpu_cluster(
-					cpumask_first(&cpu_array[order_index][cluster]))->id;
-		}
-
-		if (visited_clusters[cluster_id])
-			continue;
-
-		visited_clusters[cluster_id] = true;
-
+		cpumask_and(&visit_cpus, p->cpus_ptr,
+				&cpu_array[order_index][cluster]);
 		for_each_cpu(i, &visit_cpus) {
 			unsigned long capacity_orig = capacity_orig_of(i);
 			unsigned long wake_cpu_util, new_cpu_util, new_util_cuml;
 			long spare_cap;
 			unsigned int idle_exit_latency = UINT_MAX;
-			struct walt_rq *wrq = &per_cpu(walt_rq, i);
+			struct walt_rq *wrq = (struct walt_rq *) cpu_rq(i)->android_vendor_data1;
 
 			trace_sched_cpu_util(i, NULL);
 			/* record the prss as we visit cpus in a cluster */
 			fbt_env->prs[i] = wrq->prev_runnable_sum + wrq->grp_time.prev_runnable_sum;
 
-			if (walt_should_reject_fbt_cpu(wrq, p, i, order_index, fbt_env))
+			if (!cpu_active(i))
+				continue;
+
+			if (cpu_halted(i))
+				continue;
+
+			/*
+			 * This CPU is the target of an active migration that's
+			 * yet to complete. Avoid placing another task on it.
+			 */
+			if (is_reserved(i))
+				continue;
+
+			if (sched_cpu_high_irqload(i))
+				continue;
+
+			if (fbt_env->skip_cpu == i)
+				continue;
+
+			if (wrq->num_mvp_tasks > 0 &&
+				per_task_boost(p) != TASK_BOOST_STRICT_MAX)
 				continue;
 
 			/*
@@ -569,31 +506,18 @@ retry:
 	}
 
 out:
-	search_sibling_cluster = 0;
-	for_each_cpu(cpu, candidates) {
-		struct walt_sched_cluster *cluster = cpu_cluster(cpu);
-		int sibling = cluster->sibling_cluster;
-
-		if ((sibling >= 0) && !visited_clusters[sibling]) {
-			search_sibling_cluster |= BIT(sibling);
-		}
-	}
-	if (search_sibling_cluster) {
-		*force_energy_eval = true;
-		goto retry;
-	}
-
 	trace_sched_find_best_target(p, min_task_util, start_cpu, cpumask_bits(candidates)[0],
 			     most_spare_cap_cpu, order_index, end_index,
-			     fbt_env->skip_cpu, least_nr_cpu, cpu_rq_runnable_cnt);
+			     fbt_env->skip_cpu, task_on_rq_queued(p), least_nr_cpu,
+			     cpu_rq_runnable_cnt);
 }
 
 static inline unsigned long
 cpu_util_next_walt(int cpu, struct task_struct *p, int dst_cpu)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu);
+	struct walt_rq *wrq = (struct walt_rq *) cpu_rq(cpu)->android_vendor_data1;
 	unsigned long util = wrq->walt_stats.cumulative_runnable_avg_scaled;
-	bool queued = task_is_runnable(p);
+	bool queued = task_on_rq_queued(p);
 
 	/*
 	 * When task is queued,
@@ -634,7 +558,7 @@ static inline u64
 cpu_util_next_walt_prs(int cpu, struct task_struct *p, int dst_cpu, bool prev_dst_same_cluster,
 											u64 *prs)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 	long util = prs[cpu];
 
 	if (wts->prev_window) {
@@ -656,37 +580,12 @@ cpu_util_next_walt_prs(int cpu, struct task_struct *p, int dst_cpu, bool prev_ds
 
 static inline unsigned long get_util_to_cost(int cpu, unsigned long util)
 {
-	struct walt_sched_cluster *cluster;
-	struct em_perf_domain *pd;
-	struct em_perf_table *em_table;
-	struct em_perf_state *ps;
-	unsigned long cost;
-	unsigned long freq;
+	struct walt_rq *wrq = (struct walt_rq *) cpu_rq(cpu)->android_vendor_data1;
 
-	if (unlikely(walt_disabled))
-		return 0;
-
-	cluster = cpu_cluster(cpu);
-	pd = em_cpu_get(cpu);
-	if (!pd)
-		return 0;
-
-	em_table =  rcu_dereference(pd->em_table);
-	freq = mult_frac(cluster->max_possible_freq, util, 1024);
-	freq = freq + (freq >> 2);
-
-	for (int i = 0; i < pd->nr_perf_states; i++) {
-		ps = &em_table->state[i];
-		cost = cluster->freq_to_cost[i];
-		if (ps->frequency >= freq)
-			break;
-	}
-
-	if (cpumask_test_cpu(cpu, &cpu_array[0][num_sched_clusters - 1]) &&
-	    util > sysctl_em_inflate_thres)
-		return mult_frac(cost, sysctl_em_inflate_pct, 100);
+	if (cpu == 0 && util > sysctl_em_inflate_thres)
+		return mult_frac(wrq->cluster->util_to_cost[util], sysctl_em_inflate_pct, 100);
 	else
-		return cost;
+		return wrq->cluster->util_to_cost[util];
 }
 
 /**
@@ -703,18 +602,6 @@ static inline unsigned long get_util_to_cost(int cpu, unsigned long util)
  * Return: the sum of the energy consumed by the CPUs of the domain assuming
  * a capacity state satisfying the max utilization of the domain.
  */
-unsigned long walt_cpu_energy(int cpu,
-			      unsigned long max_util, unsigned long sum_util)
-{
-	unsigned long cost;
-
-	if (!sum_util)
-		return 0;
-
-	cost = get_util_to_cost(cpu, max_util);
-	return cost * sum_util;
-}
-
 static inline unsigned long walt_em_cpu_energy(struct em_perf_domain *pd,
 				unsigned long max_util, unsigned long sum_util,
 				struct compute_energy_output *output, unsigned int x)
@@ -733,17 +620,18 @@ static inline unsigned long walt_em_cpu_energy(struct em_perf_domain *pd,
 	cpu = cpumask_first(to_cpumask(pd->cpus));
 	scale_cpu = arch_scale_cpu_capacity(cpu);
 
+	max_util = max_util + (max_util >> 2); /* account  for TARGET_LOAD usually 80 */
 	max_util = max(max_util,
 			(arch_scale_freq_capacity(cpu) * scale_cpu) >>
 			SCHED_CAPACITY_SHIFT);
 
 	/*
-	 * The performance (capacity) of a CPU in the domain at the performance
-	 * state (ps) can be computed as:
+	 * The capacity of a CPU in the domain at the performance state (ps)
+	 * can be computed as:
 	 *
-	 *                     ps->freq * scale_cpu
-	 *   ps->performance = --------------------                  (1)
-	 *                         cpu_max_freq
+	 *             ps->freq * scale_cpu
+	 *   ps->cap = --------------------                          (1)
+	 *                 cpu_max_freq
 	 *
 	 * So, ignoring the costs of idle states (which are not available in
 	 * the EM), the energy consumed by this CPU at that performance state
@@ -751,10 +639,9 @@ static inline unsigned long walt_em_cpu_energy(struct em_perf_domain *pd,
 	 *
 	 *             ps->power * cpu_util
 	 *   cpu_nrg = --------------------                          (2)
-	 *               ps->performance
+	 *                   ps->cap
 	 *
-	 * since 'cpu_util / ps->performance' represents its percentage of busy
-	 * time.
+	 * since 'cpu_util / ps->cap' represents its percentage of busy time.
 	 *
 	 *   NOTE: Although the result of this computation actually is in
 	 *         units of power, it can be manipulated as an energy value
@@ -764,9 +651,9 @@ static inline unsigned long walt_em_cpu_energy(struct em_perf_domain *pd,
 	 * By injecting (1) in (2), 'cpu_nrg' can be re-expressed as a product
 	 * of two terms:
 	 *
-	 *             ps->power * cpu_max_freq
-	 *   cpu_nrg = ------------------------ * cpu_util           (3)
-	 *               ps->freq * scale_cpu
+	 *             ps->power * cpu_max_freq   cpu_util
+	 *   cpu_nrg = ------------------------ * ---------          (3)
+	 *                    ps->freq            scale_cpu
 	 *
 	 * The first term is static, and is stored in the em_perf_state struct
 	 * as 'ps->cost'.
@@ -776,7 +663,9 @@ static inline unsigned long walt_em_cpu_energy(struct em_perf_domain *pd,
 	 * total energy of the domain (which is the simple sum of the energy of
 	 * all of its CPUs) can be factorized as:
 	 *
-	 *   pd_nrg = ps->cost * \Sum cpu_util                       (4)
+	 *            ps->cost * \Sum cpu_util
+	 *   pd_nrg = ------------------------                       (4)
+	 *                  scale_cpu
 	 */
 	if (max_util >= 1024)
 		max_util = 1023;
@@ -788,7 +677,7 @@ static inline unsigned long walt_em_cpu_energy(struct em_perf_domain *pd,
 		output->max_util[x] = max_util;
 		output->sum_util[x] = sum_util;
 	}
-	return cost * sum_util;
+	return cost * sum_util / scale_cpu;
 }
 
 /*
@@ -856,9 +745,9 @@ walt_compute_energy(struct task_struct *p, int dst_cpu, struct perf_domain *pd,
 
 static inline int wake_to_idle(struct task_struct *p)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 	struct walt_task_struct *cur_wts =
-		(struct walt_task_struct *)android_task_vendor_data(current);
+		(struct walt_task_struct *) current->android_vendor_data1;
 
 	return (cur_wts->wake_up_idle || wts->wake_up_idle);
 }
@@ -868,10 +757,12 @@ static inline bool select_cpu_same_energy(int cpu, int best_cpu, int prev_cpu)
 {
 	bool new_cpu_is_idle = available_idle_cpu(cpu);
 	bool best_cpu_is_idle = available_idle_cpu(best_cpu);
+	struct walt_rq *wrq = (struct walt_rq *) cpu_rq(cpu)->android_vendor_data1;
+	struct walt_rq *best_wrq = (struct walt_rq *) cpu_rq(best_cpu)->android_vendor_data1;
 
-	if (check_for_higher_capacity(cpu, best_cpu))
+	if (best_wrq->cluster->id < wrq->cluster->id)
 		return false;
-	if (check_for_higher_capacity(best_cpu, cpu))
+	if (wrq->cluster->id < best_wrq->cluster->id)
 		return true;
 
 	if (best_cpu_is_idle && walt_get_idle_exit_latency(cpu_rq(best_cpu)) <= 1)
@@ -920,13 +811,12 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	int delta = 0;
 	int task_boost = per_task_boost(p);
 	bool uclamp_boost = walt_uclamp_boosted(p);
-	int start_cpu = 0, order_index, end_index;
+	int start_cpu, order_index, end_index;
 	int first_cpu;
 	bool energy_eval_needed = true;
 	struct compute_energy_output output;
-	struct walt_task_struct *wts;
-	int pipeline_cpu;
-	bool force_energy_eval = false;
+	struct walt_rq *prev_wrq = (struct walt_rq *) cpu_rq(prev_cpu)->android_vendor_data1;
+	struct walt_rq *start_wrq;
 
 	if (walt_is_many_wakeup(sibling_count_hint) && prev_cpu != cpu &&
 			cpumask_test_cpu(prev_cpu, p->cpus_ptr))
@@ -935,56 +825,10 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	if (unlikely(!cpu_array))
 		return prev_cpu;
 
-	/* Pre-select a set of candidate CPUs. */
-	candidates = this_cpu_ptr(&energy_cpus);
-	cpumask_clear(candidates);
-
-
-	wts = (struct walt_task_struct *)android_task_vendor_data(p);
-
-	pipeline_cpu = wts->pipeline_cpu;
-
-	if (pipeline_in_progress() &&
-		walt_pipeline_low_latency_task(p) &&
-		(pipeline_cpu != -1) &&
-		cpumask_test_cpu(pipeline_cpu, p->cpus_ptr) &&
-		cpu_active(pipeline_cpu) && !cpu_halted(pipeline_cpu)) {
-			/*
-			* A situation of target pipeline cpu already running a pipeline
-			* task can only happen because of pipeline cpu swapping(i.e 'p'
-			* is already a pipeline task running on pipeline cpu.
-			* 'find_heaviest_topapp' where a task is evaluated as pipeline
-			* (i.e 'p' might not be running on pipeline cpu) always ensures no
-			* two task gets same pipeline cpu and thus we never enter hit this
-			* condition.
-			*
-			* Thus if we are here that means prev_cpu of 'p' is definitely a
-			* pipeline cpu.
-			*/
-			if (walt_pipeline_low_latency_task(cpu_rq(pipeline_cpu)->curr))
-				pipeline_cpu = prev_cpu;
-
-		best_energy_cpu = pipeline_cpu;
-		fbt_env.fastpath = PIPELINE_FASTPATH;
-		goto out;
-	}
-
-	/*
-	 * If yield count is high then this must be an induced sleep wakeup
-	 * use prev_cpu(yielding cpu) as the target cpu.
-	 */
-	if ((wts->yield_state >= MAX_YIELD_CNT_PER_TASK_THR) &&
-	    (contiguous_yielding_windows >= MIN_CONTIGUOUS_YIELDING_WINDOW) &&
-	    (prev_cpu != -1) && cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-		cpu_active(prev_cpu) && !cpu_halted(prev_cpu)) {
-		best_energy_cpu = prev_cpu;
-		fbt_env.fastpath = YIELD_FASTPATH;
-		goto out;
-	}
-
 	walt_get_indicies(p, &order_index, &end_index, task_boost, uclamp_boost,
 								&energy_eval_needed);
 	start_cpu = cpumask_first(&cpu_array[order_index][0]);
+	start_wrq = (struct walt_rq *) cpu_rq(start_cpu)->android_vendor_data1;
 
 	is_rtg = task_in_related_thread_group(p);
 	curr_is_rtg = task_in_related_thread_group(cpu_rq(cpu)->curr);
@@ -992,8 +836,12 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	if (trace_sched_task_util_enabled())
 		start_t = sched_clock();
 
+	/* Pre-select a set of candidate CPUs. */
+	candidates = this_cpu_ptr(&energy_cpus);
+	cpumask_clear(candidates);
 
 	rcu_read_lock();
+	need_idle |= uclamp_latency_sensitive(p);
 
 	fbt_env.fastpath = 0;
 	fbt_env.need_idle = need_idle;
@@ -1002,15 +850,12 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 		sync = 0;
 
 	if (sysctl_sched_sync_hint_enable && sync
-	    && bias_to_this_cpu(p, cpu, start_cpu) && !cpu_halted(cpu)) {
-		if (cpu_cluster(cpu)->sibling_cluster == -1) {
-			best_energy_cpu = cpu;
-			fbt_env.fastpath = SYNC_WAKEUP;
-			goto unlock;
-		}
+			&& bias_to_this_cpu(p, cpu, start_cpu) && !cpu_halted(cpu)) {
+		best_energy_cpu = cpu;
+		fbt_env.fastpath = SYNC_WAKEUP;
+		goto unlock;
 	}
 
-	/* if symmetrical system, default to upstream behavior */
 	pd = rcu_dereference(rd->pd);
 	if (!pd)
 		goto fail;
@@ -1024,8 +869,7 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	fbt_env.skip_cpu = walt_is_many_wakeup(sibling_count_hint) ?
 			   cpu : -1;
 
-	walt_find_best_target(NULL, candidates, p, &fbt_env, &force_energy_eval);
-
+	walt_find_best_target(NULL, candidates, p, &fbt_env);
 
 	/* Bail out if no candidate was found. */
 	weight = cpumask_weight(candidates);
@@ -1034,7 +878,7 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 
 	first_cpu = cpumask_first(candidates);
 
-	if ((fbt_env.fastpath == CLUSTER_PACKING_FASTPATH) && !force_energy_eval) {
+	if (fbt_env.fastpath == CLUSTER_PACKING_FASTPATH) {
 		best_energy_cpu = first_cpu;
 		goto unlock;
 	}
@@ -1051,7 +895,7 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 		goto unlock;
 	}
 
-	if (!energy_eval_needed && !force_energy_eval) {
+	if (!energy_eval_needed) {
 		int max_spare_cpu = first_cpu;
 
 		for_each_cpu(cpu, candidates) {
@@ -1079,10 +923,6 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 		trace_sched_compute_energy(p, prev_cpu, prev_energy, 0, 0, 0, &output);
 	} else {
 		prev_energy = best_energy = ULONG_MAX;
-		if (weight == 1) {
-			best_energy_cpu = first_cpu;
-			goto unlock;
-		}
 	}
 
 	/* Select the best candidate energy-wise. */
@@ -1122,24 +962,24 @@ int walt_find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	    walt_get_idle_exit_latency(cpu_rq(best_energy_cpu)) <= 1) &&
 	    (prev_energy != ULONG_MAX) && (best_energy_cpu != prev_cpu) &&
 	    ((prev_energy - best_energy) <= prev_energy >> 5) &&
-	    !check_for_higher_capacity(prev_cpu, start_cpu))
+	    (prev_wrq->cluster->id <= start_wrq->cluster->id))
 		best_energy_cpu = prev_cpu;
 
 unlock:
 	rcu_read_unlock();
-out:
+
 	if (best_energy_cpu < 0 || best_energy_cpu >= WALT_NR_CPUS)
 		best_energy_cpu = prev_cpu;
 
 	trace_sched_task_util(p, cpumask_bits(candidates)[0], best_energy_cpu,
 			sync, fbt_env.need_idle, fbt_env.fastpath,
-			start_t, uclamp_boost, start_cpu, wts->yield_state & YIELD_CNT_MASK);
+			start_t, uclamp_boost, start_cpu);
 
 	return best_energy_cpu;
 
 fail:
 	rcu_read_unlock();
-	return -1;
+	return prev_cpu;
 }
 
 static void
@@ -1159,54 +999,137 @@ walt_select_task_rq_fair(void *unused, struct task_struct *p, int prev_cpu,
 	*target_cpu = walt_find_energy_efficient_cpu(p, prev_cpu, sync, sibling_count_hint);
 }
 
+static void walt_binder_low_latency_set(void *unused, struct task_struct *task,
+					bool sync, struct binder_proc *proc)
+{
+	struct walt_task_struct *wts = (struct walt_task_struct *) task->android_vendor_data1;
+
+	if (unlikely(walt_disabled))
+		return;
+	if (task && ((task_in_related_thread_group(current) &&
+			task->group_leader->prio < MAX_RT_PRIO) ||
+			(current->group_leader->prio < MAX_RT_PRIO &&
+			task_in_related_thread_group(task))))
+		wts->low_latency |= WALT_LOW_LATENCY_BINDER;
+	else
+		/*
+		 * Clear low_latency flag if criterion above is not met, this
+		 * will handle usecase where for a binder thread WALT_LOW_LATENCY_BINDER
+		 * is set by one task and before WALT clears this flag after timer expiry
+		 * some other task tries to use same binder thread.
+		 *
+		 * The only gets cleared when binder transaction is initiated
+		 * and the above condition to set flasg is nto satisfied.
+		 */
+		wts->low_latency &= ~WALT_LOW_LATENCY_BINDER;
+
+}
+
+
+// MIUI ADD:
+static void binder_transaction_init_hook(void *data, struct binder_transaction *t)
+{
+	transaction_extra *te = kzalloc(sizeof(*te), GFP_ATOMIC);
+	if (!te)
+		return;
+	te->times_record = trace_clock_local();
+	te->from_pid = current->tgid;
+	te->from_tid = current->pid;
+	t->android_vendor_data1 = (u64)te;
+}
+
+static void binder_txn_latency_free_hook(void *data,
+					struct binder_transaction *t,
+					int from_proc,
+					int from_thread,
+					int to_proc,
+					int to_thread)
+{
+	transaction_extra *te = (transaction_extra *)t->android_vendor_data1;
+	if (te)  {
+		kfree(te);
+		t->android_vendor_data1 = 0;
+	}
+}
+
+static void binder_print_transaction_info_hook(void *data,
+						struct seq_file *m,
+						struct binder_proc *proc,
+						const char *prefix,
+						struct binder_transaction *t)
+{
+	transaction_extra *te = NULL;
+	struct binder_proc *to_proc = NULL;
+	int from_pid = 0;
+	int from_tid = 0;
+	int to_pid = 0;
+	int to_tid = 0;
+	u64 now;
+	u64 duration = 0;
+
+	te = (transaction_extra *)t->android_vendor_data1;
+	if (!te)
+		return;
+	to_proc = t->to_proc;
+	from_pid = t->from ? (t->from->proc ? t->from->proc->pid : 0) : te->from_pid;
+	from_tid = t->from ? t->from->pid : te->from_tid;
+	to_pid = to_proc ? to_proc->pid : 0;
+	to_tid = t->to_thread ? t->to_thread->pid : 0;
+	now = trace_clock_local();
+	if (te->times_record > 0)
+		duration = now > te->times_record ? (now - te->times_record) : 0;
+	seq_printf(m,
+		"MIUI%s: from %5d:%5d to %5d:%5d context:%s code:%3d duration:%6lld.%02lld s\n",
+		prefix,
+		from_pid, from_tid,
+		to_pid, to_tid,
+		proc->context->name,
+		t->code,
+		duration / 1000000000,
+		duration % 1000000000 / 10000000
+	);
+}
+// END
+
 static void binder_set_priority_hook(void *data,
 				struct binder_transaction *bndrtrans, struct task_struct *task)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(task);
+	struct walt_task_struct *wts = (struct walt_task_struct *) task->android_vendor_data1;
 	struct walt_task_struct *current_wts =
-			(struct walt_task_struct *)android_task_vendor_data(current);
+			(struct walt_task_struct *) current->android_vendor_data1;
 
 	if (unlikely(walt_disabled))
 		return;
 
 	if (bndrtrans && bndrtrans->need_reply && current_wts->boost == TASK_BOOST_STRICT_MAX) {
-		bndrtrans->android_vendor_data1  = wts->boost;
+		// MIUI MOD:
+		//bndrtrans->android_vendor_data1  = wts->boost;
+		transaction_extra *te = (transaction_extra *)bndrtrans->android_vendor_data1;
+		if (!te)
+			return;
+		te->boost = wts->boost;
+		// END
 		wts->boost = TASK_BOOST_STRICT_MAX;
 	}
-
-	if (current == task)
-		return;
-
-	if (task && ((task_in_related_thread_group(current) &&
-			task->group_leader->prio < MAX_RT_PRIO) ||
-			(walt_get_mvp_task_prio(current) == WALT_LL_MVP) ||
-			(current->group_leader->prio < MAX_RT_PRIO &&
-			task_in_related_thread_group(task))))
-		wts->low_latency |= WALT_LOW_LATENCY_BINDER_BIT;
-	else
-		/*
-		 * Clear low_latency flag if criterion above is not met, this
-		 * will handle usecase where for a binder thread WALT_LOW_LATENCY_BINDER_BIT
-		 * is set by one task and before WALT clears this flag after timer expiry
-		 * some other task tries to use same binder thread.
-		 *
-		 * The only gets cleared when binder transaction is initiated
-		 * and the above condition to set flags is not satisfied.
-		 */
-		wts->low_latency &= ~WALT_LOW_LATENCY_BINDER_BIT;
-
 }
 
 static void binder_restore_priority_hook(void *data,
 				struct binder_transaction *bndrtrans, struct task_struct *task)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(task);
+	struct walt_task_struct *wts = (struct walt_task_struct *) task->android_vendor_data1;
 
 	if (unlikely(walt_disabled))
 		return;
 
-	if (bndrtrans && wts->boost == TASK_BOOST_STRICT_MAX)
-		wts->boost = bndrtrans->android_vendor_data1;
+	// MIUI MOD:
+	if (bndrtrans && wts->boost == TASK_BOOST_STRICT_MAX) {
+		//wts->boost = bndrtrans->android_vendor_data1;
+		transaction_extra *te = (transaction_extra *)bndrtrans->android_vendor_data1;
+		if (!te)
+			return;
+		wts->boost = te->boost;
+	}
+	// END
 }
 
 /*
@@ -1219,11 +1142,9 @@ static void binder_restore_priority_hook(void *data,
  */
 int walt_get_mvp_task_prio(struct task_struct *p)
 {
-	if (walt_pipeline_low_latency_task(p))
-		return WALT_PIPELINE_MVP;
-
-	if (walt_procfs_low_latency_task(p))
-		return WALT_LL_MVP;
+	if (walt_procfs_low_latency_task(p) ||
+			walt_pipeline_low_latency_task(p))
+		return WALT_LL_PIPE_MVP;
 
 	if (per_task_boost(p) == TASK_BOOST_STRICT_MAX)
 		return WALT_TASK_BOOST_MVP;
@@ -1239,14 +1160,11 @@ int walt_get_mvp_task_prio(struct task_struct *p)
 
 static inline unsigned int walt_cfs_mvp_task_limit(struct task_struct *p)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 
 	/* Binder MVP tasks are high prio but have only single slice */
 	if (wts->mvp_prio == WALT_BINDER_MVP)
 		return WALT_MVP_SLICE;
-
-	if (wts->mvp_prio == WALT_PIPELINE_MVP)
-		return 2 * WALT_MVP_LIMIT;
 
 	return WALT_MVP_LIMIT;
 }
@@ -1275,8 +1193,8 @@ static void walt_cfs_insert_mvp_task(struct walt_rq *wrq, struct walt_task_struc
 
 void walt_cfs_deactivate_mvp_task(struct rq *rq, struct task_struct *p)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 
 	list_del_init(&wts->mvp_list);
 	wts->mvp_prio = WALT_NOT_MVP;
@@ -1290,16 +1208,14 @@ void walt_cfs_deactivate_mvp_task(struct rq *rq, struct task_struct *p)
  * slice expired: MVP slice is expired and other MVP can preempt.
  * slice not expired: This MVP task can continue to run.
  */
-#define MAX_MVP_TIME_NS			500000000ULL
-#define MVP_THROTTLE_TIME_NS		100000000ULL
 static void walt_cfs_account_mvp_runtime(struct rq *rq, struct task_struct *curr)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(curr);
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *) curr->android_vendor_data1;
 	u64 slice;
 	unsigned int limit;
 
-	walt_lockdep_assert_rq(rq, NULL);
+	lockdep_assert_held(&rq->__lock);
 
 	/*
 	 * RQ clock update happens in tick path in the scheduler.
@@ -1311,23 +1227,6 @@ static void walt_cfs_account_mvp_runtime(struct rq *rq, struct task_struct *curr
 	if (!(rq->clock_update_flags & RQCF_UPDATED))
 		update_rq_clock(rq);
 
-	if (wrq->mvp_throttle_time) {
-		if ((rq->clock - wrq->mvp_throttle_time) > MVP_THROTTLE_TIME_NS) {
-			wrq->skip_mvp = false;
-			wrq->mvp_throttle_time = 0;
-		}
-	} else if (wrq->mvp_arrival_time) {
-		if ((rq->clock - wrq->mvp_arrival_time) > MAX_MVP_TIME_NS) {
-			wrq->skip_mvp = true;
-			wrq->mvp_arrival_time = 0;
-			wrq->mvp_throttle_time = rq->clock;
-		}
-	}
-
-	/*
-	 * continue accounting even in skip_mvp state if a MVP task is selected
-	 * by scheduler core to run on CPU.
-	 */
 	if (curr->se.sum_exec_runtime > wts->sum_exec_snapshot_for_total)
 		wts->total_exec = curr->se.sum_exec_runtime - wts->sum_exec_snapshot_for_total;
 	else
@@ -1339,7 +1238,7 @@ static void walt_cfs_account_mvp_runtime(struct rq *rq, struct task_struct *curr
 		slice = 0;
 
 	/* slice is not expired */
-	if (slice < ((wts->mvp_prio == WALT_PIPELINE_MVP) ? WALT_MVP_LIMIT : WALT_MVP_SLICE))
+	if (slice < WALT_MVP_SLICE)
 		return;
 
 	wts->sum_exec_snapshot_for_slice = curr->se.sum_exec_runtime;
@@ -1367,9 +1266,10 @@ static void walt_cfs_account_mvp_runtime(struct rq *rq, struct task_struct *curr
 
 void walt_cfs_enqueue_task(struct rq *rq, struct task_struct *p)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 	int mvp_prio = walt_get_mvp_task_prio(p);
+
 	if (mvp_prio == WALT_NOT_MVP)
 		return;
 
@@ -1382,7 +1282,7 @@ void walt_cfs_enqueue_task(struct rq *rq, struct task_struct *p)
 		return;
 
 	wts->mvp_prio = mvp_prio;
-	walt_cfs_insert_mvp_task(wrq, wts, task_on_cpu(rq, p));
+	walt_cfs_insert_mvp_task(wrq, wts, task_running(rq, p));
 
 	/*
 	 * We inserted the task at the appropriate position. Take the
@@ -1397,7 +1297,7 @@ void walt_cfs_enqueue_task(struct rq *rq, struct task_struct *p)
 
 void walt_cfs_dequeue_task(struct rq *rq, struct task_struct *p)
 {
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
 
 	if (!list_empty(&wts->mvp_list) && wts->mvp_list.next)
 		walt_cfs_deactivate_mvp_task(rq, p);
@@ -1414,10 +1314,8 @@ void walt_cfs_dequeue_task(struct rq *rq, struct task_struct *p)
 
 void walt_cfs_tick(struct rq *rq)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts =
-		(struct walt_task_struct *)android_task_vendor_data(rq->curr);
-	bool skip_mvp;
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
+	struct walt_task_struct *wts = (struct walt_task_struct *) rq->curr->android_vendor_data1;
 
 	if (unlikely(walt_disabled))
 		return;
@@ -1427,15 +1325,12 @@ void walt_cfs_tick(struct rq *rq)
 	if (list_empty(&wts->mvp_list) || (wts->mvp_list.next == NULL))
 		goto out;
 
-	/* Reschedule if RQ's skip_mvp state changes */
-	skip_mvp = wrq->skip_mvp;
 	walt_cfs_account_mvp_runtime(rq, rq->curr);
 	/*
 	 * If the current is not MVP means, we have to re-schedule to
 	 * see if we can run any other task including MVP tasks.
 	 */
-	if (((skip_mvp != wrq->skip_mvp) ||
-		(wrq->mvp_tasks.next != &wts->mvp_list)) && rq->cfs.h_nr_running > 1)
+	if ((wrq->mvp_tasks.next != &wts->mvp_list) && rq->cfs.h_nr_running > 1)
 		resched_curr(rq);
 
 out:
@@ -1446,16 +1341,16 @@ out:
  * When preempt = false and nopreempt = false, we leave the preemption
  * decision to CFS.
  */
-static void walt_cfs_check_preempt_wakeup_fair(void *unused, struct rq *rq, struct task_struct *p,
+static void walt_cfs_check_preempt_wakeup(void *unused, struct rq *rq, struct task_struct *p,
 					  bool *preempt, bool *nopreempt, int wake_flags,
-					  struct sched_entity *se, struct sched_entity *pse)
+					  struct sched_entity *se, struct sched_entity *pse,
+					  int next_buddy_marked, unsigned int granularity)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts_p = (struct walt_task_struct *)android_task_vendor_data(p);
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
+	struct walt_task_struct *wts_p = (struct walt_task_struct *) p->android_vendor_data1;
 	struct task_struct *c = rq->curr;
-	struct walt_task_struct *wts_c =
-		(struct walt_task_struct *)android_task_vendor_data(rq->curr);
-	bool resched = false, skip_mvp;
+	struct walt_task_struct *wts_c = (struct walt_task_struct *) rq->curr->android_vendor_data1;
+	bool resched = false;
 	bool p_is_mvp, curr_is_mvp;
 
 	if (unlikely(walt_disabled))
@@ -1469,7 +1364,7 @@ static void walt_cfs_check_preempt_wakeup_fair(void *unused, struct rq *rq, stru
 	 * is simple.
 	 */
 	if (!curr_is_mvp) {
-		if (p_is_mvp && !wrq->skip_mvp)
+		if (p_is_mvp)
 			goto preempt;
 		return; /* CFS decides preemption */
 	}
@@ -1478,10 +1373,8 @@ static void walt_cfs_check_preempt_wakeup_fair(void *unused, struct rq *rq, stru
 	 * current is MVP. update its runtime before deciding the
 	 * preemption.
 	 */
-	skip_mvp = wrq->skip_mvp;
 	walt_cfs_account_mvp_runtime(rq, c);
-	resched = (skip_mvp != wrq->skip_mvp) || (wrq->mvp_tasks.next != &wts_c->mvp_list) ||
-			(wts_p->mvp_prio > wts_c->mvp_prio);
+	resched = (wrq->mvp_tasks.next != &wts_c->mvp_list);
 
 	/*
 	 * current is no longer eligible to run. It must have been
@@ -1513,107 +1406,74 @@ preempt:
 
 extern void set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se);
 static void walt_cfs_replace_next_task_fair(void *unused, struct rq *rq, struct task_struct **p,
+					    struct sched_entity **se, bool *repick, bool simple,
 					    struct task_struct *prev)
 {
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
+	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
 	struct walt_task_struct *wts;
 	struct task_struct *mvp;
+	struct cfs_rq *cfs_rq;
 
 	if (unlikely(walt_disabled))
 		return;
 
 	if ((*p) && (*p) != prev && ((*p)->on_cpu == 1 || (*p)->on_rq == 0 ||
 				     (*p)->on_rq == TASK_ON_RQ_MIGRATING ||
-				     task_thread_info(*p)->cpu != cpu_of(rq)))
+				     (*p)->cpu != cpu_of(rq)))
 		WALT_BUG(WALT_BUG_UPSTREAM, *p,
 			 "picked %s(%d) on_cpu=%d on_rq=%d p->cpu=%d cpu_of(rq)=%d kthread=%d\n",
 			 (*p)->comm, (*p)->pid, (*p)->on_cpu,
-			 (*p)->on_rq, task_thread_info(*p)->cpu,
-			 cpu_of(rq), ((*p)->flags & PF_KTHREAD));
+			 (*p)->on_rq, (*p)->cpu, cpu_of(rq), ((*p)->flags & PF_KTHREAD));
 
-	/* RQ is in MVP throttled state*/
-	if (wrq->skip_mvp)
+	/* We don't have MVP tasks queued */
+	if (list_empty(&wrq->mvp_tasks))
 		return;
-
-	if (list_empty(&wrq->mvp_tasks)) {
-		wrq->mvp_arrival_time = 0;
-		return;
-	}
 
 	/* Return the first task from MVP queue */
 	wts = list_first_entry(&wrq->mvp_tasks, struct walt_task_struct, mvp_list);
 	mvp = wts_to_ts(wts);
 
 	*p = mvp;
+	*se = &mvp->se;
+	*repick = true;
 
-	/* Mark arrival of MVP task */
-	if (!wrq->mvp_arrival_time) {
-		update_rq_clock(rq);
-		wrq->mvp_arrival_time = rq->clock;
+	if (simple) {
+		for_each_sched_entity((*se)) {
+			/*
+			 * TODO If CFS_BANDWIDTH is enabled, we might pick
+			 * from a throttled cfs_rq
+			 */
+			cfs_rq = cfs_rq_of(*se);
+			set_next_entity(cfs_rq, *se);
+		}
 	}
 
 	if ((*p) && (*p) != prev && ((*p)->on_cpu == 1 || (*p)->on_rq == 0 ||
 				     (*p)->on_rq == TASK_ON_RQ_MIGRATING ||
-				     task_thread_info(*p)->cpu != cpu_of(rq)))
+				     (*p)->cpu != cpu_of(rq)))
 		WALT_BUG(WALT_BUG_UPSTREAM, *p,
 			 "picked %s(%d) on_cpu=%d on_rq=%d p->cpu=%d cpu_of(rq)=%d kthread=%d\n",
 			 (*p)->comm, (*p)->pid, (*p)->on_cpu,
-			 (*p)->on_rq, task_thread_info(*p)->cpu,
-			 cpu_of(rq), ((*p)->flags & PF_KTHREAD));
+			 (*p)->on_rq, (*p)->cpu, cpu_of(rq), ((*p)->flags & PF_KTHREAD));
 
 	trace_walt_cfs_mvp_pick_next(mvp, wts, walt_cfs_mvp_task_limit(mvp));
-}
-
-void inc_rq_walt_stats(struct rq *rq, struct task_struct *p)
-{
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
-
-	if (wts->misfit)
-		wrq->walt_stats.nr_big_tasks++;
-
-	wts->rtg_high_prio = task_rtg_high_prio(p);
-	if (wts->rtg_high_prio)
-		wrq->walt_stats.nr_rtg_high_prio_tasks++;
-
-	if (walt_flag_test(p, WALT_TRAILBLAZER_BIT))
-		wrq->walt_stats.nr_trailblazer_tasks++;
-
-	if (walt_flag_test(p, WALT_GIANT_BIT))
-		wrq->walt_stats.nr_giant_tasks++;
-}
-
-void dec_rq_walt_stats(struct rq *rq, struct task_struct *p)
-{
-	struct walt_rq *wrq = &per_cpu(walt_rq, cpu_of(rq));
-	struct walt_task_struct *wts = (struct walt_task_struct *)android_task_vendor_data(p);
-
-	if (wts->misfit)
-		wrq->walt_stats.nr_big_tasks--;
-
-	if (wts->rtg_high_prio)
-		wrq->walt_stats.nr_rtg_high_prio_tasks--;
-
-	if (walt_flag_test(p, WALT_TRAILBLAZER_BIT))
-		wrq->walt_stats.nr_trailblazer_tasks--;
-
-	if (walt_flag_test(p, WALT_GIANT_BIT))
-		wrq->walt_stats.nr_giant_tasks--;
-	if (wrq->walt_stats.nr_giant_tasks < 0)
-		wrq->walt_stats.nr_giant_tasks = 0;
-
-	BUG_ON(wrq->walt_stats.nr_big_tasks < 0);
-	BUG_ON(wrq->walt_stats.nr_trailblazer_tasks < 0);
 }
 
 void walt_cfs_init(void)
 {
 	register_trace_android_rvh_select_task_rq_fair(walt_select_task_rq_fair, NULL);
 
+	register_trace_android_vh_binder_wakeup_ilocked(walt_binder_low_latency_set, NULL);
+
 	register_trace_android_vh_binder_set_priority(binder_set_priority_hook, NULL);
 	register_trace_android_vh_binder_restore_priority(binder_restore_priority_hook, NULL);
 
-	register_trace_android_rvh_check_preempt_wakeup_fair(walt_cfs_check_preempt_wakeup_fair,
-			NULL);
+	register_trace_android_rvh_check_preempt_wakeup(walt_cfs_check_preempt_wakeup, NULL);
 	register_trace_android_rvh_replace_next_task_fair(walt_cfs_replace_next_task_fair, NULL);
+
+	// MIUI ADD:
+	register_trace_android_vh_binder_transaction_init(binder_transaction_init_hook, NULL);
+	register_trace_android_vh_binder_print_transaction_info(binder_print_transaction_info_hook, NULL);
+	register_trace_binder_txn_latency_free(binder_txn_latency_free_hook, NULL);
+	// END
 }
