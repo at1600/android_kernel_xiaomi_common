@@ -1,0 +1,54 @@
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+kernel_module(
+    name = "sched-walt",
+    srcs = [
+        "walt.c",
+        "boost.c",
+        "sched_avg.c",
+        "walt_halt.c",
+        "core_ctl.c",
+        "trace.c",
+        "input-boost.c",
+        "sysctl.c",
+        "cpufreq_walt.c",
+        "fixup.c",
+        "walt_lb.c",
+        "walt_rt.c",
+        "walt_cfs.c",
+        "walt_tp.c",
+        "walt_config.c",
+        "voter.c",
+        "walt_cpufreq_cycle_cntr_driver.c",
+        "walt_gclk_cycle_counter_driver.c",
+        "walt_cycles.c",
+        "debugfs.c",
+        "pipeline.c",
+        "smart_freq.c",
+        "walt_storage_lb.c",
+        "mvp_locking.c",
+        "midpoint.c",
+    ],
+    conditional_srcs = {
+        "CONFIG_SCHED_WALT_STATS": ["sysctl_walt_stats.c"],
+        "CONFIG_SCHED_WALT_MIDPOINT": ["midpoint.c"],
+    },
+    config = "SCHED_WALT",
+    kernel_build = "//common:kernel",
+    deps = [
+        "//drivers/soc/qcom:socinfo",
+        "//drivers/soc/qcom:smem",
+        "//drivers/misc/hwid:hwid",
+    ],
+)
+
+kernel_module(
+    name = "sched-walt-debug",
+    srcs = [
+        "walt_debug.c",
+        "preemptirq_long.c",
+    ],
+    config = "SCHED_WALT_DEBUG",
+    kernel_build = "//common:kernel",
+    deps = [":sched-walt"],
+)

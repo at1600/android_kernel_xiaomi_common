@@ -8,6 +8,8 @@ This module contains a full list of kernel modules
 
 _COMMON_GKI_MODULES_LIST = [
     # keep sorted
+    "kernel/sched/walt/sched-walt.ko",
+    "kernel/sched/walt/sched-walt-debug.ko",
     "drivers/block/virtio_blk.ko",
     "drivers/block/zram/zram.ko",
     "drivers/bluetooth/btbcm.ko",
@@ -87,7 +89,6 @@ _COMMON_GKI_MODULES_LIST = [
     "net/tipc/tipc.ko",
     "net/tipc/tipc_diag.ko",
     "net/vmw_vsock/vmw_vsock_virtio_transport.ko",
-    "kernel/sched/walt/walt",
 ]
 
 # Deprecated - Use `get_gki_modules_list` function instead.
