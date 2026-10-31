@@ -7,8 +7,8 @@
  *
  * See kernel/stop_machine.c
  */
-#include "sched.h"
 
+#ifdef CONFIG_SMP
 static int
 select_task_rq_stop(struct task_struct *p, int cpu, int flags)
 {
@@ -16,10 +16,11 @@ select_task_rq_stop(struct task_struct *p, int cpu, int flags)
 }
 
 static int
-balance_stop(struct rq *rq, struct rq_flags *rf)
+balance_stop(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
 	return sched_stop_runnable(rq);
 }
+#endif /* CONFIG_SMP */
 
 static void
 wakeup_preempt_stop(struct rq *rq, struct task_struct *p, int flags)
@@ -32,7 +33,7 @@ static void set_next_task_stop(struct rq *rq, struct task_struct *stop, bool fir
 	stop->se.exec_start = rq_clock_task(rq);
 }
 
-static struct task_struct *pick_task_stop(struct rq *rq, struct rq_flags *rf)
+static struct task_struct *pick_task_stop(struct rq *rq)
 {
 	if (!sched_stop_runnable(rq))
 		return NULL;
@@ -95,8 +96,6 @@ static void update_curr_stop(struct rq *rq)
  */
 DEFINE_SCHED_CLASS(stop) = {
 
-	.queue_mask		= 16,
-
 	.enqueue_task		= enqueue_task_stop,
 	.dequeue_task		= dequeue_task_stop,
 	.yield_task		= yield_task_stop,
@@ -107,9 +106,11 @@ DEFINE_SCHED_CLASS(stop) = {
 	.put_prev_task		= put_prev_task_stop,
 	.set_next_task          = set_next_task_stop,
 
+#ifdef CONFIG_SMP
 	.balance		= balance_stop,
 	.select_task_rq		= select_task_rq_stop,
 	.set_cpus_allowed	= set_cpus_allowed_common,
+#endif
 
 	.task_tick		= task_tick_stop,
 

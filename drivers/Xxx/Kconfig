@@ -1,7 +1,0 @@
-menu "Xxx module"
-
-source "drivers/Xxx/smart_swappiness/Kconfig"
-source "drivers/Xxx/kernel_version/Kconfig"
-source "drivers/Xxx/xxx_islandopt/Kconfig"
-
-endmenu
