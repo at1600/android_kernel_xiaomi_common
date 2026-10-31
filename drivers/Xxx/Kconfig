@@ -1,4 +1,4 @@
-menu "Xxx module blacklist"
+menu "Xxx module"
 
 source "drivers/Xxx/smart_swappiness/Kconfig"
 source "drivers/Xxx/kernel_version/Kconfig"
