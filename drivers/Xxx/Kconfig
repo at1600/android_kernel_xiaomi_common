@@ -4,10 +4,4 @@ source "drivers/Xxx/smart_swappiness/Kconfig"
 source "drivers/Xxx/kernel_version/Kconfig"
 source "drivers/Xxx/xxx_islandopt/Kconfig"
 
-
-
-config XIAOMI_MODULE_BLACKLIST
-	bool "Blacklist useless Xiaomi modules"
-	default y
-
 endmenu
