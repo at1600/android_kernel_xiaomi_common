@@ -4136,7 +4136,7 @@ static inline bool proxy_needs_return(struct rq *rq, struct task_struct *p)
 		return false;
 
 	raw_spin_lock(&p->blocked_lock);
-	if (get_task_blocked_on(p) && p->blocked_on_state == BO_WAKING) {
+	if (__get_task_blocked_on(p) && p->blocked_on_state == BO_WAKING) {
 		if (!task_current(rq, p) && (p->wake_cpu != cpu_of(rq))) {
 			if (task_current_donor(rq, p)) {
 				put_prev_task(rq, p);
@@ -7335,7 +7335,7 @@ find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
 		raw_spin_lock(&p->blocked_lock);
 
 		/* Check again that p is blocked with blocked_lock held */
-		if (mutex != get_task_blocked_on(p)) {
+		if (mutex != __get_task_blocked_on(p)) {
 			/*
 			 * Something changed in the blocked_on chain and
 			 * we don't know if only at this level. So, let's
