@@ -83,8 +83,8 @@ static void walt_cpufreq_transition(void *unused, struct cpufreq_policy *policy)
 		wcc->cur_freq_khz = policy->cur;
 	}
 
-	mult_fact = (policy->cur << SCHED_CAPACITY_SHIFT)/1020;
-	mult_fact = (mult_fact << SCHED_CAPACITY_SHIFT)/1020;
+	mult_fact = (policy->cur << SCHED_CAPACITY_SHIFT)/1000;
+	mult_fact = (mult_fact << SCHED_CAPACITY_SHIFT)/1000;
 	for_each_cpu(i, policy->related_cpus) {
 		wcc = &per_cpu(walt_cc, i);
 		wcc->mult_fact = mult_fact;

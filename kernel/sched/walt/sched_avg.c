@@ -35,7 +35,7 @@ static DEFINE_PER_CPU(u64, coloc_hyst_time);
 static DEFINE_PER_CPU(u64, util_hyst_time);
 static DEFINE_PER_CPU(u64, smart_freq_legacy_reason_hyst_ns);
 
-#define NR_THRESHOLD_PCT		25
+#define NR_THRESHOLD_PCT		40
 #define MAX_RTGB_TIME (sysctl_sched_coloc_busy_hyst_max_ms * NSEC_PER_MSEC)
 
 struct sched_avg_stats stats[WALT_NR_CPUS];

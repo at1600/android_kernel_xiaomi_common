@@ -46,7 +46,7 @@ const char *migrate_type_names[] = {
 #define SCHED_ACCOUNT_WAIT_TIME 1
 
 #define EARLY_DETECTION_DURATION 9500000
-#define MAX_NUM_CGROUP_COLOC_ID 15
+#define MAX_NUM_CGROUP_COLOC_ID 20
 
 #define NEW_TASK_ACTIVE_TIME 100000000
 
