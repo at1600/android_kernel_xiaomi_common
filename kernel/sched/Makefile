@@ -22,11 +22,6 @@ ifneq ($(CONFIG_SCHED_OMIT_FRAME_POINTER),y)
 CFLAGS_core.o := $(PROFILING) -fno-omit-frame-pointer
 endif
 
-# Branch profiling isn't noinstr-safe
-ifdef CONFIG_TRACE_BRANCH_PROFILING
-CFLAGS_build_policy.o += -DDISABLE_BRANCH_PROFILING
-CFLAGS_build_utility.o += -DDISABLE_BRANCH_PROFILING
-endif
 #
 # Build efficiency:
 #
@@ -38,3 +33,4 @@ obj-y += fair.o
 obj-y += build_policy.o
 obj-y += build_utility.o
 obj-$(CONFIG_ANDROID_VENDOR_HOOKS) += vendor_hooks.o
+obj-$(CONFIG_SCHED_RT_INVARIANT_TEST) += test_ksched_football.o
