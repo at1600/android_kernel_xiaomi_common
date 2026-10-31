@@ -6,8 +6,6 @@ This module contains a full list of kernel modules
  compiled by GKI.
 """
 
-load(":kernel/modules.bzl", register_rnel = "register_modules")
-
 _COMMON_GKI_MODULES_LIST = [
     # keep sorted
     "drivers/block/virtio_blk.ko",
@@ -46,7 +44,10 @@ _COMMON_GKI_MODULES_LIST = [
     "drivers/pps/pps_core.ko",
     "drivers/ptp/ptp.ko",
     "drivers/usb/class/cdc-acm.ko",
-    "drivers/usb/mon/usbmon.ko",
+    "drivers/usb/mon/usbmon.kCOMMON_GKI_MODULES_LIST = [
+    # ...
+    "drivers/mygki/mygki",
+]o",
     "drivers/usb/serial/ftdi_sio.ko",
     "drivers/usb/serial/usbserial.ko",
     "drivers/virtio/virtio_balloon.ko",
@@ -86,6 +87,7 @@ _COMMON_GKI_MODULES_LIST = [
     "net/tipc/tipc.ko",
     "net/tipc/tipc_diag.ko",
     "net/vmw_vsock/vmw_vsock_virtio_transport.ko",
+    "kernel/sched/walt/walt",
 ]
 
 # Deprecated - Use `get_gki_modules_list` function instead.
