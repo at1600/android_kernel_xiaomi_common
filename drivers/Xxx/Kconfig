@@ -1,9 +1,11 @@
+menu "Xxx module blacklist"
+
 source "drivers/Xxx/perfmgr/Kconfig"
 source "drivers/Xxx/smart_swappiness/Kconfig"
 source "drivers/Xxx/kernel_version/Kconfig"
 source "drivers/Xxx/slim_walt/Kconfig"
 
-menu "Xxx module blacklist"
+
 
 config XIAOMI_MODULE_BLACKLIST
 	bool "Blacklist useless Xiaomi modules"
