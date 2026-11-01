@@ -142,8 +142,9 @@ void walt_config(void)
 		soc_feat_unset(SOC_ENABLE_FT_BOOST_TO_ALL);
 
 		if (!strcmp(name, "CANOE")) {
-			trailblazer_floor_freq[0] = 1200000;
-			trailblazer_floor_freq[1] = 1800000;
+			trailblazer_floor_freq[0] = 900000;
+			trailblazer_floor_freq[1] = 1400000;
+			demand_scaling_factor = 54;
 		} else {
 			trailblazer_floor_freq[0] = 2000000;
 		}
@@ -153,35 +154,35 @@ void walt_config(void)
 		sysctl_walt_features |= WALT_FEAT_TOPAPP_BASED_HISPEED;
 		soc_feat_unset(SOC_ENABLE_COLOCATION_PLACEMENT_BOOST_BIT);
 		
-		oscillate_period_ns = 12000000;
+		oscillate_period_ns = 18000000;
 
 		/*G + P*/
 		cpumask_copy(&pipeline_sync_cpus, cpu_possible_mask);
 		cpumask_copy(&storage_boost_cpus, &cpu_array[0][0]);
 		
 		soc_sched_lib_name_capacity = 2;
-		soc_feat_unset(SOC_ENABLE_PIPELINE_SWAPPING_BIT);
-		pipeline_swap_util_th = 75;
+		soc_feat_set(SOC_ENABLE_PIPELINE_SWAPPING_BIT);
+		pipeline_swap_util_th = 70;
 
-		sysctl_cluster01_load_sync[0]	= 480;
+		sysctl_cluster01_load_sync[0]	= 460;
 		sysctl_cluster01_load_sync[1]	= 70;
-		sysctl_cluster01_load_sync[2]	= 90;
-		sysctl_cluster10_load_sync[0]	= 600;
-		sysctl_cluster10_load_sync[1]	= 80;
+		sysctl_cluster01_load_sync[2]	= 85;
+		sysctl_cluster10_load_sync[0]	= 650;
+		sysctl_cluster10_load_sync[1]	= 70;
 		sysctl_cluster10_load_sync[2]	= 90;
 		load_sync_util_thres[0][1]	= sysctl_cluster01_load_sync[0];
 		load_sync_low_pct[0][1]		= sysctl_cluster01_load_sync[1];
 		load_sync_high_pct[0][1]	= sysctl_cluster01_load_sync[2];
 		load_sync_util_thres[1][0]	= sysctl_cluster10_load_sync[0];
 		load_sync_low_pct[1][0]		= sysctl_cluster10_load_sync[1];
-		load_sync_high_pct[1][0]	= sysctl_cluster10_load_sync[2];
+		load_sync_high_pct[1][0]		= sysctl_cluster10_load_sync[2];
 
-		sysctl_cluster01_load_sync_60fps[0]	= 450;
-		sysctl_cluster01_load_sync_60fps[1]	= 50;
-		sysctl_cluster01_load_sync_60fps[2]	= 85;
-		sysctl_cluster10_load_sync_60fps[0]	= 580;
-		sysctl_cluster10_load_sync_60fps[1]	= 60;
-		sysctl_cluster10_load_sync_60fps[2]	= 85;
+		sysctl_cluster01_load_sync_60fps[0]	= 440;
+		sysctl_cluster01_load_sync_60fps[1]	= 55;
+		sysctl_cluster01_load_sync_60fps[2]	= 80;
+		sysctl_cluster10_load_sync_60fps[0]	= 620;
+		sysctl_cluster10_load_sync_60fps[1]	= 65;
+		sysctl_cluster10_load_sync_60fps[2]	= 88;
 		load_sync_util_thres_60fps[0][1]	= sysctl_cluster01_load_sync_60fps[0];
 		load_sync_low_pct_60fps[0][1]		= sysctl_cluster01_load_sync_60fps[1];
 		load_sync_high_pct_60fps[0][1]		= sysctl_cluster01_load_sync_60fps[2];
@@ -190,23 +191,17 @@ void walt_config(void)
 		load_sync_high_pct_60fps[1][0]		= sysctl_cluster10_load_sync_60fps[2];
 
 		for (i = 1; i < LEGACY_SMART_FREQ; i++)
-			smart_freq_legacy_reason_hyst_ms[i][0] = 12;
+			smart_freq_legacy_reason_hyst_ms[i][0] = 16;
 		for_each_cpu(cpu, &cpu_array[0][num_sched_clusters - 1]) {
 			for (i = 1; i < LEGACY_SMART_FREQ; i++)
-				smart_freq_legacy_reason_hyst_ms[i][cpu] = 5;
+				smart_freq_legacy_reason_hyst_ms[i][cpu] = 10;
 		}
 		for_each_possible_cpu(cpu) {
-			smart_freq_legacy_reason_hyst_ms[PIPELINE_60FPS_OR_LESSER_SMART_FREQ][cpu] =
-				2;
+			smart_freq_legacy_reason_hyst_ms[PIPELINE_60FPS_OR_LESSER_SMART_FREQ][cpu] = 5;
 		}
 		
 		soc_feat_set(SOC_ENABLE_THERMAL_HALT_LOW_FREQ_BIT);
 		
-		if (!strcmp(name, "CANOE")) {
-			demand_scaling_factor = 62;
-		} else if (strcmp(name, "ALOR_INTERPOSER") && strcmp(name, "ALOR")) {
-			demand_scaling_factor = 70;
-		}
 	} else if (!strcmp(name, "PINEAPPLE")) {
 		soc_feat_set(SOC_ENABLE_SILVER_RT_SPREAD_BIT);
 		soc_feat_set(SOC_ENABLE_BOOST_TO_NEXT_CLUSTER_BIT);
@@ -363,8 +358,8 @@ void early_walt_config(void)
 		soc_cluster_freq_table[0][27] = 2525;
 		soc_cluster_freq_table[0][28] = 2776;
 		soc_cluster_freq_table[0][29] = 2974;
-		soc_cluster_freq_table[0][30] = 3199;
-		soc_cluster_freq_table[0][31] = 3200;
+		soc_cluster_freq_table[0][30] = 2974;
+		soc_cluster_freq_table[0][31] = 3000;
 
 		soc_cluster_freq_table[1][0] = 1889;
 		soc_cluster_freq_table[1][1] = 1917;
@@ -387,16 +382,17 @@ void early_walt_config(void)
 		soc_cluster_freq_table[1][18] = 3486;
 		soc_cluster_freq_table[1][19] = 3661;
 		soc_cluster_freq_table[1][20] = 3844;
-		soc_cluster_freq_table[1][21] = 4420;
-		soc_cluster_freq_table[1][22] = 4900;
-		soc_cluster_freq_table[1][23] = 4900;
-		soc_cluster_freq_table[1][24] = 4900;
-		soc_cluster_freq_table[1][25] = 4900;
-		soc_cluster_freq_table[1][26] = 4900;
-		soc_cluster_freq_table[1][27] = 4900;
-		soc_cluster_freq_table[1][28] = 4900;
-		soc_cluster_freq_table[1][29] = 4900;
-		soc_cluster_freq_table[1][30] = 4900;
-		soc_cluster_freq_table[1][31] = 4900;
+		soc_cluster_freq_table[1][21] = 4300;
+		soc_cluster_freq_table[1][22] = 4300;
+		soc_cluster_freq_table[1][23] = 4300;
+		soc_cluster_freq_table[1][24] = 4300;
+		soc_cluster_freq_table[1][25] = 4300;
+		soc_cluster_freq_table[1][26] = 4300;
+		soc_cluster_freq_table[1][27] = 4300;
+		soc_cluster_freq_table[1][28] = 4300;
+		soc_cluster_freq_table[1][29] = 4300;
+		soc_cluster_freq_table[1][30] = 4300;
+		soc_cluster_freq_table[1][31] = 4300;
 	}
 }
+
