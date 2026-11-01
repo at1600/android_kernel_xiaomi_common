@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+package(default_visibility = ["//visibility:public"])
+
+kernel_module(
+    name = "msm_sysstats",
+    kconfig = "CONFIG_MSM_SYSSTATS",
+    srcs = [
+        "msm_sysstats.c",
+    ],
+    # 等价高通 registry 的 deps：控制ko加载顺序
+    module_deps = [
+        "//drivers/dma-buf/heaps:qcom_dma_heaps",
+        "//drivers/iommu:msm_dma_iommu_mapping",
+        "//drivers/soc/qcom/mem_buf:mem_buf_dev",
+        "//drivers/soc/qcom:secure_buffer",
+        "//drivers/firmware/qcom:qcom-scm",
+        "//drivers/virt/gunyah:gh_rm_drv",
+        "//drivers/virt/gunyah:gh_msgq",
+        "//drivers/virt/gunyah:gh_dbl",
+        "//arch/arm64/gunyah:gh_arm_drv",
+    ],
+)
+
+kernel_module(
+    name = "torture",
+    kconfig = "CONFIG_TORTURE_TEST",
+    srcs = [
+        "torture.c",
+    ],
+)

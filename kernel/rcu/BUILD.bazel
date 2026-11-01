@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+package(default_visibility = ["//visibility:public"])
+
+kernel_module(
+    name = "rcutorture",
+    kconfig = "CONFIG_RCU_TORTURE_TEST",
+    srcs = [
+        "rcutorture.c",
+    ],
+    module_deps = [
+        "//kernel:torture",
+    ],
+)
+

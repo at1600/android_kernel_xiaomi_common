@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+package(default_visibility = ["//visibility:public"])
+
+kernel_module(
+    name = "qcom_ipc_logging",
+    kconfig = "CONFIG_IPC_LOGGING",
+    srcs = [
+        "ipc_logging.c",
+        "ipc_logging_debug.c",
+        "ipc_logging_private.h",
+    ],
+    conditional_srcs = {
+        "CONFIG_IPC_LOGGING_CDEV": [
+            "ipc_logging_cdev.c",
+        ],
+    },
+    module_deps = [
+        "//drivers/soc/qcom:minidump",
+        "//drivers/soc/qcom:smem",
+        "//drivers/soc/qcom:debug_symbol",
+        "//drivers/dma-buf/heaps:qcom_dma_heaps",
+        "//drivers/iommu:msm_dma_iommu_mapping",
+        "//drivers/soc/qcom/mem_buf:mem_buf_dev",
+        "//drivers/soc/qcom:secure_buffer",
+        "//drivers/firmware/qcom:qcom-scm",
+        "//drivers/virt/gunyah:gh_rm_drv",
+        "//drivers/virt/gunyah:gh_msgq",
+        "//drivers/virt/gunyah:gh_dbl",
+        "//arch/arm64/gunyah:gh_arm_drv",
+    ],
+)

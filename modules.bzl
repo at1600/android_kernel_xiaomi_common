@@ -8,8 +8,13 @@ This module contains a full list of kernel modules
 
 _COMMON_GKI_MODULES_LIST = [
     # keep sorted
+    "kernel/msm_sysstats.ko",
+    "kernel/torture.ko",
+    "kernel/locking/locktorture.ko",
+    "kernel/rcu/rcutorture.ko",
     "kernel/sched/walt/sched-walt.ko",
     "kernel/sched/walt/sched-walt-debug.ko",
+    "kernel/trace/qcom_ipc_logging.ko",
     "drivers/block/virtio_blk.ko",
     "drivers/block/zram/zram.ko",
     "drivers/bluetooth/btbcm.ko",
