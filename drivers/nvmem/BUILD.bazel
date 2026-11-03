@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+kernel_module(
+    name = "nvmem_qcom-spmi-sdam",
+    srcs = [
+        "qcom-spmi-sdam.c",
+    ],
+    kconfig = "CONFIG_NVMEM_SPMI_SDAM",
+)
+
+kernel_module(
+    name = "nvmem_qfprom",
+    srcs = [
+        "qfprom.c",
+    ],
+    kconfig = "CONFIG_NVMEM_QCOM_QFPROM",
+)

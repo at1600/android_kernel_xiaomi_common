@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-2.0
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+kernel_module(
+    name = "qcom-dload-mode",
+    srcs = [
+        "qcom-dload-mode.c",
+    ],
+    kconfig = "CONFIG_POWER_RESET_QCOM_DOWNLOAD_MODE",
+    deps = [
+        "//drivers/soc/qcom:minidump",
+        "//drivers/soc/qcom:smem",
+        "//drivers/soc/qcom:debug_symbol",
+        "//drivers/dma-buf/heaps:qcom_dma_heaps",
+        "//drivers/iommu:msm_dma_iommu_mapping",
+        "//drivers/soc/qcom/mem_buf:mem_buf_dev",
+        "//drivers/soc/qcom:secure_buffer",
+        "//drivers/firmware/qcom:qcom-scm",
+        "//drivers/virt/gunyah:gh_rm_drv",
+        "//drivers/virt/gunyah:gh_msgq",
+        "//drivers/virt/gunyah:gh_dbl",
+        "//arch/arm64/gunyah:gh_arm_drv",
+    ],
+)
+
+kernel_module(
+    name = "qcom-pon",
+    srcs = [
+        "qcom-pon.c",
+    ],
+    kconfig = "CONFIG_POWER_RESET_QCOM_PON",
+    deps = [
+        "//drivers/power/reset:reboot-mode",
+    ],
+)
+
+kernel_module(
+    name = "qcom-reboot-reason",
+    srcs = [
+        "qcom-reboot-reason.c",
+    ],
+    kconfig = "CONFIG_POWER_RESET_QCOM_REBOOT_REASON",
+)
+
+kernel_module(
+    name = "reboot-mode",
+    srcs = [
+        "reboot-mode.c",
+    ],
+    kconfig = "CONFIG_REBOOT_MODE",
+)
+
+kernel_module(
+    name = "msm-vm-poweroff",
+    srcs = [
+        "msm-vm-poweroff.c",
+    ],
+    kconfig = "CONFIG_POWER_RESET_QCOM_VM",
+    deps = [
+        "//drivers/soc/qcom:qcom_wdt_core",
+        "//drivers/soc/qcom:qcom_soc_wdt",
+    ],
+)
