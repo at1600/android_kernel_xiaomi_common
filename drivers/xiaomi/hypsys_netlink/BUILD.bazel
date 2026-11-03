@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+kernel_module(
+    name = "hypsys_netlink",
+    srcs = [
+        "hypsys_netlink.c",
+        "hypsys_netlink.h",
+    ],
+    kconfig = "CONFIG_MI_HYPSYS_NETLINK",
+)

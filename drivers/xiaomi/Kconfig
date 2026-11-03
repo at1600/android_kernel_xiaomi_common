@@ -5,4 +5,4 @@ source "drivers/xiaomi/printk_enhance/Kconfig"
 source "drivers/xiaomi/mi_trace/Kconfig"
 source "drivers/xiaomi/swinfo/Kconfig"
 
-
+source "$(KCONFIG_EXT_PREFIX)drivers/xiaomi/hypsys_netlink/Kconfig"

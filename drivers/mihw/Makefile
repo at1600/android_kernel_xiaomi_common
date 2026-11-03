@@ -15,4 +15,5 @@ obj-y                                   += dcvs_arbi/
 # END DCVS ARBI
 obj-y                                   += migt/
 
+# obj-y                                  += perfmgr/
 

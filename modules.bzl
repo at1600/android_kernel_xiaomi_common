@@ -15,6 +15,7 @@ _COMMON_GKI_MODULES_LIST = [
     "kernel/sched/walt/sched-walt.ko",
     "kernel/sched/walt/sched-walt-debug.ko",
     "kernel/trace/qcom_ipc_logging.ko",
+    "drivers/xiaomi/hypsys_netlink/hypsys_netlink.ko",
     "drivers/block/virtio_blk.ko",
     "drivers/block/zram/zram.ko",
     "drivers/bluetooth/btbcm.ko",
