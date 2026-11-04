@@ -19,7 +19,7 @@
 #include <linux/thermal.h>
 #include <linux/unaligned.h>
 
-#include "drivers/thermal/thermal_hwmon.h"
+#include <drivers/thermal/thermal_hwmon.h>
 
 /*
  * Thermal monitoring block consists of 8 (ADC_TM5_NUM_CHANNELS) channels. Each
